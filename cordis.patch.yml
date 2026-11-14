@@ -1,0 +1,4 @@
+# 本包在宿主层栈里的插入点：id 固定，宿主按 id 做 patch 覆盖。
+- insert:
+    - id: rtk
+      name: "@jayyuen66/dsh-rtk"

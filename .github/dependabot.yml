@@ -1,0 +1,36 @@
+# 依赖更新：action 一条线。
+#
+# action 侧覆盖本仓的全部 workflow 引用：这些引用都钉了 commit SHA，Dependabot 提的 PR
+# 会把「换了哪个提交」变成一次可评审的 diff。
+#
+# 这里刻意**没有** npm 更新块：本仓依赖只有两类，两类都不该由更新机器人改动。
+# 一是工具链与大部分宿主依赖写成 catalog:，取值住在伞根的 pnpm-workspace.yaml，本仓这一份
+# 是投影下来的生成物；机器人改不到取值，改得到的只是 package.json 里那串引用写法。
+# 二是写成字面版本的那几枚：宿主族在 devDependencies 里逐字钉住，且每一枚都有本仓
+# pnpm-workspace.yaml 的 overrides 兜着取值；`react`（devDependencies，^19.3.0）不在 overrides
+# 覆盖范围内（catalog 里只有 `@types/react`），机器人对它提的 PR 会真的换掉安装树。
+# 两类都要人来判断：走 catalog: 的在伞根改那份唯一来源再投影，`react` 那一枚改了要复跑 check。
+#
+# 但「本仓不会出现 npm 机器人 PR」这句话不由这个文件保证：Dependabot security updates
+# 是仓库设置里独立开着的，不读本文件、也不需要 npm 配置块，仍会针对漏洞依赖提 PR。要真正
+# 关掉它得去 Settings → Code security 里处理 npm 那条 security updates，改这里的 yml 没有用。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      # 本仓引用的 action 全部放进一组，避免每个 action 各占一个 PR 去抢同一个名额。
+      # 模式按 `<owner>/<repo>` 写：通配符覆盖该仓库下的全部条目（codeql-action 的 init、
+      # analyze、upload-sarif 就是三条不同的引用），跨仓库不会互相匹配，所以每个 owner 各列一条。
+      # 最后那条 `*` 是有意留下的后备：workflow 里新增没列出的 owner 时，它跟着进同一组，而不是脱离分组
+      # 单独占掉 open-pull-requests-limit 的名额——那种漂移没有任何机制会把它暴露出来。
+      actions:
+        patterns:
+          - "actions/*"
+          - "pnpm/*"
+          - "github/codeql-action*"
+          - "ossf/scorecard-action*"
+          - "*"

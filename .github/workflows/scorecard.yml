@@ -1,0 +1,69 @@
+# OpenSSF Scorecard：供应链体检。
+#
+# 它查的正是本仓这一层关心的东西——脚本注入、token 权限、依赖是否钉版、分支保护是否
+# 存在。结果同时进 code scanning 面板与 OpenSSF 公有 API（本仓是 public 仓）。
+#
+# publish_results 只在默认分支上有效：上传的身份由 OIDC 换得，所以要 id-token: write。
+name: scorecard
+on:
+  # 分支保护/ruleset 变更时重跑，否则 Branch-Protection 这项检查只会停在旧值上。
+  branch_protection_rule:
+  # 手动入口：同上。注意下面的 if 要求「在默认分支上跑」，所以在功能分支上手跑时该 job
+  # 会被跳过——这不是故障。
+  workflow_dispatch: {}
+  schedule:
+    - cron: "23 4 * * 1"
+  push:
+    # 分支名在这里只能是静态字符串：过滤器位置不提供任何 context，表达式写法会被 actionlint 判成
+    # `context "github" is not allowed here`，因此做不到与下面 if: 里那个
+    # github.event.repository.default_branch 同源。默认分支若改名，这一行要手工跟着改，
+    # 否则 push 这个入口静默失效（schedule 与两个手动入口仍在，体检不会完全停）。
+    branches: [main]
+# 四个入口（push / schedule / branch_protection_rule / workflow_dispatch）会在同一个 ref 上
+# 撞车：两份 analysis 往 code scanning 传同名 category 的结果，后传的覆盖前一份，中间还夹着
+# 一次可能失败的并发上传；OIDC 换 token 与公有 API 的发布额度也被无谓重复消耗。
+# 所以组键按 ref 聚合，让同一 ref 的分析排成一队，并**不**取消——体检结果不该因为又一次运行
+# 而被判成「没量过」。(早先把 event_name 放进组键，正好让四个入口各自成组并行，把要防的覆盖
+# 变成了默认行为；那条规则与这里的目的相反。)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+# 工作流级全只读；两个写权限只挂在 analysis job 上。
+permissions: read-all
+jobs:
+  analysis:
+    name: scorecard analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # publish_results: true 只在默认分支生效，所以在非默认分支上不跑这条。
+    # 判据比的是完整 ref 而不是 github.ref_name：ref_name 是短名，名为 `main` 的 tag 与 main
+    # 分支在它眼里一样，在那种 ref 上手跑会过判并让 OIDC 发布出错误来源的结果。
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    permissions:
+      security-events: write
+      id-token: write
+      # job 级 permissions 一旦写了，没列出的项一律是 none，checkout 也就读不到仓库内容。
+      # 这里显式补回来：它要的是读，与上面两项写权限不冲突。
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 不让 checkout 把 token 留在 .git/config 里：后续步骤不该能借它推代码。
+          persist-credentials: false
+      - name: Run analysis
+        uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          retention-days: 5
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: results.sarif

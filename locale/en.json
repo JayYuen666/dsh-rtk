@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "rtk output compression",
+    "description": "Compresses bash/pwsh output with rtk before it reaches the model, keeping failures and structure.",
+    "detail": "docs/DETAIL.md"
+  }
+}

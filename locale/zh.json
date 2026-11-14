@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "rtk 输出压缩",
+    "description": "用 rtk 在输出进入模型前压缩 bash/pwsh 结果，保留失败与结构。",
+    "detail": "docs/DETAIL.zh.md"
+  }
+}

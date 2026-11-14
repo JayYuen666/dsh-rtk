@@ -1,0 +1,67 @@
+# CodeQL：两格并跑。
+#
+# javascript-typescript 扫源码；actions 扫 .github/workflows/*.yml —— 后者正是
+# 本仓这一层最需要的一种检查：工作流里的表达式注入、过度权限、可被 fork PR 触发的
+# 危险形态，都是「代码全绿但门禁本身有洞」那一类。
+#
+# 不给 build-mode：JS/TS 与 actions 都走默认的 none，不需要编译。
+name: codeql
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # 手动入口：修完一条告警想立刻复验时，不必等下一周的 cron。
+  workflow_dispatch: {}
+  schedule:
+    - cron: "23 4 * * 1"
+# 组键带事件名：周度扫描与 main 上的 push 落在不同组，前者不会因为一次 push 被取消。
+# 取消只留给同分支的 push 与 pull_request——同一分支连推几次时，旧那一轮没人还要它的结论。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+# 工作流级只给读；写入权限挂在 job 上，因为只有上传 SARIF 那一步需要它。
+permissions:
+  contents: read
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # 上传 SARIF 到 code scanning 面板所必需。
+      security-events: write
+      # 不写 packages: read——本文件没有任何 packs / queries 输入，init 与 analyze 只用
+      # codeql-action 自带的默认套件。官方 code scanning 起始工作流把这枚权限标为
+      # 「required to fetch internal or private CodeQL packs」，本仓没有那一类 pack，它就是多给的。
+      contents: read
+      # 私有仓库下 init/analyze 要读本次运行的工作流元数据（判断该 ref 是否已有分析、回写状态）。
+      # 缺它时的形态是上传/状态回写报权限不足，而不是一条看得懂的报错；本仓现在是 public，
+      # 这一条是为可见性变化准备的，不改变当前结论。
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # 两个标识都按官方清单写死：javascript-typescript 覆盖 JS 与 TS；
+        # actions 覆盖本仓 .github/workflows 下的工作流文件。
+        language: [javascript-typescript, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
+          # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+      - name: Perform CodeQL Analysis
+        # fork PR 的 GITHUB_TOKEN 一律只读，job 上写的 security-events: write 会被降级。上传那
+        # 一步拿到 403 后并不会静默通过：codeql-action v4.39.2 的 src/upload-lib.ts 在 403 分支
+        # 里先 core.warning、随后无条件 throw，src/analyze-action.ts 的 catch 再 core.setFailed。
+        # 所以只对 fork PR 容错，同仓 PR / push / schedule 的分析失败仍判红。
+        # 反过来整条 job 跳过不可取：被跳过的必检在分支保护里记作通过，等于「未扫描即绿」。
+        continue-on-error: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:${{ matrix.language }}
