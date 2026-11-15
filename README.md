@@ -49,11 +49,12 @@
 
 ## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> What it does
 
-- **Two compression shapes, both off by default.** `prefix` shadows `bash` per agent and routes the command through `rtk rewrite` first; `pipe` feeds a finished shell result through `rtk pipe -f <filter>` and replaces only the model-facing text.
+- **Two compression shapes; the master switch follows rtk readiness.** `prefix` shadows `bash` per agent and routes the command through `rtk rewrite` first; `pipe` feeds a finished shell result through `rtk pipe -f <filter>` and replaces only the model-facing text. Until you set `enabled` explicitly, it is on only when a supported rtk is detected; `prefix` is the default form and `pipe` is opt-in.
 - **Nothing is compressed that is not worth it.** Outputs under `minBytes` (256) and rewrites that save less than `minGainRatio` (0.95) pass through unchanged. The plugin never claims a saving it did not make.
 - **Failures keep their text.** The guard rejects any compression that loses the failing assertion, the file:line, or the exit marker — a compressed failure that hides why it failed is worse than no compression.
 - **Fail-open everywhere.** rtk missing, rtk too old, a rewrite that rewrites destructively, a command that is not safe to rewrite: the original command runs, the original output is delivered, and nothing is lost.
-- **A settings card.** Per-filter counters and byte savings, read from a host storage domain through the official Typert Remote namespace.
+- **Compound commands are rewritten segment by segment.** `cd <repo> && cargo test` — the shape multi-repo work produces constantly — is split into segments and only the one carrying the output is rewritten (`cd <repo> && rtk cargo test`). Constructs that cannot be split (command substitution, redirection, background `&`, unbalanced quotes) still run unchanged as a whole.
+- **A settings card.** Command counts, tokens saved, the savings rate, and a per-filter bar chart of token savings — read from a host storage domain through the official Typert Remote namespace.
 
 ## <img src="https://api.iconify.design/lucide/package.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Install
 
@@ -89,7 +90,7 @@ Remove with `dsh plugin --profile web remove @jayyuen66/dsh-rtk`. The package is
 - `dsh.bundle.patch` points at `cordis.patch.yml`, whose `insert:` block carries a single `- id: rtk` entry with `name: "@jayyuen66/dsh-rtk"` — the **bare package name** is what makes the host scan the client half. The card components are bundled into `client.js` (only `react` / `zod` stay external to the host's module table).
 - A missing injected surface keeps cordis from activating the entry (startup diagnostic: `pending (waiting for service: …)`); a malformed ctx throws `required services … missing` from apply.
 - Deployment defaults go on the registration line's `config:`; precedence is card runtime value > row config > schema `.default()`.
-- **Everything is off until you turn it on.** `enabled: false` is the default: the plugin mounts, the card renders, and no command is touched.
+- **The master switch follows rtk readiness.** Until you set `enabled` explicitly, it stays off when rtk is missing or below the supported floor and turns on once a supported rtk is detected. `prefix` is the default form. Turn the switch off manually to pin it off, or on to pin it on; both the switch and the form selector take effect on the next tool call.
 
 ## <img src="https://api.iconify.design/lucide/sliders-horizontal.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> The two shapes
 
@@ -99,14 +100,17 @@ Remove with `dsh plugin --profile web remove @jayyuen66/dsh-rtk`. The package is
 | How | shadow `bash` per agent, ask `rtk rewrite`, run the rewritten form | feed captured stdout through `rtk pipe -f <filter>` |
 | What the model sees | the compressed output of the rewritten command | the compressed output, original markers and exit code preserved |
 | Failure mode | rewrite rejected → original command runs | filter unusable → original text delivered |
+| Compound commands | rewritten segment by segment: only the output-bearing segment changes | the whole command's output is compressed together |
 | Default | on when `enabled` is on | off (waiting for rtk to cover more shapes) |
+
+Compound handling under `prefix` deserves its own paragraph: rtk already rewrites segment by segment (`rewrite_compound` in `discover/registry.rs`), and `cd /tmp && cargo test` measurably becomes `cd /tmp && rtk cargo test`. The plugin splits both the original command and the product into segments, requires the **separator sequence to match one for one**, and runs P1–P4 on **each** segment (a segment that was not touched must be byte-identical; the touched one may only gain a leading `rtk `). Anything else is rejected and the original command runs.
 
 ## <img src="https://api.iconify.design/lucide/settings.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Settings
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `false` | master switch |
-| `enabledForms` | `['prefix']` | which shapes may act. The card can write it, but both layers read it at assembly: **a change needs a restart** |
+| `enabled` | unset | master switch; until set, on only when a supported rtk is detected |
+| `enabledForms` | `['prefix']` | which shapes may act; takes effect on the next tool call |
 | `denyCommands` | `[]` | extra command patterns never rewritten |
 | `enabledFilters` | `['cargo-test','pytest','ctest']` | pipe filters that may act |
 | `minBytes` | `256` | outputs smaller than this are never compressed |
@@ -120,9 +124,7 @@ Remove with `dsh plugin --profile web remove @jayyuen66/dsh-rtk`. The package is
 | `vitestMaxMajor` | `5` | restart-only; vitest at or above this major is not compressed |
 | `logFilterMode` | `'off'` | restart-only |
 
-The config schema has 14 fields with built-in defaults, 9 of them volatile — the settings card writes those and they take effect on the next tool call. The remaining **non-volatile deployment values**, 5 of them, are read once at assembly, so changing them needs a restart.
-
-One volatile field is the exception to "next tool call": `enabledForms` decides *which layers get installed*, so both shapes read it once at assembly. The card still shows the selector (the host only projects volatile fields into `describe()`), but a change there needs a restart to take effect. The same applies to the prefix form generally: it also writes to rtk's own `history.db`, because the rewritten command is what actually runs.
+The config schema has 14 fields; 13 of them carry built-in defaults, while `enabled` follows rtk readiness until you set it explicitly. 9 of them volatile — the settings card writes those and they take effect on the next tool call, `enabledForms` included. The remaining **non-volatile deployment values**, 5 of them, are read once at assembly, so changing them needs a restart. The prefix form also writes to rtk's own `history.db`, because the rewritten command is what actually runs.
 
 ## <img src="https://api.iconify.design/lucide/monitor.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Support surface
 
@@ -135,7 +137,8 @@ rtk 1.2.0 was the version every claim in this repository was measured against. T
 ## <img src="https://api.iconify.design/lucide/lock.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Data and privacy
 
 - **Command text leaves the host process only as an argv to your own `rtk` binary.** No network call is made by this plugin.
-- **Counters live in the host's storage domain** (`<DSH_HOME>/storages/`), one record per filter plus a summary. Nothing else is persisted.
+- **Counters live in the host's storage domain** (`<DSH_HOME>/storages/`), one record per filter plus a summary; the records carry command counts, bytes before/after, and tokens before/after. Nothing else is persisted.
+- **Tokens are estimated by the host's `tokenMeter`** (falling back to `bytes / 4` when the service is absent — the same density as rtk's own `estimate_tokens_from_len`). The rewrite form cannot see the original output, so what it saves is only visible through `rtk gain`; every number on the card comes from the output-compression form.
 - **Compressed originals can be spilled** into the host's spill area when they exceed the inline budget — the same mechanism every other host tool uses, with the same per-session partition.
 
 ## <img src="https://api.iconify.design/lucide/triangle-alert.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Known boundaries
@@ -144,6 +147,7 @@ rtk 1.2.0 was the version every claim in this repository was measured against. T
 - **`npm run <script>` is never rewritten.** rtk maps a script name to a tool name (`npm run lint` → `rtk lint`), which would run ESLint instead of your script. The plugin drops any rewrite that removes a word from the original command.
 - **Listing commands fold.** `ls`, `find`, `grep`/`rg` can replace a long listing with a `+N more` marker; the guard detects the marker family and rejects the compression, so folded listings never reach the model through this plugin.
 - **Approvals see the command you asked for, not the rewritten one.** The shadow rewrites `args.command` inside `execute`, which runs *after* the pipeline's `tools/pre-execute` stage. General command approval (auto-review, danger-guard, Claude-Code-style hooks) therefore evaluates the frozen original arguments (`cargo test`) while the rewritten form (`rtk cargo test`) is what actually runs. Sandbox escalation approval is *inside* `orig.execute` and is preserved untouched, because the plugin never spawns the command itself. The plugin's own safety net in front of that gap is three subtractions — the information-loss deny table (`git diff` / `git log` / `git show <ref>` / `ls` / `find` / `grep` / `rg` / `cargo clippy` / `aws`), the P1–P4 rewrite checks (only a prefix may be stripped, no script-runner word may disappear), and the vitest major gate. Danger commands (`rm -rf`, `git push --force`) are not in rtk's rewrite surface at all, so they run unchanged and are reviewed unchanged — danger-guard is not bypassed.
+- **If any segment of a compound command hits the deny list, the whole command runs unchanged.** The deny list (`git diff` / `git log` / `ls` / `find` / `grep` / `rg` / `cargo clippy` / `aws`, …) and the vitest major gate are evaluated **per segment**, because `cd x && git diff` starts with `cd` — evaluating the whole string would disable the entire table. On a hit the command is not taken apart either: someone typing `cd X && git status` expects one complete execution, and handing the first half to the shell while stitching the second half back is not the plugin's job.
 - **`rtk pipe` on a failing pytest run keeps the failure names but not always the assertion body.** The guard checks for a success claim and for the failing line; a filter output that passes both but still loses detail is a known limit of the filter, not of the guard.
 
 ## <img src="https://api.iconify.design/lucide/wrench.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Development

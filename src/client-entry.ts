@@ -4,10 +4,9 @@
 // 槽位 key（BUNDLE_PKG）与宿主模块表键必须逐字相同——build-client.mjs 在构建期核对它，
 // 因此这个字面量不能改成模板串。导出形态与兄弟仓一致：只有命名导出，没有 default——
 // 两者混用会让 rolldown 报 MIXED_EXPORTS，且外壳那层取默认导出时拿到的是命名空间对象。
-import { createElement, useCallback, useEffect, useState } from "react";
+import { createElement, useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
-  CARD_UI_CSS,
   CardForm,
   ListField,
   NumberField,
@@ -17,8 +16,10 @@ import {
   TextField,
   ToggleField,
   diffTouched,
+  ensureCardUiCss,
   errorText,
   splitHint,
+  useInvalidFields,
 } from "@jayyuen66/dsh-plugin-shared/client";
 import type { SelectOption } from "@jayyuen66/dsh-plugin-shared/client";
 
@@ -27,14 +28,17 @@ import { RTK_LOGO_DATA_URI } from "./rtk-icon.ts";
 import {
   FORM_MODES,
   cardStore,
+  chartBarsOf,
   draftFields,
+  enabledHintKeyOf,
   formModeOf,
   formsOf,
   hintOf,
   numberOf,
   stringListOf,
 } from "../lib/card-logic.ts";
-import type { CardSnapshot, CardFields, SettingScope } from "../lib/card-logic.ts";
+import type { CardSnapshot, CardFields, ChartBar, SettingScope } from "../lib/card-logic.ts";
+import { ALL_FILTERS } from "../lib/command-filter.ts";
 import { MIN_RTK_VERSION } from "../lib/rtk-version.ts";
 import type { StatsStatus, StatsSummary } from "../lib/stats-shape.ts";
 import { createStatsReader } from "./stats-reader.ts";
@@ -56,12 +60,22 @@ const SECTION_ID = "rtk";
 const SECTION_ORDER = 31;
 /** 卡片样式表 id：同一页面挂两张同 id 的 <style> 会让后一张覆盖前一张。 */
 const STYLE_ID = "rtk-card-css";
-/** 卡片自有样式（与 shared 的 CARD_UI_CSS 一起注入，本文件只放差异项）。 */
+/** 统计轮询间隔：卡片挂在设置页/插件页期间每 5 秒拉一次 summary 与 status。 */
+const STATS_REFRESH_MS = 5000;
+/** 卡片自有样式；shared 的 CARD_UI_CSS 由 ensureCardUiCss 单独注入，本文件只放差异项。 */
 const CARD_CSS = [
   ".rtkc-note{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary,inherit);margin:6px 0}",
   ".rtkc-hint{font-size:12px;line-height:1.7;margin:6px 0;padding:6px 8px;border-radius:6px;background:var(--dsw-alias-bg-warning,#3a2d12);color:var(--dsw-alias-label-primary,inherit)}",
   ".rtkc-ready{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary,inherit);margin:6px 0}",
   ".rtkc-actions{margin-top:8px}",
+  // 条形图：纯 div + 宽度百分比，不引第三方图表库（宿主没有可复用的，client 产物只外置
+  // react 与 zod，每多一个依赖都要进产物体积预算）。轨道用半透明前景色，填充用主色，
+  // 主题切换跟着 CSS 变量走，不必在 JS 里读主题。
+  ".rtkc-chart{display:flex;flex-direction:column;gap:6px;margin:8px 0 4px}",
+  ".rtkc-chart-row{display:grid;grid-template-columns:1fr;gap:2px}",
+  ".rtkc-chart-track{position:relative;height:8px;border-radius:4px;background:color-mix(in srgb,currentColor 12%,transparent);overflow:hidden}",
+  ".rtkc-chart-fill{position:absolute;inset-block:0;inset-inline-start:0;border-radius:4px;background:currentColor;opacity:.75}",
+  ".rtkc-chart-label{font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit)}",
   // 一级分区里没有插件页那层卡片外壳，自己给一点上下留白，样式与插件页那张卡一致。
   ".rtkc-page{padding:4px 0 8px}",
   // 导航图标：官方标记的 PNG 当 alpha 遮罩，颜色由 `background-color: currentColor` 给，
@@ -91,6 +105,8 @@ function numberField(props: {
   max: number;
   step: number;
   editable: boolean;
+  resetToken: number;
+  onInvalidChange: (invalid: boolean) => void;
   onChange: (next: number | undefined) => void;
 }): ReactNode {
   return createElement(NumberField, {
@@ -102,6 +118,8 @@ function numberField(props: {
     max: props.max,
     step: props.step,
     invalidHint: props.t("outOfRange"),
+    resetToken: props.resetToken,
+    onInvalidChange: props.onInvalidChange,
     disabled: !props.editable,
     onChange: props.onChange,
   });
@@ -142,6 +160,52 @@ function RtkHint(props: { t: Translate; status: StatsStatus | undefined }): Reac
   return node;
 }
 
+/** 一根柱子（轨道 + 填充 + 文案）。抽成独立函数是为了让 `createElement` 的嵌套不超三层。 */
+function chartRow(t: Translate, bar: ChartBar): ReactNode {
+  // 百分比宽度是最省事的表达：不依赖任何布局测量，窗口缩放自动跟着走。
+  const fill = createElement("div", {
+    className: "rtkc-chart-fill",
+    style: { inlineSize: `${String(Math.round(bar.ratio * 100))}%` },
+  });
+  const track = createElement("div", { className: "rtkc-chart-track" }, fill);
+  const label = createElement(
+    "span",
+    { className: "rtkc-chart-label" },
+    t("statsChartRow", {
+      filter: bar.filter,
+      tokens: String(bar.savedTokens),
+      share: String(bar.share),
+    }),
+  );
+  return createElement("div", { key: bar.filter, className: "rtkc-chart-row" }, track, label);
+}
+
+/**
+ * 按 filter 的 token 收益条形图。
+ *
+ * 纯 div + 宽度百分比：宿主没有可复用的图表组件，而 client 产物只外置 react 与 zod——
+ * 引一个 charts 库等于把几十 KB 塞进一个 88KB 的产物（`test/floors.ts` 的 budget 是 110KB）。
+ * 这些柱子要表达的事情（谁最大、差多少）用长度就够了，不需要坐标轴与刻度。
+ *
+ * 数据来自 `statsSummarySchema` 的 `topFilters`（宿主侧 `summarize` 已排好序并算了占比），
+ * 本组件只做归一化与渲染，不重算口径。
+ */
+function StatsChart(props: { t: Translate; summary: StatsSummary }): ReactNode {
+  const bars = chartBarsOf(props.summary);
+  if (bars.length === 0) {
+    return createElement("p", { className: "rtkc-note" }, props.t("statsChartEmpty"));
+  }
+  const title = createElement("p", { className: "rtkc-note" }, props.t("statsChartTitle"));
+  const hint = createElement("p", { className: "rtkc-note" }, props.t("statsChartHint"));
+  return createElement(
+    "div",
+    { className: "rtkc-chart" },
+    title,
+    hint,
+    ...bars.map((bar) => chartRow(props.t, bar)),
+  );
+}
+
 /** 统计区：读面缺失或首读未回来时给一行说明，不判错（压缩本身不受统计影响）。 */
 function StatsSection(props: {
   t: Translate;
@@ -169,6 +233,7 @@ function StatsSection(props: {
     Section,
     { title: t("statusSection") },
     createElement("p", null, `${numbers}: ${values}`),
+    createElement(StatsChart, { t, summary }),
     // spec §6：按形态分账。改写那一档记不到原始字节（命令在进 shell 之前就被换掉了），
     // 所以这里只报命令数——把两档都塞进「节省字节」会让读数变成半真半假的合计数。
     createElement(
@@ -310,6 +375,8 @@ interface FieldSectionProps {
   readonly view: CardFields;
   readonly writable: boolean;
   readonly setField: (name: string, draft: unknown) => void;
+  readonly resetToken: number;
+  readonly reportInvalid: (field: string, invalid: boolean) => void;
 }
 
 /** 形态区：总开关、形态选择，以及 B 形态未开时的一行说明。 */
@@ -326,7 +393,7 @@ function cardModeFields(props: FieldSectionProps): ReactNode[] {
   return [
     toggleField({
       label: t("enabledLabel"),
-      hint: t("enabledHint"),
+      hint: t(enabledHintKeyOf(view.forms)),
       field: "enabled",
       checked: view.enabled,
       editable: writable,
@@ -369,7 +436,7 @@ function cardFilterFields(props: FieldSectionProps): ReactNode[] {
     }),
     listField({
       label: t("filtersLabel"),
-      hint: t("filtersHint"),
+      hint: t("filtersHint", { filters: ALL_FILTERS.join(", ") }),
       field: "enabledFilters",
       value: view.enabledFilters,
       editable: writable,
@@ -382,7 +449,7 @@ function cardFilterFields(props: FieldSectionProps): ReactNode[] {
 
 /** 三个字节/比例阈值 + 提示开关 + 宿主环境变量。 */
 function cardNumberFields(props: FieldSectionProps): ReactNode[] {
-  const { t, view, writable, setField } = props;
+  const { t, view, writable, setField, resetToken, reportInvalid } = props;
   return [
     numberField({
       t,
@@ -394,6 +461,10 @@ function cardNumberFields(props: FieldSectionProps): ReactNode[] {
       max: 1_048_576,
       step: 1,
       editable: writable,
+      resetToken,
+      onInvalidChange: (invalid) => {
+        reportInvalid("minBytes", invalid);
+      },
       onChange: (next) => {
         setField("minBytes", next);
       },
@@ -408,6 +479,10 @@ function cardNumberFields(props: FieldSectionProps): ReactNode[] {
       max: 1,
       step: 0.01,
       editable: writable,
+      resetToken,
+      onInvalidChange: (invalid) => {
+        reportInvalid("minGainRatio", invalid);
+      },
       onChange: (next) => {
         setField("minGainRatio", next);
       },
@@ -422,6 +497,10 @@ function cardNumberFields(props: FieldSectionProps): ReactNode[] {
       max: 10_485_760,
       step: 1,
       editable: writable,
+      resetToken,
+      onInvalidChange: (invalid) => {
+        reportInvalid("stdoutCapBytes", invalid);
+      },
       onChange: (next) => {
         setField("stdoutCapBytes", next);
       },
@@ -449,32 +528,42 @@ function cardNumberFields(props: FieldSectionProps): ReactNode[] {
   ];
 }
 
-function RtkCard(props: CardSlotProps): ReactNode {
-  const snap = props.useCard((state) => state);
-  const writable = snap.status === "ready" && snap.writable;
-  const [touched, setTouched] = useState<Record<string, unknown>>({});
-  const [busy, setBusy] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
+/**
+ * 统计读面的状态与刷新。
+ *
+ * 卡片挂载期间每 `STATS_REFRESH_MS` 拉一次 summary/status；页面不可见时跳过，
+ * 一次刷新还在路上时也跳过下一拍，避免慢请求叠出并发。
+ */
+function useStatsRefresh(reader: StatsReader | undefined): {
+  readonly summary: StatsSummary | undefined;
+  readonly status: StatsStatus | undefined;
+  readonly resetStats: () => Promise<void>;
+} {
   const [summary, setSummary] = useState<StatsSummary | undefined>(undefined);
   const [status, setStatus] = useState<StatsStatus | undefined>(undefined);
-  const { statsRemote: reader, t } = props;
+  const refreshing = useRef(false);
 
   const refresh = useCallback(async (): Promise<void> => {
-    if (reader === undefined) {
+    if (reader === undefined || refreshing.current) {
       return;
     }
+    refreshing.current = true;
     try {
-      setSummary(await reader.summary());
-    } catch {
-      // 读面报错不清空已显示的数字：保留上一次成功的读数，比闪成「未连接」更少误导。
-      setSummary(undefined);
-    }
-    // 状态与统计各读各的：一条失败不该把另一条也抹掉（统计读面缺席时压缩照常，
-    // 而 rtk 装没装正是用户最需要看到的那一句）。
-    try {
-      setStatus(await reader.status());
-    } catch {
-      setStatus(undefined);
+      try {
+        setSummary(await reader.summary());
+      } catch {
+        // 读面报错不清空已显示的数字：保留上一次成功的读数，比闪成「未连接」更少误导。
+        setSummary(undefined);
+      }
+      // 状态与统计各读各的：一条失败不该把另一条也抹掉（统计读面缺席时压缩照常，
+      // 而 rtk 装没装正是用户最需要看到的那一句）。
+      try {
+        setStatus(await reader.status());
+      } catch {
+        setStatus(undefined);
+      }
+    } finally {
+      refreshing.current = false;
     }
   }, [reader]);
 
@@ -482,14 +571,52 @@ function RtkCard(props: CardSlotProps): ReactNode {
     void refresh();
   }, [refresh]);
 
-  const view = draftFields(touched, snap.value);
+  useEffect(() => {
+    const timer = globalThis.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void refresh();
+      }
+    }, STATS_REFRESH_MS);
+    return () => {
+      globalThis.clearInterval(timer);
+    };
+  }, [refresh]);
+
+  const resetStats = useCallback(async (): Promise<void> => {
+    if (reader === undefined) {
+      return;
+    }
+    try {
+      setSummary(await reader.reset());
+    } catch {
+      setSummary(undefined);
+    }
+  }, [reader]);
+
+  return { summary, status, resetStats };
+}
+
+function RtkCard(props: CardSlotProps): ReactNode {
+  const snap = props.useCard((state) => state);
+  const writable = snap.status === "ready" && snap.writable;
+  const [touched, setTouched] = useState<Record<string, unknown>>({});
+  const [busy, setBusy] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const { statsRemote: reader, t } = props;
+  const { summary, status, resetStats } = useStatsRefresh(reader);
+  // 越界集与重置信号由 shared 的 `useInvalidFields()` 提供（六个仓共用同一套判定）。
+  const invalid = useInvalidFields();
+  const { blocked, fields: invalidFields, resetToken, reportInvalid } = invalid;
+
+  const view = draftFields(touched, snap.value, status?.supported === true);
   const dirty = diffTouched(touched, snap.value);
+  const pending = new Set([...dirty, ...invalidFields]);
   const setField = (name: string, draft: unknown): void => {
     setTouched((prev) => ({ ...prev, [name]: draft }));
   };
 
   const save = async (): Promise<void> => {
-    if (dirty.length === 0) {
+    if (dirty.length === 0 || blocked) {
       return;
     }
     setBusy(true);
@@ -501,6 +628,7 @@ function RtkCard(props: CardSlotProps): ReactNode {
         return;
       }
       setTouched((prev) => withoutKeys(prev, dirty));
+      invalid.clear();
     } catch (error) {
       setSaveError(t("saveFailed", { reason: errorText(error) }));
     } finally {
@@ -508,26 +636,16 @@ function RtkCard(props: CardSlotProps): ReactNode {
     }
   };
 
-  const resetStats = async (): Promise<void> => {
-    if (reader === undefined) {
-      return;
-    }
-    try {
-      setSummary(await reader.reset());
-    } catch {
-      setSummary(undefined);
-    }
-  };
-
   const saveBar = createElement(SaveBar, {
-    dirty: dirty.length > 0,
+    dirty: pending.size > 0,
+    blocked,
     busy,
     writable,
-    error: saveError,
+    error: saveError ?? (blocked ? t("invalidFields") : null),
     saveLabel: t("save"),
     savingLabel: t("saving"),
     revertLabel: t("revert"),
-    dirtyLabel: t("dirtyCount", { count: dirty.length }),
+    dirtyLabel: t("dirtyCount", { count: pending.size }),
     cleanLabel: t("statusClean"),
     readOnlyLabel: t("statusReadOnly"),
     onSave: () => {
@@ -536,6 +654,7 @@ function RtkCard(props: CardSlotProps): ReactNode {
     onDiscard: () => {
       setTouched({});
       setSaveError(null);
+      invalid.clear();
     },
   });
 
@@ -557,9 +676,9 @@ function RtkCard(props: CardSlotProps): ReactNode {
     createElement(
       Section,
       { title: t("switchSection") },
-      cardModeFields({ t, view, writable, setField }),
-      cardFilterFields({ t, view, writable, setField }),
-      cardNumberFields({ t, view, writable, setField }),
+      cardModeFields({ t, view, writable, setField, resetToken, reportInvalid }),
+      cardFilterFields({ t, view, writable, setField, resetToken, reportInvalid }),
+      cardNumberFields({ t, view, writable, setField, resetToken, reportInvalid }),
     ),
     saveBar,
   );
@@ -612,12 +731,14 @@ interface ClientCtx {
 
 function apply(ctx: ClientCtx): void {
   ctx.effect(() => {
+    const disposeShared = ensureCardUiCss();
     const tag = document.createElement("style");
     tag.id = STYLE_ID;
-    tag.textContent = `${CARD_CSS}\n${CARD_UI_CSS}`;
+    tag.textContent = CARD_CSS;
     document.head.append(tag);
     return () => {
       tag.remove();
+      disposeShared();
     };
   }, "rtk-card: styles");
 

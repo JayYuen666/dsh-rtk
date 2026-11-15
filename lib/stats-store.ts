@@ -136,7 +136,7 @@ export function createStatsStore(table: StatsTable): StatsStore {
           byForm: { ...acc.byForm, prefix: acc.byForm.prefix + 1 },
         };
       } else {
-        const entry = acc.byFilter[input.filter] ?? { commands: 0, savedBytes: 0 };
+        const entry = acc.byFilter[input.filter] ?? { commands: 0, savedBytes: 0, savedTokens: 0 };
         acc = {
           commands: acc.commands + 1,
           originalBytes: acc.originalBytes + input.originalBytes,
@@ -149,6 +149,7 @@ export function createStatsStore(table: StatsTable): StatsStore {
             [input.filter]: {
               commands: entry.commands + 1,
               savedBytes: entry.savedBytes + (input.originalBytes - input.compressedBytes),
+              savedTokens: entry.savedTokens + (input.originalTokens - input.compressedTokens),
             },
           },
         };
@@ -254,12 +255,13 @@ export function createDeferredStatsStore(ctx: DeferredStatsContext): DeferredSta
         const opened = await openStatsTable(ctx.storageDomain);
         // 域的 close 由调用方负责（facility 不把 domain 绑到任何 consumer fiber），
         // 所以「谁 open 谁 close」：挂本插件 fiber 的 disposer（卸载时按注册逆序跑）。
-        ctx.effect(
-          () => () => {
-            void opened.close();
-          },
-          "rtk: stats domain",
-        );
+        //
+        // **disposer 要把 close 的 promise 交回去**，不能 `() => { void opened.close(); }`。
+        // `ctx.effect` 的契约是「返回 thenable 就等它」，返回 undefined 等于宣告「同步就撤完了」：
+        // 卸载随即返回，而域还要等自己的写入链跑完才释放名字（`DomainImpl.runClose()` 的
+        // `await this.chain` 之后才 `onClosed()` 把名字从 reserved 里删掉）。这中间重新装配，
+        // 就会撞 `domain 'rtk_stats' is already open`——真机现场那条「统计存储打不开」。
+        ctx.effect(() => () => opened.close(), "rtk: stats domain");
         active = opened.store;
         // `openStatsTable` 内部已经 load 过一次；切换后不必再调（`StatsStore.load()` 同步）。
       } catch (error) {

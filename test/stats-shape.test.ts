@@ -139,6 +139,65 @@ describe("落盘形状与投影形状的分工", () => {
     }
   });
 
+  it("存量账本没有 token 两列时，topFilters 的占比是 0 而不是 NaN", () => {
+    // 域版本 ≤2 的记录里每条 filter 的 savedTokens 都是 0、总 originalTokens 也是 0。
+    // 除下去是 NaN，而 NaN 会被卡片原样打进 style 宽度（`width: NaN%`）——浏览器静默忽略，
+    // 症状是柱子一根都看不见，且没有任何东西会报错。所以这一格必须单独钉。
+    const summary = summarize({
+      ...EMPTY_ACCUMULATOR,
+      commands: 1,
+      originalBytes: 200,
+      compressedBytes: 100,
+      byFilter: { "cargo-test": { commands: 1, savedBytes: 100, savedTokens: 0 } },
+    });
+    assert.deepEqual(
+      summary.topFilters.map((row) => row.sharePct),
+      [0],
+    );
+    assert.equal(summary.topFilters.length, 1);
+  });
+
+  it("topFilters 的占比是各 filter 在总节省 token 中的份额，合计 100%", () => {
+    // 分母必须是「总节省 token」（originalTokens - compressedTokens），不是总原文 token。
+    // 后者会让所有 filter 的占比之和等于整体节省率，读起来像分布但实际是贡献率。
+    const summary = summarize({
+      ...EMPTY_ACCUMULATOR,
+      originalTokens: 1000,
+      compressedTokens: 600,
+      byFilter: {
+        "cargo-test": { commands: 1, savedBytes: 10, savedTokens: 300 },
+        grep: { commands: 1, savedBytes: 10, savedTokens: 100 },
+      },
+    });
+    assert.deepEqual(
+      summary.topFilters.map((row) => [row.filter, row.sharePct]),
+      [
+        ["cargo-test", 75],
+        ["grep", 25],
+      ],
+    );
+  });
+
+  it("topFilters 按 savedTokens 降序，且最多 6 条", () => {
+    // 只验排序与截断这两件事：卡片拿它直接画柱子，顺序错就是「第二大的柱子更长」。
+    const byFilter = Object.fromEntries(
+      ["f1", "f2", "f3", "f4", "f5", "f6", "f7"].map((filter, index) => [
+        filter,
+        { commands: 1, savedBytes: 10, savedTokens: index * 10 },
+      ]),
+    );
+    const summary = summarize({
+      ...EMPTY_ACCUMULATOR,
+      originalTokens: 1000,
+      compressedTokens: 500,
+      byFilter,
+    });
+    assert.deepEqual(
+      summary.topFilters.map((row) => row.filter),
+      ["f7", "f6", "f5", "f4", "f3", "f2"],
+    );
+  });
+
   it("summarize 的输出能过投影 schema（两处口径不会分叉）", () => {
     const summary = summarize({
       ...EMPTY_ACCUMULATOR,

@@ -19,6 +19,8 @@ const CARGO_TEST = "cargo test";
 const GIT_SHOW_HEAD = "git show HEAD";
 const VITEST_VERSION = "vitest-version";
 const DENY_TABLE = "deny-table";
+/** 复合命令的两段样例：后半段命中拒绝表那一组反复用同一串。 */
+const CD_PREFIX = "cd x && ";
 const VITEST_RUN = "vitest run";
 const GH_PR_VIEW = "gh pr view";
 const HEADER_CWD = "/from/header";
@@ -69,10 +71,27 @@ describe("结构判据", () => {
     assert.equal(gate("rtk cargo test"), "already-rtk");
   });
 
-  it("复合命令", () => {
-    assert.equal(gate("cd /tmp && cargo test"), "compound");
-    assert.equal(gate("cargo test | tee log"), "compound");
+  it("复合命令：可拆的放行、拆不开的拒", () => {
+    // 可逐段拆分的交给 rtk 逐段改写（见 prefix-safety 的 splitCommand）。
+    assert.equal(gate("cd /tmp && cargo test"), undefined);
+    assert.equal(gate("cargo test | tee log"), undefined);
+    // 拆不开的仍然整条拒：重定向 / 命令替换 / 后台。
     assert.equal(gate("cargo test > o.txt"), "compound");
+    assert.equal(gate("echo $(cargo test)"), "compound");
+    assert.equal(gate("cargo test &"), "compound");
+  });
+
+  it("复合命令逐段判：后半段命中拒绝表就整条原样执行", () => {
+    // 放开复合命令之后必须补这一组，否则「首词是 cd」会让内建表整片失效：
+    // `cd x && git diff` 会被 rtk 改成 `cd x && rtk git diff`，丢 5 行 patch 头且不可 apply。
+    assert.equal(gate(`${CD_PREFIX}git diff`), DENY_TABLE);
+    assert.equal(gate(`${CD_PREFIX}git log`), DENY_TABLE);
+    assert.equal(gate(`${CD_PREFIX}cargo clippy`), DENY_TABLE);
+    assert.equal(gate(`${CD_PREFIX}ls`), DENY_TABLE);
+    assert.equal(gate(`${CD_PREFIX}find . -name x`), DENY_TABLE);
+    // 没命中的照常放行（逐段判不等于整条拒）。
+    assert.equal(gate(`${CD_PREFIX}cargo test`), undefined);
+    assert.equal(gate(`${CD_PREFIX}cargo build`), undefined);
   });
 
   it("详情 flag", () => {

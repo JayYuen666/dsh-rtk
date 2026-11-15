@@ -5,7 +5,12 @@
 // 之类的缺口后可以直接打开。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
-import { DEFAULT_ENABLED_FILTERS, PIPE_TABLE, filterOf } from "../lib/command-filter.ts";
+import {
+  ALL_FILTERS,
+  DEFAULT_ENABLED_FILTERS,
+  PIPE_TABLE,
+  filterOf,
+} from "../lib/command-filter.ts";
 
 // 启用集合装的是 **rtk filter 名**（`enabledFilters` 在 Config 里的就是这些），不是行 id：
 // 生产路径把它原样传进来，所以判据必须是「这行的 filter 在不在集合里」。
@@ -32,6 +37,15 @@ const KNOWN = new Set([
 const ALL = new Set(PIPE_TABLE.map((entry) => entry.filter));
 const CARGO_TEST = "cargo test";
 const TEST_SCRIPT = "test";
+
+describe("all filters", () => {
+  it("是 PIPE_TABLE 的去重排序名单，供卡片提示展示完整可用名", () => {
+    assert.deepEqual(ALL_FILTERS, [...new Set(PIPE_TABLE.map((entry) => entry.filter))].toSorted());
+    assert.deepEqual(new Set(ALL_FILTERS), ALL);
+    // 名单必须比默认启用集合宽：只列默认三项就是原提示的问题。
+    assert.ok(ALL_FILTERS.length > DEFAULT_ENABLED_FILTERS.length);
+  });
+});
 
 describe("filterOf", () => {
   it("cargo test → cargo-test", () => {

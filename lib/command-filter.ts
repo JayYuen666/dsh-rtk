@@ -78,6 +78,11 @@ export const PIPE_TABLE: readonly PipeEntry[] = [
   { id: "find", pattern: /^(?:find|fd)(?:\s|$)/u, filter: "find" },
 ];
 
+/** 卡片提示用：表里出现过的全部 filter 名（去重排序），不是只有默认启用那三项。 */
+export const ALL_FILTERS: readonly string[] = [
+  ...new Set(PIPE_TABLE.map((entry) => entry.filter)),
+].toSorted();
+
 /** 命中表且该行 filter 已启用才返回 filter 名；否则 `undefined`（这条不做 pipe 压缩）。 */
 export function filterOf(cmd: string, enabled: ReadonlySet<string>): string | undefined {
   const trimmed = cmd.trimStart();

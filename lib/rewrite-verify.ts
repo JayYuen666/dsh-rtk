@@ -6,7 +6,14 @@
  * 为什么不能只信 rtk 的退出码：rc=3 只说明「有等价改写」，不说明改写对插件无损。实测两类反例——
  * 把 rtk 插进 wrapper 内部（`uv run cargo test` → `uv run rtk cargo test`），以及把
  * `npm run lint` 塌缩成 `rtk lint`（用户脚本完全不跑，无 eslint 时仍 rc=0 伪造成功）。
+ *
+ * 复合命令按段校验：`lib/prefix-safety.ts` 的 `splitCommand` 先把原命令与改写结果各拆成若干段，
+ * 分隔符序列必须逐一相同，然后**每一段各自**走下面这套 P1~P4——没被动过的段要求逐字符相同，
+ * 被动过的那段必须是「只在前插位置多了 `rtk `」。这样 `cd /tmp && cargo test` →
+ * `cd /tmp && rtk cargo test` 能通过（`cd` 那段原样、后一段是纯前插），而
+ * `cd /tmp && rtk cargo test` 若被改成动到 `cd` 段、或把两段并成一段，都仍然被拒。
  */
+import { splitCommand } from "./prefix-safety.ts";
 
 /** P1 要求的前缀形态：`rtk` 加一个空格。**不带**空格的那种（`rtk` / `rtkx`）不算前插形态。 */
 const RTK_PREFIX = "rtk ";
@@ -88,14 +95,68 @@ function checkSuffix(original: string, rest: string): string | undefined {
   return reject;
 }
 
-/** 校验一次改写；`undefined` = 通过。 */
-export function verifyRewrite(original: string, rewritten: string): string | undefined {
-  const prefixProblem = checkPrefix(rewritten);
-  const rest = rewritten.slice(RTK_PREFIX.length).trimEnd();
+/**
+ * 单段校验（P1~P4）；`undefined` = 通过。
+ *
+ * 两侧都只 `trimStart`：`trimEnd` 会把 `rtk    ` 这类「只有前缀没有正文」的产物洗成 `rtk`，
+ * 于是 P2 的 `empty-rest` 永远不出现、错误被误报成 `not-rtk-prefixed`（判据还在，只是答错）。
+ */
+function verifySingle(original: string, rewritten: string): string | undefined {
+  // 两侧都按**段**校验，所以段尾的空白也得洗掉：`cargo test ; echo done` 的第一段是
+  // `"cargo test "`（分隔符前的空格），不 trim 会让 P3 的 `endsWith(rest)` 永远不成立，
+  // 症状是「明明只是前插了 rtk，却被报 `not-a-suffix`」。
+  const source = original.trimStart().trimEnd();
+  // 原段本身已经是 rtk 形态：再压一层就是「压两次比压一次更坏」（`rtk rtk cargo test` 这类
+  // 二次前插在 P1~P4 眼里完全合法，只有这一条能拦住它）。
+  if (source.startsWith(RTK_PREFIX)) {
+    return "already-rtk";
+  }
+  const target = rewritten.trimStart();
+  const prefixProblem = checkPrefix(target);
+  const rest = target.slice(RTK_PREFIX.length).trimEnd();
   const restProblem = prefixProblem === undefined ? checkRest(rest) : undefined;
   const suffixProblem =
     prefixProblem === undefined && restProblem === undefined
-      ? checkSuffix(original, rest)
+      ? checkSuffix(source, rest)
       : undefined;
   return prefixProblem ?? restProblem ?? suffixProblem;
+}
+
+/**
+ * 给单段的原因串加段号。单段命令保持裸串——既有断言逐字比对 `not-rtk-prefixed` 这些值，
+ * 加前缀会把它们全变成「第 0 段出了问题是 X」而不只是换了个措辞。
+ */
+function labelled(problem: string | undefined, index: number, total: number): string | undefined {
+  return problem !== undefined && total > 1 ? `segment ${String(index)}: ${problem}` : problem;
+}
+
+/**
+ * 校验一次改写；`undefined` = 通过。
+ *
+ * 单段命令走 `verifySingle` 本来的判据；多段命令要求「分隔符逐一相同、段数相同」，且每段
+ * 要么原样不动、要么自身通过 `verifySingle`。任一段拆不出来（`splitCommand` 返回 undefined）
+ * 就整条拒——那说明这条命令的形状本就不该进改写面（`structuralReject` 也会拒它）。
+ */
+export function verifyRewrite(original: string, rewritten: string): string | undefined {
+  const before = splitCommand(original);
+  const after = splitCommand(rewritten);
+  if (before === undefined || after === undefined || before.length !== after.length) {
+    return "not-segmentable";
+  }
+  // 逐段判，第一处问题即定案（后面的段判不判都不影响结论，且早退省掉重复的比较）。
+  const problems = before.map((segment, index): string | undefined => {
+    const produced = after[index];
+    const keptSeparator = produced !== undefined && produced.sep === segment.sep;
+    const untouched = produced !== undefined && produced.text === segment.text;
+    let problem: string | undefined;
+    if (!keptSeparator) {
+      // 分隔符被换掉（`&&` 变 `;`、`|` 变 `&&`）等于改了命令的连接语义，一律拒。
+      problem = "separator-changed";
+    } else if (!untouched) {
+      // 单段命令保持原来的裸原因串（既有断言逐字比对它）；多段时点名是第几段出的问题。
+      problem = labelled(verifySingle(segment.text, produced.text), index, before.length);
+    }
+    return problem;
+  });
+  return problems.find((each) => each !== undefined);
 }

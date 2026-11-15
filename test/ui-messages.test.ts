@@ -72,6 +72,8 @@ describe("设置卡双语字典", () => {
       saveFailed: ["reason"],
       rtkTooOldHint: ["version", "minimum"],
       rtkReadyHint: ["version", "path"],
+      statsChartRow: ["filter", "tokens", "share"],
+      filtersHint: ["filters"],
     };
     for (const [key, expected] of Object.entries(EXPECTED) as [
       keyof UiMessages,
@@ -91,5 +93,21 @@ describe("设置卡双语字典", () => {
         assert.ok(key in EXPECTED, `${key} 带占位符，却没登记到期望表`);
       }
     }
+  });
+
+  it("统计图与形态提示写清占比口径、热更新与越界处理", () => {
+    // 这些是上两轮真机验收暴露的误导点：占比没有分母说明、过滤器范围写错、
+    // 形态改完要重启。现在形态是运行期现读，文案要承诺下一次调用即生效。
+    assert.match(UI_MESSAGES.zh.statsChartRow, /占全部节省/u);
+    assert.match(UI_MESSAGES.zh.statsChartRow, /个 token/u);
+    assert.match(UI_MESSAGES.zh.statsChartHint, /柱长/u);
+    assert.match(UI_MESSAGES.zh.filtersHint, /仅结果压缩/u);
+    assert.match(UI_MESSAGES.zh.formsHint, /下一次工具调用/u);
+    assert.match(UI_MESSAGES.zh.enabledHintPrefix, /检测到受支持的 rtk/u);
+    assert.notEqual(UI_MESSAGES.zh.enabledHintPrefix, UI_MESSAGES.zh.enabledHintWithPipe);
+    assert.match(UI_MESSAGES.zh.invalidFields, /超出范围|修正/u);
+    assert.match(UI_MESSAGES.en.statsChartRow, /of total saved/u);
+    assert.match(UI_MESSAGES.en.formsHint, /next tool call/u);
+    assert.match(UI_MESSAGES.en.enabledHintPrefix, /follows rtk readiness/u);
   });
 });

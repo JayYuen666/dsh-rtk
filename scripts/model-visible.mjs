@@ -263,7 +263,7 @@ async function startListener(options) {
     supported: () => true,
     // 诊断日志默认关（与部署默认一致）。
     log: undefined,
-    forms: ["pipe"],
+    forms: () => ["pipe"],
     // 四处 volatile 配置项在 `PipeOptions` 里是取值函数（卡片改完下一次调用即生效）。
     enabledFilters: () => ["cargo-test"],
     minBytes: () => 16,
@@ -296,6 +296,7 @@ async function startListener(options) {
         savingsPct: 0,
         byFilter: {},
         byForm: { prefix: 0, pipe: 0 },
+        topFilters: [],
       }),
       reset: () => Promise.resolve(),
       flush: () => Promise.resolve(),

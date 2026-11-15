@@ -28,6 +28,13 @@ import {
   resolveLocalePreference,
 } from "@jayyuen66/dsh-plugin-shared/lib/locale";
 import { hasMethods, isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+// 双路径装载的自保：dshmarket 运行期热装时会在 `<profile>/.dsh-market/` 下造一棵它自己的
+// Include 子树（条目 id 形如 `mkt-<包>`），把同一份 host.js 再挂一次；而 profile 的
+// `dsh.profile.bundles` 那条 bundle 行仍会被宿主按 patch 重新组装。于是同一个进程里
+// `apply` 跑两遍，第二遍的注册面（工具 / 设置页策略 / Typert Remote 服务）撞「同名已注册」
+// 而抛，那条 fiber 落 failed —— 用户在插件页看到「启动失败」。抢这把锁把第二遍挡在注册面
+// 之外；锁随在册那一份的 fiber 卸载自动释放，所以后续装配仍能抢到。
+import { claimInstance } from "@jayyuen66/dsh-plugin-shared/lib/instance-lock";
 
 import { RTK_REWRITE_ENV, runRtkPipe, runRtkRewrite } from "./lib/cli.ts";
 import { DEFAULT_ENABLED_FILTERS, filterOf } from "./lib/command-filter.ts";
@@ -172,12 +179,31 @@ export interface HostContext {
 }
 
 /**
+ * C 形态在 `HostContext` 之上多要的那一位：把 disposer 挂到**本插件 fiber** 的口。
+ *
+ * 为什么非它不可：`agent.ctx.tools.register()` 交回的 disposer 归**调用方 ctx** 所有，而这里的
+ * 调用方是 `agent.ctx`（agent 的作用域 fiber），不是插件 fiber。裸调用的后果是遮蔽体在插件卸载后
+ * 仍留在 agent 作用域里，下一次装配再注册就撞 `tool "bash" is already registered in this scope`
+ * （真机现场，`probe-scope5` 的 A 行复现）。经 `ctx.effect` 转手之后，回收权才落在插件手里。
+ *
+ * 独立成一层而不是往 `HostContext` 里加：`HostContext` 是「四个服务面 + `get`/`on`」，
+ * 其余几个 installer 与半栈夹具都只造那几样，加进去会让它们全部失配。
+ */
+export interface PrefixContext extends HostContext {
+  readonly effect: Context["effect"];
+}
+
+/**
  * C 形态的装配参数。收已解析的值而不是整个 `Config`：volatile 与非 volatile 字段的读法不同
  * （前者要 `.get()`），把那个差别收在 `apply` 一处，本函数就能脱离 cordis 的配置投影单独测。
  */
 export interface PrefixOptions {
   readonly enabled: () => boolean;
-  readonly forms: readonly string[];
+  /**
+   * 启用的形态，运行期现读。装配期不再按它决定装不装：层常驻，execute 每次判
+   * `forms().includes("prefix")`；卡片改完形态后下一次工具调用就生效，不需要重启宿主。
+   */
+  readonly forms: () => readonly string[];
   /**
    * 下面五位 volatile 配置项**都是取值函数，不是值快照**。
    *
@@ -301,6 +327,37 @@ function isToolDefinition(value: unknown): value is ToolDefinition {
 }
 
 /**
+ * 遮蔽体自己的记号。**必须是全局注册表里的 Symbol**（`Symbol.for`）：market 的热挂子树与本包
+ * 的 bundle 层是**两次 `apply`、同一份模块**（`file://` 与裸包名解析到同一个实例，实测同一 id），
+ * 两次装配各自新建闭包，普通字段区分不了「这是不是我写的那个遮蔽体」。
+ *
+ * 它解决的是「两份实例同时存活」这一形态：第一份已把遮蔽体注册进 agent 作用域，第二份的
+ * `get("bash", agent)` 解析出来的就是它——没有记号时只能去 `register` 然后撞同名，而那条错误
+ * 会把**整个插件**打成 `fiberPhase: failed`（真机现场：`tool "bash" is already registered in
+ * this scope`）。有记号就能认出「本插件已经装过了」，让路而不是抛。
+ */
+const RTK_SHADOW_MARKER = Symbol.for("jayyuen66.dsh-rtk.shadow");
+
+/** 这个工具体是不是本插件装上去的遮蔽体（按运行期事实判，不靠类型断言）。 */
+function isRtkShadow(value: unknown): boolean {
+  return (
+    typeof value === "object" && value !== null && Reflect.get(value, RTK_SHADOW_MARKER) === true
+  );
+}
+
+/**
+ * 给遮蔽体打上记号并原样交回。
+ *
+ * 用 `Reflect.set` 而不是在对象字面量里写 `[RTK_SHADOW_MARKER]: true`：`ToolDefinition` 是宿主
+ * 的类型，收不下一个插件私有的 Symbol 键，字面量写法会被 `tsc` 判成多余属性（实测 `TS2353`）。
+ * 而这一位本来就不是类型面——它是运行期记号，只给 `isRtkShadow` 读。
+ */
+function markAsShadow<Tool extends object>(target: Tool): Tool {
+  Reflect.set(target, RTK_SHADOW_MARKER, true);
+  return target;
+}
+
+/**
  * 跑一次 `rtk --version` 读原始回执。
  *
  * 结果有三个去处：**设置卡的状态行**（路径 + 版本）、**装配期的一条 warn**（探不到与低于下限
@@ -362,9 +419,10 @@ export async function readRtkVersion(ctx: HostContext): Promise<string | undefin
  * 不是「装上一个不干活的壳」。装了壳会让模型看到的 bash 来自本插件、出问题要往这里查；
  * 不装则宿主原生 bash 原样生效，插件在该平台上等于不存在。
  *
- * 注意连带后果：v3.5 的 `enabledForms` 默认是 `['prefix']`、pipe 层默认关，所以在 win32 上
- * **两层都不装**——插件装载但完全不动命令与输出。这不是缺陷，是「默认只开前缀」在那条平台上的
- * 直接投影；要看效果的 Windows 用户得显式把 `enabledForms` 改成 `['pipe']`。
+ * 注意连带后果：默认 `enabledForms` 是 `['prefix']`（不含 pipe），所以在 win32 上
+ * **两层都不生效**——前缀层整层不装，结果压缩层的监听器虽然常驻，但 `decide` 现读到的
+ * `forms` 不含 pipe，一律原样放行。插件装载但完全不动命令与输出。这不是缺陷，是「默认只开
+ * 前缀」在那条平台上的直接投影；要看效果的 Windows 用户得显式把 `enabledForms` 改成 `['pipe']`。
  */
 export function prefixSupportedOn(platform: NodeJS.Platform): boolean {
   return platform !== "win32";
@@ -391,16 +449,15 @@ function readLiveAgents(ctx: HostContext): readonly Agent[] {
 /**
  * C 形态装配：给每个新 agent 在它自己的作用域里注册一个同名的 bash，内部先求改写再转调。
  *
- * 装配期门禁三条，缺一不装：
- *   1. `options.forms` 含 `prefix`；
- *   2. 平台被认作支持（见 `prefixSupportedOn`）；
- *   3. 装配时 `findOnPath("rtk")` 命中。
+ * 装配期门禁两条，缺一不装：
+ *   1. 平台被认作支持（见 `prefixSupportedOn`）；
+ *   2. 装配时 `findOnPath("rtk")` 命中。
  *
- * **`enabled` 不在这三条里**，它在 `execute` 里逐次现读（`options.enabled()`）——与 B 形态同一分工：
- * 装配期只判「形态」与「环境能不能装」，运行期判「用户开没开」。早先这里还有一条 `!options.enabled()`
- * 的早退，而 `enabled` 默认 false，于是**默认路径是坏的**：用户装好插件、在卡片上打开总开关、
- * 下一次调用 bash 时什么都没发生——因为遮蔽层在装配那一刻就没装、`agent/created` 监听器也没挂，
- * 之后再打开开关没有任何东西会去补装。spec §4.0.1 的伪码本来就把这道判断写在 `execute` 里。
+ * **`forms` 与 `enabled` 都不在这两条里**：层常驻，`execute` 每次现读
+ * `forms().includes("prefix")`、`enabled()` 与 `supported()`。卡片改完形态后下一次工具调用
+ * 就生效，不需要重启宿主。早先 `forms` 是装配期门禁，于是「切到 prefix」必须重启；
+ * `enabled` 早退则让默认路径整条不通（装好插件、打开开关，下一次 bash 什么都没发生）。
+ * spec §4.0.1 的伪码本来就把这两道判断写在 `execute` 里。
  *
  * **版本门也不在这里**：装配期只判「rtk 在不在 PATH 上」，版本要等异步探测回来才知道。所以
  * 「低于下限就停手」落在 `execute` 里的 `options.supported() === false`（逐次现读），不是
@@ -415,14 +472,11 @@ function readLiveAgents(ctx: HostContext): readonly Agent[] {
  * 测试机上永远走不到，若焊死 `process.platform`，那条分支只能靠放宽阈值或 ignore 注释糊过去。
  */
 export function installPrefixShadow(
-  ctx: HostContext,
+  ctx: PrefixContext,
   options: PrefixOptions,
   deps: PrefixDeps,
   platform: NodeJS.Platform = process.platform,
 ): void {
-  if (!options.forms.includes("prefix")) {
-    return;
-  }
   if (!prefixSupportedOn(platform)) {
     return;
   }
@@ -456,6 +510,19 @@ export function installPrefixShadow(
       options.log?.("[rtk] prefix: this agent has no executable bash tool; shadow not installed");
       return;
     }
+    // **让路**：解析出来的已经是本插件装上去的遮蔽体，说明另一个实例先到了。
+    //
+    // 这不是理论情形：market 的热挂子树用 `file://…/host.js` 直连产物，与 bundle 层的裸包名
+    // 解析到**同一个模块实例**（实测同一个 id），但两条层条目各自起一个 fiber、各跑一次 `apply`。
+    // 第一份注册完，第二份的 `get("bash", agent)` 拿到的就是那份遮蔽体；此时若照旧 `register`，
+    // 宿主会抛 `tool "bash" is already registered in this scope`，**整条插件被打成
+    // `fiberPhase: failed`**——真机现场就是这样，用户看到的是「启动失败」。
+    //
+    // 让路是正确取舍：功能由先到的那一份提供，两份的装配参数来自同一份配置，行为没有差别。
+    if (isRtkShadow(found)) {
+      options.log?.("[rtk] prefix: another instance already installed the shadow; skipping");
+      return;
+    }
     const orig = found;
     // 继承被遮蔽工具的全部字段（description/parameters/output/render 等），不手抄——
     // 手抄会随宿主升级漂移，模型看到的 schema 也会与真实执行面不符。
@@ -476,7 +543,11 @@ export function installPrefixShadow(
     const shadow: ToolDefinition = {
       ...orig,
       async execute(args: unknown, exec: ToolRunContext): Promise<unknown> {
-        if (!options.enabled() || options.supported() === false) {
+        if (
+          !options.enabled() ||
+          !options.forms().includes("prefix") ||
+          options.supported() === false
+        ) {
           return orig.execute(args, exec);
         }
         const invocation = readInvocation(args);
@@ -548,8 +619,15 @@ export function installPrefixShadow(
         return result;
       },
     };
+    markAsShadow(shadow);
     // 注册进 agent 的作用域：宿主据此遮蔽同名 global 工具，并随 agent 销毁自动退场。
-    agent.ctx.tools.register(shadow);
+    //
+    // **必须经 `ctx.effect` 转手**（插件 fiber 的 effect，不是 `agent.ctx` 的）：`register` 交回的
+    // disposer 归**调用方 ctx** 所有，而调用方是 `agent.ctx`——裸调用等于把回收权交给了 agent 的
+    // 作用域 fiber，插件卸载时它不会被触发，遮蔽体就留在那里（`probe-scope5` 的 A 行：卸载后
+    // `agent` 视图里仍是 `true`）。下一次装配 `installed` 是新的空 Set，于是又去注册，撞
+    // `already registered in this scope`。经插件 fiber 转手之后，卸载即回收（同一探针的 B 行）。
+    ctx.effect(() => agent.ctx.tools.register(shadow), "rtk: prefix shadow");
   };
 
   /**
@@ -581,8 +659,8 @@ export function installPrefixShadow(
 /**
  * B 形态的装配参数。同样只收已解析的值：volatile 与非 volatile 的读法差别留在 `apply` 一处。
  *
- * `forms` 里没有 `pipe` 时整条链路不装——这是「默认关闭但代码保留」的落点
- * （用户裁定：等官方补上 vitest 5 这类缺口后再打开）。
+ * `forms` 里没有 `pipe` 时监听器仍在栈上，但 `decide` 每次现读 forms 并原样放行。默认形态
+ * 不含 pipe 是刻意的：等官方补上 vitest 5 这类缺口后再打开（用户裁定）。
  */
 export interface PipeOptions {
   /**
@@ -594,7 +672,11 @@ export interface PipeOptions {
    * pipe 照样改写模型读到的输出（真宿主实测 2878B → 1299B），违反 `enabled` = 总开关的语义。
    */
   readonly enabled: () => boolean;
-  readonly forms: readonly string[];
+  /**
+   * 启用的形态，运行期现读。监听器常驻，`decide` 每次判 `forms().includes("pipe")`；
+   * 卡片改完形态后下一次工具结果就按新形态处理，不需要重启宿主。
+   */
+  readonly forms: () => readonly string[];
   /**
    * 下面四位 volatile 配置项与 `PrefixOptions` 的同名项一样**都是取值函数**：卡片改完、
    * 宿主写进配置之后，下一次 `tools/post-execute` 就该用新值。快照写法会让「卡片上的数字」
@@ -848,7 +930,7 @@ async function planForCommand(
   let plan: PipePlan | undefined;
   if (
     pipeStructuralReject(command) === undefined &&
-    !shouldSkipPipe({ callId: exec.callId }, options.forms, deps.rewrittenCalls)
+    !shouldSkipPipe({ callId: exec.callId }, options.forms(), deps.rewrittenCalls)
   ) {
     // 白名单**在这里现读**（不是装配期快照一份 Set）：`enabledFilters` 标了 volatile，
     // 用户在卡片上勾掉一个 filter 之后，下一次 post-execute 就该按新集合查表。
@@ -1002,12 +1084,12 @@ async function decide(
   try {
     // 下游已经换过值：那是它算好的结果，二次改写只会把两边口径搅在一起。
     //
-    // `options.enabled()` 必须在**每次**判定时现读，不能在装配期判一次：`enabled` 是 volatile
-    // 字段，用户可以在卡片上随时关掉它，而这条监听器那时已经在栈上了。装配期只判 `forms`
-    // （形态是启动期决定），运行期判 `enabled`（总开关）——C 形态在 `installPrefixShadow`
-    // 的 execute 里也是这么分工的。
+    // `enabled` 与 `forms` 都必须在**每次**判定时现读：两者都是 volatile 字段，用户可以在
+    // 卡片上随时开关/切换形态，而这条监听器常驻在栈上。C 形态在 `installPrefixShadow` 的
+    // execute 里也是同一分工。
     if (
       input.options.enabled() &&
+      input.options.forms().includes("pipe") &&
       input.options.supported() !== false &&
       decision.kind === "accept" &&
       !Object.hasOwn(decision, "value") &&
@@ -1035,17 +1117,14 @@ async function decide(
  * B 形态装配：挂 `tools/post-execute`，按命令命中的 filter 把**输出**压小。
  *
  * 定位要读准：B **不是** C 失败时的兜底，而是「C 够不着的那一格」——C 只改命令串
- * （`rtk rewrite` 决定范围），B 在结果侧按 filter 压输出。两者默认不同开：`enabledForms`
- * 默认只有 `prefix`，而这条链路在打开 `pipe` 之前不装。
+ * （`rtk rewrite` 决定范围），B 在结果侧按 filter 压输出。监听器常驻，`decide` 每次现读
+ * `forms().includes("pipe")`；卡片改完形态后下一次工具结果就按新形态处理，不需要重启。
  */
 export function installPostExecuteListener(
   ctx: HostContext,
   options: PipeOptions,
   deps: PipeDeps,
 ): void {
-  if (!options.forms.includes("pipe")) {
-    return;
-  }
   const base = { ctx, options, deps };
   ctx.on("tools/post-execute", (exec, result, next) => decide({ ...base, exec, result }, next));
 }
@@ -1060,17 +1139,18 @@ export function installPostExecuteListener(
  * `cordis.yml` 的 `config:` 并重启。所以**运行期调参项**标 volatile，**部署级预算项**不标。
  */
 const configSchema = Schema.object({
-  /** 用户开关。默认关闭：宿主不该在用户知情前改写命令。 */
-  enabled: Schema.boolean().default(false).volatile(),
+  /**
+   * 用户总开关。**没有静态默认值**：未显式设置时，有效值跟随 rtk 版本探测
+   * （`supported === true` 才默认开启）；探测回来前按关闭处理。手动切换会写入显式值，
+   * 此后显式值优先。
+   */
+  enabled: Schema.boolean().volatile(),
   /**
    * 启用的形态。默认只开 C（prefix）：B 的 vitest filter 在 5.x 上只剩一行 passthrough，
    * 且会在用户仓库里落 `.vitest/json/output.json`，等官方修好再默认打开。
    *
-   * **volatile 但只在装配期消费**：卡片要能写它（非 volatile 的字段宿主根本不投影进
-   * `describe()`，卡上就不会出现这一格），而两层——C 形态在 `agent/created` 里读、B 形态
-   * 按它决定挂不挂 post-execute——都是装配期读一次。所以它的效果与其他 volatile 不同：
-   * **改完要重启**，不是「下一次工具调用即生效」。这一位必须在文档里写明，否则卡片是在
-   * 承诺一件它做不到的事。
+   * **volatile 且运行期现读**：两层常驻，C 在 execute 里读、B 在 decide 里读；卡片改完
+   * 下一次工具调用即生效，不需要重启宿主。
    */
   enabledForms: Schema.array(Schema.union(["prefix", "pipe"]))
     .default(["prefix"])
@@ -1172,6 +1252,15 @@ export interface HostServices extends HostContext {
   readonly inject: (deps: readonly string[], callback: (child: InjectedContext) => void) => unknown;
   readonly effect: Context["effect"];
   readonly fiber: unknown;
+  /**
+   * cordis 的注册口（单实例锁要用）。**可选**：`HostContext` 那四个服务面之外的能力，
+   * 半栈夹具不一定造；缺了就是「能力缺席」，锁按放行处理（见 shared 的 lib/instance-lock）。
+   * 取值时把**对象本身**交出去，不要包一层 `{ provide }`：包出来的箭头恒是函数，会让
+   * 「没有注册口」伪装成「有注册口但 provide 抛错」，让路判据当场误判而把插件整个关掉。
+   */
+  readonly reflect?:
+    | { readonly provide?: ((name: string, value?: unknown) => unknown) | undefined }
+    | undefined;
 }
 
 /**
@@ -1220,6 +1309,14 @@ export function formsOr(forms: readonly string[] | undefined): readonly string[]
 }
 
 /**
+ * 形态的取值函数。装配期交出去的是「怎么读」，不是读到的值；卡片改完形态后，
+ * 下一次工具调用读到的就是新值。
+ */
+export function formsReaderOf(config: Config): () => readonly string[] {
+  return () => formsOr(config.enabledForms.get());
+}
+
+/**
  * volatile 字段的兜底口径（`get()` 交回 `undefined` 时用哪个值）。
  *
  * 九处读面都过它，而不是各自写 `?? 字面量`：那些字面量里每一个都必须与 schema 的 `.default()`
@@ -1233,24 +1330,20 @@ export function withDefault<TValue>(value: TValue | undefined, fallbackValue: TV
 /**
  * C 形态那几位 volatile 的取值函数（装配时原样交给 `installPrefixShadow`）。
  *
- * 单独成件而不是就地写成 `apply` 里面的箭头，有两个理由：
- *   · **可测**。`apply` 只跑一次，那些闭包体在整条装配栈里几乎走不到（要一个真 agent、
- *     一个真 bash 工具体、一次真 execute），于是「闭包到底是不是现读」这件事没有直接判据，
- *     只剩覆盖率裂隙。提到这一层之后，用例拿一个假的 `Config` 就能钉住。
- *   · **一处口径**。`enabled` 在 C/B 两层都要读，而两层各自的兜底必须同值；写成两个内联
- *     箭头时它们是两份独立的字面量，改一处不算改了另一处。
- *
- * 交回来的每一个都是**取值函数**：`apply` 只跑一次，快照下来的值此后永不更新，而标了
- * volatile 的字段名义上是「下一次工具调用即生效」。
+ * `enabled` 的兜底不是写死的 true：未显式设置时，由调用方传入的 `ready`（rtk 版本探测结果）
+ * 决定；探测回来前是 false。其余几位仍按 schema 默认值兜底。
  */
-export function prefixReadersOf(config: Config): {
+export function prefixReadersOf(
+  config: Config,
+  ready: () => boolean | undefined,
+): {
   readonly enabled: () => boolean;
   readonly denyCommands: () => readonly string[];
   readonly warnHint: () => boolean;
   readonly rewriteHostEnv: () => string;
 } {
   return {
-    enabled: () => withDefault(config.enabled.get(), false),
+    enabled: () => config.enabled.get() ?? ready() === true,
     denyCommands: () => withDefault(config.denyCommands.get(), []),
     warnHint: () => withDefault(config.warnHint.get(), true),
     rewriteHostEnv: () => withDefault(config.rewriteHostEnv.get(), ""),
@@ -1258,7 +1351,10 @@ export function prefixReadersOf(config: Config): {
 }
 
 /** B 形态那几位 volatile 的取值函数；理由同 `prefixReadersOf`。 */
-export function pipeReadersOf(config: Config): {
+export function pipeReadersOf(
+  config: Config,
+  ready: () => boolean | undefined,
+): {
   readonly enabled: () => boolean;
   readonly enabledFilters: () => readonly string[];
   readonly minBytes: () => number;
@@ -1266,7 +1362,7 @@ export function pipeReadersOf(config: Config): {
   readonly stdoutCapBytes: () => number;
 } {
   return {
-    enabled: () => withDefault(config.enabled.get(), false),
+    enabled: () => config.enabled.get() ?? ready() === true,
     // 兜底与 schema 的 `.default()` 读同一个常量：两处各写一份字面量时，改一处另一处不变，
     // 而只有退化态（volatile 读到空引用）才会走兜底，正常装出来的行为看不出来。
     enabledFilters: () => withDefault(config.enabledFilters.get(), DEFAULT_ENABLED_FILTERS),
@@ -1357,6 +1453,12 @@ export function createLocaleMessages(ctx: HostServices): () => Messages {
 }
 
 /**
+ * 单实例锁的服务名。取包名形态而**不带随机后缀**：名字必须每一份实例都算出同一个串才可能
+ * 互斥，随机后缀等于谁都能抢到。判据与边界见 shared 的 lib/instance-lock 头注释。
+ */
+const INSTANCE_LOCK_KEY = "@jayyuen66/dsh-rtk/instance";
+
+/**
  * 插件总装。
  *
  * 装配顺序有依赖，不能随意调换：设置页（卡片要读 config）→ 文案 thunk → 缓存与账本
@@ -1369,6 +1471,22 @@ function apply(ctx: unknown, config: Config): void {
     );
   }
   const host = ctx;
+
+  // 0. 抢单实例锁。抢不到说明同一作用域里已经有一份在册（market 热挂 + bundle 层双路径），
+  //    那一份已经把工具、设置页与读取面上齐了，本份再注册一遍不可能成功，只会把 fiber 打成
+  //    failed（真机现场：`tool "bash" is already registered in this scope`）。
+  //    放在最前面：让路那一份不该建缓存、不该开账本、不该装任何监听。
+  //    `get` 包一层箭头（成员的 `this` 不能丢），`reflect` 直接交对象本身。
+  const lockContext = {
+    get: (name: string): unknown => host.get(name),
+    reflect: host.reflect,
+  };
+  if (!claimInstance(lockContext, INSTANCE_LOCK_KEY)) {
+    host
+      .logger?.("rtk")
+      .warn("detected another live instance in this scope; this assembly steps aside");
+    return;
+  }
 
   // 1. 设置页注册。owner 必须是本插件 fiber：缺省是 settings 服务自己的 fiber，插件卸载时清不掉。
   //    经注入子上下文挂，随注入子上下文回收（兄弟仓 dsh-zvec-grep 的 configureSettingsPage 同款）。
@@ -1398,7 +1516,8 @@ function apply(ctx: unknown, config: Config): void {
     rtkPath: findOnPath("rtk") ?? null,
     rtkVersion: probed?.raw ?? null,
     supported: probed?.supported ?? null,
-    enabled: withDefault(config.enabled.get(), false),
+    // 未显式设置时跟随版本探测：探到受支持版本才默认开启；探测前/失败/过旧都是关闭。
+    enabled: config.enabled.get() ?? probed?.supported === true,
     // 复制一份：`StatsStatus` 的 `forms` 是可变数组（zod 的 `z.array` 交出来的是 `string[]`），
     // 而 `config.enabledForms` 是只读的 —— 直接把那个引用塞进投影，会让读面拿到一个能反改
     // 配置的对象。
@@ -1428,8 +1547,8 @@ function apply(ctx: unknown, config: Config): void {
   installPrefixShadow(
     host,
     {
-      ...prefixReadersOf(config),
-      forms: formsOr(config.enabledForms.get()),
+      ...prefixReadersOf(config, supported),
+      forms: formsReaderOf(config),
       vitestMaxMajor: config.vitestMaxMajor,
       rewriteTimeoutMs: config.rewriteTimeoutMs,
       log: diag,
@@ -1448,8 +1567,8 @@ function apply(ctx: unknown, config: Config): void {
   installPostExecuteListener(
     host,
     {
-      ...pipeReadersOf(config),
-      forms: formsOr(config.enabledForms.get()),
+      ...pipeReadersOf(config, supported),
+      forms: formsReaderOf(config),
       pipeTimeoutMs: config.pipeTimeoutMs,
       vitestMaxMajor: config.vitestMaxMajor,
       log: diag,

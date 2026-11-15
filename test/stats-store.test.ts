@@ -106,6 +106,7 @@ describe("summarize", () => {
       savingsPct: 0,
       byFilter: {},
       byForm: { prefix: 0, pipe: 0 },
+      topFilters: [],
     });
   });
 
@@ -158,8 +159,12 @@ describe("createStatsStore", () => {
     assert.equal(summary.compressedTokens, 85);
     // 逐项整体比对而不是逐字段取：zod 4 的 `z.record(z.string(), ...)` 在类型上把任意键
     // 都当成必定存在（索引签名不是可选的），所以 `?.` 会被判成多余的条件判断。
-    assert.deepEqual(summary.byFilter[CARGO_TEST], { commands: 2, savedBytes: 1350 });
-    assert.deepEqual(summary.byFilter["pytest"], { commands: 1, savedBytes: 180 });
+    assert.deepEqual(summary.byFilter[CARGO_TEST], {
+      commands: 2,
+      savedBytes: 1350,
+      savedTokens: 675,
+    });
+    assert.deepEqual(summary.byFilter["pytest"], { commands: 1, savedBytes: 180, savedTokens: 90 });
   });
 
   it("prefix 只加命令数与 byForm.prefix，字节与 byFilter 一个都不动", () => {
@@ -176,7 +181,9 @@ describe("createStatsStore", () => {
     assert.equal(summary.compressedBytes, 100);
     assert.equal(summary.originalTokens, 500);
     assert.equal(summary.compressedTokens, 50);
-    assert.deepEqual(summary.byFilter, { [CARGO_TEST]: { commands: 1, savedBytes: 900 } });
+    assert.deepEqual(summary.byFilter, {
+      [CARGO_TEST]: { commands: 1, savedBytes: 900, savedTokens: 450 },
+    });
   });
 
   it("load 从存量记录恢复；没存量时用空账本", async () => {
@@ -266,7 +273,7 @@ describe("openStatsTable", () => {
       commands: 3,
       originalBytes: 300,
       compressedBytes: 30,
-      byFilter: { [CARGO_TEST]: { commands: 3, savedBytes: 270 } },
+      byFilter: { [CARGO_TEST]: { commands: 3, savedBytes: 270, savedTokens: 0 } },
       byForm: { prefix: 0, pipe: 3 },
     });
     let closed = 0;
@@ -328,15 +335,25 @@ function onlineDomain(table: StatsTable): {
 function effectRecorder(): {
   readonly effect: DeferredStatsContext["effect"];
   readonly labels: string[];
+  readonly disposers: (() => void | Promise<void>)[];
 } {
   const labels: string[] = [];
+  const disposers: (() => void | Promise<void>)[] = [];
   // `Context["effect"]` 是 cordis 的双重载签名（同步 / 异步工厂各一支），替身只覆盖同步那一支。
   // 断言收在这一处：用例其余部分都走 `DeferredStatsContext["effect"]` 的类型面。
-  const effect = ((execute: () => () => void, label?: string): (() => void) => {
+  //
+  // 工厂返回的清理函数**必须允许返回 promise**：cordis 的 disposer 契约是「返回 thenable 就等它」，
+  // 而统计域的 close 是异步的（`DomainImpl.runClose()` 要等写入链跑完才释放名字）。替身若收窄成
+  // `() => void`，实现改成 `() => opened.close()` 就会在这里编译不过——那正是要保住的性质。
+  const effect = ((execute: () => () => void | Promise<void>, label?: string): (() => void) => {
     labels.push(label ?? "");
-    return execute();
+    const disposer = execute();
+    disposers.push(disposer);
+    return () => {
+      void disposer();
+    };
   }) as unknown as DeferredStatsContext["effect"];
-  return { effect, labels };
+  return { effect, labels, disposers };
 }
 
 describe("createDeferredStatsStore", () => {
@@ -372,10 +389,18 @@ describe("createDeferredStatsStore", () => {
   it("存储打得开时切到持久化账本，并挂一个只关一次的 disposer", async () => {
     const table = fakeTable();
     const online = onlineDomain(table);
-    const { effect, labels } = effectRecorder();
+    const { effect, labels, disposers } = effectRecorder();
     const store = createDeferredStatsStore({ storageDomain: online.storageDomain, effect });
     await store.load();
     assert.deepEqual(labels, [STATS_DOMAIN_LABEL]);
+    // **disposer 必须把 close 的 promise 交回来**（而不是 `void` 掉它）：cordis 只等 thenable，
+    // 返回 undefined 就等于宣告「同步撤完了」，卸载会先于域真正释放名字返回，紧接着的重新装配
+    // 就撞 `already open`。这一条把那个性质钉在实现里——删掉 `return` 这里就红。
+    assert.equal(disposers.length, 1);
+    const returned = disposers[0]?.();
+    assert.ok(returned instanceof Promise, "disposer 要返回 close 的 promise，不能 void 掉");
+    await returned;
+    assert.equal(online.closes(), 1, "disposer 跑一次关一次");
     store.accumulate(pipeOf("pytest", 100, 10));
     await store.flush();
     // 落到了真表上：内存表那一支不会有写入记录。
@@ -386,6 +411,6 @@ describe("createDeferredStatsStore", () => {
     // 去重：同一份两处读到的都是切换后的账本（`load` 只切一次）。
     await store.load();
     assert.equal(labels.length, 2);
-    assert.equal(online.closes(), 0, "close 由 disposer 负责，load 不自己关");
+    assert.equal(online.closes(), 1, "load 不自己关；第二枚 disposer 还没跑");
   });
 });

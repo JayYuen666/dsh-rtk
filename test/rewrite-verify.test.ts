@@ -16,6 +16,9 @@ const NOT_A_SUFFIX = "not-a-suffix";
 const CARGO_TEST = "cargo test";
 const UV_RUN_CARGO_TEST = "uv run cargo test";
 const RTK_CARGO_TEST = "rtk cargo test";
+/** 复合命令的两侧样例：多段校验那几条用例反复用同一对，抽出来免得撞 no-duplicate-string。 */
+const CD_CARGO = "cd /tmp && cargo test";
+const CD_RTK_CARGO = "cd /tmp && rtk cargo test";
 const SCRIPT_STRIPPED = "script-runner-stripped";
 
 describe("P1 必须以 rtk 开头", () => {
@@ -27,10 +30,55 @@ describe("P1 必须以 rtk 开头", () => {
     assert.equal(verifyRewrite("env FOO=1 cargo test", "env FOO=1 rtk cargo test"), NOT_PREFIXED);
   });
 
-  it("链式命令的改写也拒（设计内）", () => {
-    // 实测 `rtk rewrite 'cd /tmp && cargo test'` 的产物是 `cd /tmp && rtk cargo test`——rtk 插在中间。
-    // 链式命令每一段的语义插件都不判，原样执行最安全，所以这里拒绝是正确行为，不是缺陷。
-    assert.equal(verifyRewrite("cd /tmp && cargo test", "cd /tmp && rtk cargo test"), NOT_PREFIXED);
+  it("链式命令按段校验：只前插了 rtk 的那一段通过，其余段必须原样", () => {
+    // 早期版本在这里整条拒（rtk 把 `rtk ` 插在中间，P1 只认开头）。改判的理由：rtk 逐段改写
+    // （discover/registry.rs 的 rewrite_compound），实测产物就是 `cd /tmp && rtk cargo test`——
+    // 只有承载输出的那一段被换掉。§「复合命令按段校验」把这条形状收进合法面，安全性由
+    // 「分隔符序列必须逐一相同 + 每段各自过 P1~P4」两条保证。
+    assert.equal(verifyRewrite(CD_CARGO, CD_RTK_CARGO), undefined);
+    // 动到没被改写的那一段 → 拒（点名第几段）。
+    assert.equal(
+      verifyRewrite(CD_CARGO, "cd /other && rtk cargo test"),
+      "segment 0: not-rtk-prefixed",
+    );
+    // 换掉分隔符 → 拒（连接语义变了）。
+    assert.equal(verifyRewrite(CD_CARGO, "cd /tmp ; rtk cargo test"), "separator-changed");
+    // 段数变了（多一段 / 少一段）→ 拒。
+    assert.equal(verifyRewrite(CD_CARGO, RTK_CARGO_TEST), "not-segmentable");
+    assert.equal(verifyRewrite(CD_CARGO, `${CD_RTK_CARGO} && rtk ls`), "not-segmentable");
+  });
+
+  it("段本身已经是 rtk 形态时不再接受二次前插", () => {
+    // `structuralReject` 只看整条命令的开头，所以 `cd a && rtk cargo test` 会在它那一关放行
+    // （首词是 cd）。真正拦住「压两次」的是这里：第二段本来就是 rtk 形态，再前插一层就是
+    // `rtk rtk cargo test`——在 P1~P4 眼里完全合法，只有这条段级判据能拒。
+    assert.equal(
+      verifyRewrite("cd a && rtk cargo test", "cd a && rtk rtk cargo test"),
+      "segment 1: already-rtk",
+    );
+    assert.equal(verifyRewrite(RTK_CARGO_TEST, `rtk ${RTK_CARGO_TEST}`), "already-rtk");
+  });
+
+  it("每一段都必须自己通过 P1~P4", () => {
+    // 第二段被塌缩成非前插形态（`npm run lint` → `lint`）→ 拒，且点名段号。
+    assert.equal(
+      verifyRewrite("cd a && npm run lint", "cd a && rtk lint"),
+      "segment 1: script-runner-stripped",
+    );
+    // 第一段被前插 rtk、第二段原样：合法。
+    assert.equal(
+      verifyRewrite("cargo test && echo done", "rtk cargo test && echo done"),
+      undefined,
+    );
+    // 管道同形。
+    assert.equal(verifyRewrite("cargo test | tail -5", "rtk cargo test | tail -5"), undefined);
+    // 第二段被换成「不是纯前插」的形态（`cat f` → `rtk read f`：rtk 会这么改，但读法变了）→ 拒。
+    assert.equal(
+      verifyRewrite("cargo test | cat f", "rtk cargo test | rtk read f"),
+      "segment 1: not-a-suffix",
+    );
+    // 第二段纯前插同样合法（`tail -5` → `rtk tail -5` 只是多了前缀，语义没被换掉）。
+    assert.equal(verifyRewrite("cargo test | tail -5", "rtk cargo test | rtk tail -5"), undefined);
   });
 
   it("rtk 开头通过 P1", () => {
@@ -88,7 +136,7 @@ describe("P3 只许剥前缀", () => {
   });
 
   it("原命令前导空白被容忍", () => {
-    assert.equal(verifyRewrite("   cargo test", "rtk cargo test"), undefined);
+    assert.equal(verifyRewrite("   cargo test", RTK_CARGO_TEST), undefined);
   });
 });
 

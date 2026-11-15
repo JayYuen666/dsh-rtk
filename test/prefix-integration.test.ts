@@ -93,7 +93,8 @@ describe.skipIf(!POSIX_ONLY)("c 形态", () => {
     });
 
     it("enabled 为假时**仍然装**，只是执行期原样转调", async () => {
-      // 这一条钉的是「装配期不判总开关」：`enabled` 默认 false，而用户是在卡片上打开它的。
+      // 这一条钉的是「装配期不判总开关」：`enabled` 显式关着（未显式设置时跟随 rtk 就绪状态），
+      // 而用户是在卡片上打开它的。
       // 早先装配期有这样一道早退，于是默认路径整条不通——装好插件、打开开关、下一次调用 bash
       // 什么都没发生，因为遮蔽层在装配那一刻就没装、之后没有任何东西会去补装。
       // 判据分两半：装配必须发生（`installed === true`），行为必须是原样的（不 spawn 改写）。
@@ -110,7 +111,7 @@ describe.skipIf(!POSIX_ONLY)("c 形态", () => {
     });
 
     it("装配期关着、之后打开总开关 → 不改装配也能改写", async () => {
-      // 用户真实路径：装好插件（`enabled` 默认 false）→ 在卡片上打开 → 下一次 cargo test 被改写。
+      // 用户真实路径：装好插件（`enabled` 还没打开）→ 在卡片上打开 → 下一次 cargo test 被改写。
       // `enabled` 是 volatile，宿主把卡片上的改动写进配置之后 `apply` 早已跑完，所以只有
       // 「装配期不判它」能让这条路走得通。
       let enabled = false;
@@ -127,11 +128,23 @@ describe.skipIf(!POSIX_ONLY)("c 形态", () => {
       }
     });
 
-    it("enabledForms 不含 prefix 时整层不装", async () => {
+    it("enabledForms 不含 prefix 时仍装遮蔽层，运行期切到 prefix 后立刻改写", async () => {
+      // 热切换判据：装配期不再按 forms 决定装不装；层常驻，execute 每次现读 forms。
+      // 先关着跑一次必须原样转调（不 spawn 改写），再把 forms 改成含 prefix，
+      // 同一条遮蔽体下一次调用就必须改写——不重新 apply、不重启宿主。
+      let forms: readonly string[] = [];
       const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_CARGO_TEST }]);
       try {
-        const host = await startPrefixHost({ options: { forms: [] } });
-        assert.equal(host.installed, false);
+        const host = await startPrefixHost({ options: { forms: () => forms } });
+        assert.equal(host.installed, true);
+        const shadow = host.withAgent();
+        await shadow.execute({ command: CARGO_TEST }, exec({ callId: "call-forms-off" }));
+        assert.equal(rtk.spawned(), 0);
+        assert.deepEqual(host.fake.received, [CARGO_TEST]);
+        forms = ["prefix"];
+        await shadow.execute({ command: CARGO_TEST }, exec({ callId: "call-forms-on" }));
+        assert.equal(rtk.spawned(), 1);
+        assert.deepEqual(host.fake.received, [CARGO_TEST, RTK_CARGO_TEST]);
       } finally {
         rtk.restore();
       }
@@ -279,15 +292,36 @@ describe.skipIf(!POSIX_ONLY)("c 形态", () => {
       }
     });
 
-    it("复合命令不进 spawn（shouldSkipRewrite 先拒）", async () => {
+    it("复合命令逐段改写：只换承载输出的那一段，前面那段原样留在命令里", async () => {
+      // 早期版本在这里断言「复合命令不进 spawn」——那是 `COMPOUND` 一律整条拒的年代。改判之后
+      // 这一格必须反过来验：`cd /tmp && cargo test` 会真的去 spawn `rtk rewrite`，产物的形态是
+      // `cd /tmp && rtk cargo test`（rtk 自己逐段改写，见 discover/registry.rs 的 rewrite_compound），
+      // 校验层按段核对通过后，转调原工具时携带的也是这个形态。
       const compound = "cd /tmp && cargo test";
-      const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_CARGO_TEST }]);
+      const rewritten = "cd /tmp && rtk cargo test";
+      const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: rewritten }]);
       try {
         const host = await startPrefixHost();
         await host
           .withAgent()
           .execute({ command: compound }, exec({ arguments: { command: compound } }));
-        assert.equal(rtk.spawned(), 0);
+        assert.equal(rtk.spawned(), 1);
+        assert.deepEqual(host.fake.received, [rewritten]);
+      } finally {
+        rtk.restore();
+      }
+    });
+
+    it("复合命令的改写被拆开/换分隔符时不采用（校验层按段拦）", async () => {
+      // 反向判据：产物把两段并成一段（`not-segmentable`）时，命令必须原样执行——
+      // 「按段校验」这个改动的全部意义就在这一格。
+      const compound = "cd /tmp && cargo test";
+      const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: "rtk cargo test" }]);
+      try {
+        const host = await startPrefixHost();
+        await host
+          .withAgent()
+          .execute({ command: compound }, exec({ arguments: { command: compound } }));
         assert.deepEqual(host.fake.received, [compound]);
       } finally {
         rtk.restore();
@@ -597,6 +631,44 @@ describe.skipIf(!POSIX_ONLY)("c 形态", () => {
         await host.withAgent().execute({ command: 42 }, exec({ arguments: { command: 42 } }));
         assert.equal(rtk.spawned(), 0);
         assert.equal(host.fake.received.length, 1);
+      } finally {
+        rtk.restore();
+      }
+    });
+  });
+
+  describe("c 形态：另一个实例先到时让路", () => {
+    it("解析出来的 bash 已经是本插件的遮蔽体 → 不再注册、只留一行日志", async () => {
+      // 真机现场：market 的热挂子树用 `file://…/host.js` 直连产物，与 bundle 层的裸包名解析到
+      // **同一个模块实例**，但两条层条目各起一个 fiber、各跑一次 apply。第一份注册完，第二份的
+      // `get("bash", agent)` 拿到的就是那份遮蔽体；照旧 register 会让宿主抛
+      // `tool "bash" is already registered in this scope`，把整条插件打成 failed。
+      const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_CARGO_TEST }]);
+      try {
+        const first = await startPrefixHost({ reply: cargoReply(CLEAN_TEXT) });
+        const shadow = first.withAgent();
+        // 第二份装配：把第一份的遮蔽体当作「解析到的 bash」交给它。
+        const logs: string[] = [];
+        const second = await startPrefixHost({
+          bash: shadow,
+          log: (line) => {
+            logs.push(line);
+          },
+        });
+        // 第二份的遮蔽体只在 agent 出现时才装（`agent/created`），所以让路也发生在那一下。
+        assert.throws(
+          () => {
+            second.withAgent();
+          },
+          /遮蔽层没有注册任何工具体/u,
+          "同层已被本插件遮蔽体占据时不该再注册一次",
+        );
+        assert.equal(second.registrations.length, 0, "注册表里一条都不该有");
+        assert.equal(
+          logs.includes("[rtk] prefix: another instance already installed the shadow; skipping"),
+          true,
+          "让路必须留一行可查的日志：不然「功能没了但一切正常」没有线索",
+        );
       } finally {
         rtk.restore();
       }

@@ -17,10 +17,28 @@ export const RTK_STATS_NAMESPACE = "rtkStats";
 const filterStatSchema = z.object({
   commands: z.int().nonnegative(),
   savedBytes: z.int(),
+  /**
+   * 这个 filter 省下的 token。与 `savedBytes` 并存的理由同账本那两列：字节可复算，
+   * token 是宿主扣钱的单位。`.default(0)` 同样是迁移通道（本列加入前写下的账本没有它）。
+   */
+  savedTokens: z.int().nonnegative().default(0),
 });
 
 /** `byFilter` 那一层：filter 名 → 分项。 */
 const byFilterSchema = z.record(z.string(), filterStatSchema);
+
+/**
+ * 排行榜的一行。与 `filterStatSchema` 分开声明而不是共用：那个是**落盘**的分项（命令数、
+ * 字节与 token），这个是**投影**的排行行（带占比）。共用一份会让落盘形状里凭空多出
+ * 一个「占全部省下量百分之几」的派生值——那个数随总账变化，存进账本就自相矛盾了。
+ */
+const topFilterSchema = z.object({
+  filter: z.string(),
+  commands: z.int().nonnegative(),
+  savedTokens: z.int(),
+  /** 在**全部节省 token** 中的份额（`savedTokens / 总节省 token`），不是该 filter 的压缩率。 */
+  sharePct: z.number(),
+});
 
 /**
  * 持久化账本的形状。**必须是 zod**：`domainTable` 的 `valueSchema` 由宿主在 open 时逐条
@@ -86,6 +104,13 @@ export const statsSummarySchema = z.object({
     prefix: z.int().nonnegative(),
     pipe: z.int().nonnegative(),
   }),
+  /**
+   * 按 filter 的节省排行（token 降序，最多 `TOP_FILTERS` 条）。
+   *
+   * 卡片用它画条形图；留成**列表**而不是让客户端自己排 `byFilter` 的 Record，是因为
+   * 「排哪一列、取前几」是口径问题，该和 `summarize` 待在一起，而不是散在渲染代码里。
+   */
+  topFilters: z.array(topFilterSchema),
 });
 export type StatsSummary = z.infer<typeof statsSummarySchema>;
 
@@ -108,6 +133,23 @@ export const statsStatusSchema = z.object({
 });
 export type StatsStatus = z.infer<typeof statsStatusSchema>;
 
+/** 排行榜最多几条：卡片是半宽面板，再多就只剩标签没有条了。 */
+export const TOP_FILTERS = 6;
+
+/**
+ * 一张 filter 卡片的节省份额。
+ *
+ * 分母是**全部节省 token**（`originalTokens - compressedTokens`），不是全部原文 token。
+ * 后者会让各条 filter 的占比相加等于整体节省率（例如 38.34%），读起来像分布、实际是贡献率；
+ * 本卡片的文案与 `statsChartHint` 都按「占全部节省」解释，所以这里必须用前者。
+ *
+ * 分母 0 时给 0 而不是 NaN：域版本 1 的存量账本没有 token 两列，而本列加入前写下的记录里
+ * 每条 `savedTokens` 也都是 0。
+ */
+function shareOf(savedTokens: number, totalSavedTokens: number): number {
+  return totalSavedTokens <= 0 ? 0 : Math.round((savedTokens / totalSavedTokens) * 10_000) / 100;
+}
+
 /**
  * 账本 → 投影。
  *
@@ -124,5 +166,14 @@ export function summarize(acc: StatsAccumulator): StatsSummary {
   const numerator = useTokens ? savedTokens : savedBytes;
   const denominator = useTokens ? acc.originalTokens : acc.originalBytes;
   const savingsPct = denominator === 0 ? 0 : Math.round((numerator / denominator) * 10_000) / 100;
-  return { ...acc, savedBytes, savedTokens, savingsPct };
+  const topFilters = Object.entries(acc.byFilter)
+    .map(([filter, stat]) => ({
+      filter,
+      commands: stat.commands,
+      savedTokens: stat.savedTokens,
+      sharePct: shareOf(stat.savedTokens, savedTokens),
+    }))
+    .toSorted((left, right) => right.savedTokens - left.savedTokens)
+    .slice(0, TOP_FILTERS);
+  return { ...acc, savedBytes, savedTokens, savingsPct, topFilters };
 }

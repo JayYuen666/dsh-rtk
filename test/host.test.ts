@@ -19,7 +19,7 @@ import plugin, { Config as configSchema } from "../host.ts";
 
 /** spec 的十四项终表（九个 volatile + 五个部署级）。 */
 const DEFAULTS = {
-  enabled: false,
+  enabled: true,
   // 数组与联合字面量都写显式类型：schema 的输入面要的是可变数组与那条联合，
   // 而 `as const` 交出来的是只读元组（类型上装不进去，运行期却没有区别）。
   enabledForms: ["prefix"] as ("prefix" | "pipe")[],
@@ -72,9 +72,9 @@ describe("config 默认值", () => {
     }
   });
 
-  it("空配置也能解析（每一项都有默认）", () => {
+  it("空配置也能解析（enabled 无静态默认，其余每一项都有默认）", () => {
     const parsed = configSchema({}) as unknown as Record<string, unknown>;
-    assert.equal(readField(parsed, "enabled"), false);
+    assert.equal(readField(parsed, "enabled"), undefined);
     assert.deepEqual(readField(parsed, "enabledForms"), ["prefix"]);
     assert.deepEqual(readField(parsed, "enabledFilters"), ["cargo-test", "pytest", "ctest"]);
     assert.equal(readField(parsed, "rewriteHostEnv"), "");

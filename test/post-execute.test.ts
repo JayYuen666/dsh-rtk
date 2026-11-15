@@ -183,7 +183,7 @@ describe("b 形态监听器", () => {
   it("双形态同开、本次已被 C 改写过 → 跳过且读后即删", async () => {
     const host = startPipeHost({
       pipe: { exitCode: 0, stdout: PIPED },
-      forms: ["prefix", "pipe"],
+      forms: () => ["prefix", "pipe"],
     });
     host.rewrittenCalls.mark("call-1");
     const out = await host.run(RAW, { callId: "call-1" });
@@ -690,11 +690,17 @@ describe("b 形态监听器", () => {
     host.dispose();
   });
 
-  it("forms 不含 pipe 时整层不装", async () => {
-    const host = startPipeHost({ forms: ["prefix"] });
-    const out = await host.run(RAW);
-    assert.equal(out.decision, undefined);
-    assert.equal(out.piped, 0);
+  it("forms 不含 pipe 时监听器仍在，切到 pipe 后下一次立刻压缩", async () => {
+    // 热切换判据：B 形态不再按装配期 forms 决定装不装；监听器常驻，decide 每次现读 forms。
+    let forms: readonly string[] = ["prefix"];
+    const host = startPipeHost({ pipe: { exitCode: 0, stdout: PIPED }, forms: () => forms });
+    const off = await host.run(RAW);
+    assert.deepEqual(off.decision, { kind: "accept" });
+    assert.equal(off.piped, 0);
+    forms = ["prefix", "pipe"];
+    const on = await host.run(RAW);
+    assert.equal(on.piped, 1);
+    assert.ok(stdoutText(on.decision).startsWith(PIPED));
     host.dispose();
   });
 

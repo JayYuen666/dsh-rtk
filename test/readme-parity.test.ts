@@ -226,8 +226,8 @@ describe("两份文档声明的配置表数字与实际 schema 对齐", () => {
     );
     assert.equal(
       shape.defaulted,
-      shape.total,
-      "每个字段都必须带内置默认值：文档那句说的是「带内置默认值的字段数」",
+      shape.total - 1,
+      "enabled 没有静态默认值（跟随 rtk 就绪状态）；其余 13 个字段都必须带内置默认值",
     );
     const claims: readonly {
       readonly label: string;
@@ -238,7 +238,13 @@ describe("两份文档声明的配置表数字与实际 schema 对齐", () => {
       {
         label: "字段总数",
         zh: /schema 共 (?<count>\d+) 个字段/u,
-        en: /(?<count>\d+) fields with built-in defaults/u,
+        en: /(?<count>\d+) fields/u,
+        actual: shape.total,
+      },
+      {
+        label: "带内置默认值的字段数",
+        zh: /其中 (?<count>\d+) 个带内置默认值/u,
+        en: /(?<count>\d+) of them carry built-in defaults/u,
         actual: shape.defaulted,
       },
       {

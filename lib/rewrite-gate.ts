@@ -1,5 +1,5 @@
 import path from "node:path";
-import { structuralReject } from "./prefix-safety.ts";
+import { splitCommand, structuralReject } from "./prefix-safety.ts";
 import { detectVitestMajor, isVitestCommand } from "./vitest-major.ts";
 
 /**
@@ -134,27 +134,47 @@ export interface RewriteGateOptions {
 }
 
 /**
+ * 单段的判据：用户拒绝表 → 内建信息损失表 → vitest 版本门控。
+ *
+ * **必须逐段判**：`cd x && git diff` 的首词是 `cd`，按整条命令判会让内建表整片失效，
+ * 结果是 rtk 把后半段改成 `rtk git diff`（丢 5 行 patch 头、patch 不可 apply）。同理
+ * `cd x && vitest run` 绕过了版本门控——vitest 5 上 rtk 会吞掉全部输出。
+ */
+function segmentSkipReason(
+  segment: string,
+  options: RewriteGateOptions,
+): RewriteSkipReason | undefined {
+  const [first] = splitWords(segment);
+  let reason: RewriteSkipReason | undefined;
+  if (first !== undefined && options.denyCommands.includes(first)) {
+    reason = "user-deny";
+  } else if (denyTableReason(segment) !== undefined) {
+    reason = "deny-table";
+  } else if (isVitestCommand(segment)) {
+    reason = vitestGateReason(segment, options.cwd, options.vitestMaxMajor);
+  }
+  return reason;
+}
+
+/**
  * 判这条命令要不要跳过改写。
  *
  * `undefined` = 可以交给 `rtk rewrite`；返回值 = 原样执行的原因。
+ *
+ * 结构判据对**整条**命令判（拆不开就是拆不开），后三道对**每一段**判：任意一段命中就整条原样
+ * 执行。整条原样执行而不是「跳过那一段、改其余段」——用户按 `cd X && git status` 敲下来时，
+ * 他期望的是一次完整执行；把前一段交出去、后一段自己拼，等于让插件替用户重写命令。
  */
 export function shouldSkipRewrite(
   command: string,
   options: RewriteGateOptions,
 ): RewriteSkipReason | undefined {
   const structural = structuralReject(command);
-  const [first] = splitWords(command);
-  let reason: RewriteSkipReason | undefined;
-  if (structural !== undefined) {
-    reason = structural;
-  } else if (first !== undefined && options.denyCommands.includes(first)) {
-    reason = "user-deny";
-  } else if (denyTableReason(command) !== undefined) {
-    reason = "deny-table";
-  } else if (isVitestCommand(command)) {
-    reason = vitestGateReason(command, options.cwd, options.vitestMaxMajor);
-  }
-  return reason;
+  // 拆不开的命令（`structuralReject` 已经拒掉了这种）走单段兜底：结构与后三道判据的入参
+  // 统一成「段表」，下面那条循环就不必再分两种形状。
+  const segments = splitCommand(command) ?? [{ sep: "", text: command }];
+  const reasons = segments.map((segment) => segmentSkipReason(segment.text, options));
+  return structural ?? reasons.find((each) => each !== undefined);
 }
 
 /** 从 `unknown` 形状的 agent 上取 `session.header.cwd`；任何一层缺席都给 undefined。 */

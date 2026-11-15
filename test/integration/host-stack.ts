@@ -15,6 +15,7 @@ import type { Messages } from "../../lib/messages.ts";
 import type {
   HostContext,
   PipeDeps,
+  PrefixContext,
   PrefixDeps,
   PrefixOptions,
   SubprocessFace,
@@ -175,9 +176,18 @@ export interface PrefixHost {
   readonly withAgent: (id?: string) => ShadedTool;
   /** 每次「命令真的被改写了」记一次（spec §6 的 prefix 分账就是用这个钩子记账的）。 */
   readonly rewrites: readonly string[];
+  /**
+   * 模拟**插件 fiber 卸载**：按逆序跑 `ctx.effect` 收下的全部 disposer。
+   *
+   * 判据用点：卸载后 `agent` 视图里那枚遮蔽体应当消失（`visibleShadows()` 归零）。它是
+   * 「裸 register 把回收权交给了 agent 作用域」这格缺陷的正相判据——不跑这一步，泄漏看不见。
+   */
+  readonly disposeFiber: () => Promise<void>;
+  /** 某个 agent 作用域里现在能看到的遮蔽体（= `scoped` 栈的快照），用来判「卸载后还在不在」。 */
+  readonly visibleShadows: () => readonly ShadedTool[];
 }
 
-/** C 形态半栈：假 ctx 只需 `on` / `tools` / `workingDirectory` / `subprocess` 四样。 */
+/** C 形态半栈：假 ctx 造 `on` / `tools` / `workingDirectory` / `subprocess` / `effect` 五样。 */
 export async function startPrefixHost(
   overrides: {
     readonly options?: Partial<PrefixOptions>;
@@ -237,6 +247,25 @@ export async function startPrefixHost(
    * 那种写法在 `get` 内部重复一次就是两份口径。
    */
   const bash: unknown = overrides.bash === undefined ? fake.definition : overrides.bash;
+  /**
+   * `ctx.effect` 收下的 disposer，按注册顺序；`disposeFiber()` 按**逆序**跑（cordis 的卸载序）。
+   *
+   * 半栈必须演这一位：`host.ts` 把 `agent.ctx.tools.register()` 的执行包进工厂交给插件 fiber，
+   * 回收权因此从 agent 作用域转到了插件手里。替身若不真跑工厂、也不真跑兜出来的 disposer，
+   * 「插件卸载后遮蔽体仍留在 agent 视图里」那一格就永远绿——而它正是真机报错的起点。
+   */
+  const disposers: (() => void | Promise<void>)[] = [];
+  const disposeFiber = async (): Promise<void> => {
+    // 逆序（cordis 的卸载序）。串成一条链而不是 `Promise.all`：那样顺序就没了，而「逆序 +
+    // 逐条等完」正是这里要演的东西；链式写法还顺带避开 `no-await-in-loop`（那规则拦的是
+    // 「本该并行却在循环里逐条等」——这里恰恰相反，必须逐条、必须有序）。
+    const pending = disposers.toReversed();
+    disposers.length = 0;
+    for (const disposer of pending) {
+      // oxlint-disable-next-line no-await-in-loop -- 逆序串行是契约，本就没有可并行的独立工作
+      await disposer();
+    }
+  };
   const makeAgent = (id: string): { readonly id: string; readonly ctx: unknown } => ({
     id,
     ctx: {
@@ -261,6 +290,25 @@ export async function startPrefixHost(
   const ctx = {
     subprocess,
     workingDirectory: { ensure: overrides.ensure ?? (async (): Promise<string> => process.cwd()) },
+    /**
+     * `ctx.effect` 的替身：**立刻跑工厂**、收下它返回的清理函数，卸载时按逆序跑。
+     *
+     * 与宿主一致到「同步工厂 + 返回值若为 thenable 就等它」这两位：`host.ts` 用它把
+     * `agent.ctx.tools.register()` 的回收权从 agent 作用域转到插件 fiber，替身不跑工厂
+     * 就等于那次转手没发生。
+     */
+    effect: ((execute: () => unknown, ...rest: unknown[]): (() => void) => {
+      void rest;
+      const produced = execute();
+      if (typeof produced === "function") {
+        disposers.push(produced as () => void | Promise<void>);
+      }
+      return () => {
+        void disposeFiber();
+      };
+    }) as unknown as PrefixContext["effect"],
+    /** 插件 fiber 的替身：`host.ts` 只把它原样交给 `settings.configure`，这里给个可辨的标记。 */
+    fiber: { id: "rtk-test-fiber" },
     tools: {
       // **替身必须复刻宿主的 scope 语义**，否则「忘了传 scope」这一格在单测里永远是绿的。
       //
@@ -303,10 +351,10 @@ export async function startPrefixHost(
     },
   };
   installPrefixShadow(
-    ctx as unknown as HostContext,
+    ctx as unknown as PrefixContext,
     {
       enabled: () => true,
-      forms: ["prefix"],
+      forms: () => ["prefix"],
       // 诊断日志：默认关（只有专门验它的用例显式打开），否则每条用例都会往控制台写一行。
       log: overrides.log,
       supported: overrides.options?.supported ?? (() => true),
@@ -341,6 +389,8 @@ export async function startPrefixHost(
     registrations,
     withAgent,
     rewrites,
+    disposeFiber,
+    visibleShadows: () => [...scoped],
   };
 }
 
@@ -422,6 +472,7 @@ function recordingStats(boom: boolean, recorded: unknown[]): StatsStore {
     savingsPct: 0,
     byFilter: {},
     byForm: { prefix: 0, pipe: 0 },
+    topFilters: [],
   };
   return {
     load: (): void => {
@@ -446,7 +497,8 @@ export interface PipeHostOptions {
   /** 收插件 info 的数组（诊断行）。 */
   readonly infos?: string[];
   readonly pipe?: { readonly exitCode: number; readonly stdout: string };
-  readonly forms?: readonly string[];
+  /** 形态读取函数；传函数才能在用例里中途切换形态，验证热更新。 */
+  readonly forms?: () => readonly string[];
   /** 总开关。默认 `() => true`（本半栈只测 B 形态，装配已由 `forms` 控制）。 */
   readonly enabled?: () => boolean;
   /** 版本门：默认 `() => true`；给 `() => false` 模拟「探到 rtk 低于下限」。 */
@@ -613,7 +665,7 @@ export function startPipeHost(options: PipeHostOptions = {}): PipeHost {
     ctx,
     {
       enabled: options.enabled ?? ((): boolean => true),
-      forms: options.forms ?? ["pipe"],
+      forms: options.forms ?? (() => ["pipe"]),
       log: options.log,
       supported: options.supported ?? ((): boolean | undefined => true),
       // 四处 volatile 都给取值函数：中途改值必须影响下一次 `run`，这是被测的行为本身。

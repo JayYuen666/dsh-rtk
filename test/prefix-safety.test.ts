@@ -8,7 +8,12 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { structuralReject, findOnPath, pipeStructuralReject } from "../lib/prefix-safety.ts";
+import {
+  structuralReject,
+  findOnPath,
+  pipeStructuralReject,
+  splitCommand,
+} from "../lib/prefix-safety.ts";
 
 /** 两个原因串提到模块级：同一字面量在断言里出现多次，`sonarjs(no-duplicate-string)` 会判红。 */
 const DETAIL_REJECT = "detail-flag";
@@ -37,21 +42,54 @@ function withPath<Result>(dir: string, run: () => Result): Result {
 }
 
 describe("structuralReject 复合命令", () => {
-  it("&& / ; / | / 换行 全拒", () => {
-    assert.equal(structuralReject("cd /tmp && cargo test"), "compound");
-    assert.equal(structuralReject("cargo test; echo done"), "compound");
-    assert.equal(structuralReject("cargo test | tee log"), "compound");
-    assert.equal(structuralReject("cargo test\ncargo build"), "compound");
+  it("可逐段拆分的复合命令放行（交给 rtk 逐段改写，方向修正）", () => {
+    // 这一组在早期版本里是「全拒」。改判的理由是实测：rtk 自己就逐段改写
+    // （discover/registry.rs 的 rewrite_compound），`cd /tmp && cargo test` 的产物是
+    // `cd /tmp && rtk cargo test`——只有承载输出的那一段被换掉。多仓开发时模型几乎每条命令
+    // 都是这个形状，整条拒掉等于把最常见的一类命令排除在压缩面之外。
+    // 安全性由下游两道判据接住：rewrite-gate 逐段判 deny-table / vitest 门，rewrite-verify 逐段核对。
+    assert.equal(structuralReject("cd /tmp && cargo test"), undefined);
+    assert.equal(structuralReject("cargo test; echo done"), undefined);
+    assert.equal(structuralReject("cargo test | tee log"), undefined);
+    assert.equal(structuralReject("cargo test\ncargo build"), undefined);
+    assert.equal(structuralReject("cargo test 2>&1"), undefined);
   });
 
-  it("命令替换与反引号拒", () => {
+  it("拆不成独立段的构造仍拒（compound 的语义收窄到这一档）", () => {
+    // 反引号 / 命令替换：改写其中一段等于改另一段的输入，边界不可证明。
     assert.equal(structuralReject("echo $(cargo test)"), "compound");
     assert.equal(structuralReject("echo `cargo test`"), "compound");
-  });
-
-  it("重定向拒", () => {
+    // 重定向：写盘目标一变副作用就变了。
     assert.equal(structuralReject("cargo test > out.txt"), "compound");
     assert.equal(structuralReject("cargo test < in.txt"), "compound");
+    assert.equal(structuralReject("cargo test &> out.txt"), "compound");
+    // 后台执行与空段。
+    assert.equal(structuralReject("cargo test &"), "compound");
+    assert.equal(structuralReject("cd x &&"), "compound");
+    assert.equal(structuralReject("&& cargo test"), "compound");
+    // 引号不配对：连边界在哪都判不出来。
+    assert.equal(structuralReject('cargo test "unterminated'), "compound");
+  });
+
+  it("双引号内的转义与命令替换", () => {
+    // 双引号里 `\"` 是转义字符：`echo "a\"b && c"` 的 `&&` 仍在引号内。
+    assert.equal(structuralReject(String.raw`echo "a\"b" && cargo test`), undefined);
+    // 双引号里的 `$(...)` 与反引号仍然是命令替换：边界不可证明，整条拒。
+    assert.equal(structuralReject('echo "start $(cargo test) end"'), "compound");
+    assert.equal(structuralReject('echo "start `cargo test` end"'), "compound");
+  });
+
+  it("反斜杠转义的分隔符不是分隔符", () => {
+    // `&&` 被转义之后是普通字符（`\&\&`），不该在这里切成两段。
+    const ESCAPED = String.raw`echo a\&\&b && cargo test`;
+    assert.equal(structuralReject(ESCAPED), undefined);
+    assert.equal(splitCommand(ESCAPED)?.length, 2);
+  });
+
+  it("引号内的分隔符不算分隔符", () => {
+    assert.equal(structuralReject('echo "a && b"'), undefined);
+    assert.equal(structuralReject("echo 'a && b'"), undefined);
+    assert.equal(structuralReject('cd "a b" && cargo test'), undefined);
   });
 
   it("普通命令放行", () => {

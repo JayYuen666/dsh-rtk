@@ -15,11 +15,22 @@ export interface UiMessages {
   /** 按形态分账那行：改写（prefix）与结果压缩（pipe）各自的命令数（spec §6）。 */
   readonly statsByForm: string;
   readonly statsSavings: string;
+  /** 图表标题：按 filter 的 token 收益排行。 */
+  readonly statsChartTitle: string;
+  /** 图表口径说明：柱长相对最大项、百分比是占全部节省 token 的比例。 */
+  readonly statsChartHint: string;
+  /** 一条柱子的说明：这张 filter 省了多少 token、占全部省下量的百分之几。 */
+  readonly statsChartRow: string;
+  /** 还没有任何 pipe 记账时的空态（不是错误）。 */
+  readonly statsChartEmpty: string;
   readonly statsUnavailable: string;
   readonly resetStats: string;
   readonly switchSection: string;
   readonly enabledLabel: string;
-  readonly enabledHint: string;
+  /** 仅改写形态的总开关说明。 */
+  readonly enabledHintPrefix: string;
+  /** 含结果压缩形态的总开关说明（pipe / prefix+pipe）。 */
+  readonly enabledHintWithPipe: string;
   readonly formsLabel: string;
   readonly formsHint: string;
   readonly formPrefix: string;
@@ -29,6 +40,7 @@ export interface UiMessages {
   readonly denyLabel: string;
   readonly denyHint: string;
   readonly filtersLabel: string;
+  /** `{filters}` 是表里全部 filter 名的去重名单（不是默认三项）。 */
   readonly filtersHint: string;
   readonly minBytesLabel: string;
   readonly minBytesHint: string;
@@ -50,6 +62,8 @@ export interface UiMessages {
   readonly saveRejected: string;
   readonly saveFailed: string;
   readonly outOfRange: string;
+  /** 有数字字段越界时保存条给出的原因（保存被阻止，先修正或撤销）。 */
+  readonly invalidFields: string;
   readonly statsNote: string;
   /** rtk 不在 PATH：卡片顶部那条引导行（安装命令直接给出来，别让用户去翻 README）。 */
   readonly rtkMissingHint: string;
@@ -80,14 +94,21 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     statsSaved: "节省 token",
     statsByForm: "按形态分账（改写 / 结果压缩）",
     statsSavings: "节省率",
+    statsChartTitle: "按过滤器省下的 token",
+    statsChartHint: "柱长相对最大项；百分比是这条过滤器在全部节省 token 里占的份额。",
+    statsChartRow: "{filter} · {tokens} 个 token · 占全部节省 {share}%",
+    statsChartEmpty: "还没有按过滤器记账的数据（改写形态看不到输出，这里只会统计结果压缩）",
     statsUnavailable: "统计读面未连接（压缩本身不受影响）",
     resetStats: "清零统计",
     switchSection: "开关",
     enabledLabel: "启用 rtk 压缩",
-    enabledHint: "默认关闭。打开后 bash 命令会先问 rtk 能否改写；问不到就原样执行。",
+    enabledHintPrefix:
+      "未手动设置时，检测到受支持的 rtk 才默认开启；手动切换会固定选择。打开后 bash 命令会先问 rtk 能否改写；问不到就原样执行。",
+    enabledHintWithPipe:
+      "未手动设置时，检测到受支持的 rtk 才默认开启；手动切换会固定选择。打开后按所选形态处理：改写命令，或在结果侧压缩输出；不可用或收益不足时原样放行。",
     formsLabel: "启用的形态",
     formsHint:
-      "prefix = 改写命令（主路径，会 spawn `rtk rewrite`，受 rewriteTimeoutMs 管；Windows 上装配期会被忽略）；prefix+pipe = 额外在结果侧按 filter 压缩（B 形态，默认关闭）；pipe = 只压结果、不改命令（绕过拦截 bash 的护栏工具时用）。",
+      "prefix = 改写命令（主路径，会 spawn `rtk rewrite`，受 rewriteTimeoutMs 管；Windows 上不装配 prefix）；prefix+pipe = 额外在结果侧按 filter 压缩（B 形态）；pipe = 只压结果、不改命令（绕过拦截 bash 的护栏工具时用）。改完下一次工具调用即生效。",
     formPrefix: "仅改写命令",
     formPrefixAndPipe: "改写 + 结果压缩",
     formPipeOnly: "仅结果压缩",
@@ -96,7 +117,8 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     denyLabel: "额外拒绝的命令（首词）",
     denyHint: "逗号分隔。命中即不改写，如 gh,npm。内置的信息损失拒绝表不受此项影响。",
     filtersLabel: "启用的结果过滤器",
-    filtersHint: "只在「改写 + 结果压缩」形态下生效。cargo-test / pytest / ctest。",
+    filtersHint:
+      "只在包含结果压缩的形态下生效（改写 + 结果压缩 / 仅结果压缩）。可用名：{filters}。",
     minBytesLabel: "最小输入字节",
     minBytesHint: "小于它的输出不压（压了反而多出说明行）。",
     minGainLabel: "最小节省比例",
@@ -118,6 +140,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     saveRejected: "宿主拒绝了这次写入",
     saveFailed: "保存失败：{reason}",
     outOfRange: "超出范围",
+    invalidFields: "有字段超出范围，先修正或撤销后再保存。",
     statsNote:
       "统计由插件自记账（rtk pipe 不写 rtk gain）。token 由宿主的 tokenMeter 估算（服务缺席时按 bytes/4），节省率按 token 算；改写形态看不到原始输出，它省下的量请看 rtk gain。",
     rtkMissingHint:
@@ -133,15 +156,23 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     statsSaved: "Tokens saved",
     statsByForm: "Per form (rewrite / output compression)",
     statsSavings: "Savings",
+    statsChartTitle: "Tokens saved per filter",
+    statsChartHint:
+      "Bar length is relative to the largest filter; the percentage is that filter's share of all tokens saved.",
+    statsChartRow: "{filter} · {tokens} tokens · {share}% of total saved",
+    statsChartEmpty:
+      "No per-filter records yet (the rewrite form cannot see output, so only output compression is counted here)",
     statsUnavailable: "Stats channel unavailable (compression itself is unaffected)",
     resetStats: "Reset stats",
     switchSection: "Switches",
     enabledLabel: "Enable rtk compression",
-    enabledHint:
-      "Off by default. When on, bash commands are first offered to rtk; if rtk declines, the command runs unchanged.",
+    enabledHintPrefix:
+      "Until set explicitly, this follows rtk readiness: on only when a supported rtk is detected; a manual toggle pins the choice. When on, bash commands are first offered to rtk; if rtk declines, the command runs unchanged.",
+    enabledHintWithPipe:
+      "Until set explicitly, this follows rtk readiness: on only when a supported rtk is detected; a manual toggle pins the choice. When on, the selected form rewrites commands and/or compresses their output; unavailable or low-gain results pass through unchanged.",
     formsLabel: "Enabled forms",
     formsHint:
-      "prefix = rewrite the command (main path; spawns `rtk rewrite`, bounded by rewriteTimeoutMs, ignored at assembly on Windows); prefix+pipe = also compress output by filter (form B, off by default); pipe = compress output only, never rewrite (for setups that block command rewriting).",
+      "prefix = rewrite the command (main path; spawns `rtk rewrite`, bounded by rewriteTimeoutMs, not assembled on Windows); prefix+pipe = also compress output by filter (form B); pipe = compress output only, never rewrite (for setups that block command rewriting). A change takes effect on the next tool call.",
     formPrefix: "Rewrite only",
     formPrefixAndPipe: "Rewrite + output compression",
     formPipeOnly: "Output compression only",
@@ -151,7 +182,8 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     denyHint:
       "Comma separated. A match skips rewriting, e.g. gh,npm. The built-in information-loss table is not affected.",
     filtersLabel: "Enabled output filters",
-    filtersHint: "Only used by the rewrite + output-compression form. cargo-test / pytest / ctest.",
+    filtersHint:
+      "Used by every form that includes output compression (rewrite + output compression / output compression only). Available: {filters}.",
     minBytesLabel: "Minimum input bytes",
     minBytesHint: "Output smaller than this is left alone (compressing it adds lines).",
     minGainLabel: "Minimum gain ratio",
@@ -176,6 +208,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     saveRejected: "The host rejected this write",
     saveFailed: "Save failed: {reason}",
     outOfRange: "out of range",
+    invalidFields: "Some fields are out of range; fix them or revert before saving.",
     statsNote:
       "Stats are self-accounted by this plugin (rtk pipe does not write rtk gain). Tokens are estimated by the host tokenMeter (bytes/4 when that service is absent) and the savings rate is computed on tokens; the rewrite form never sees the original output — read `rtk gain` for that saving.",
     rtkMissingHint:

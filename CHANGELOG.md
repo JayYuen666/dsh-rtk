@@ -4,6 +4,60 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.1
+
+Feature and behavior update: compound command handling, per-filter token accounting with a bar
+chart, and settings-card fixes. The master switch follows rtk readiness, the form selector is hot,
+and the stats card refreshes while it is open.
+
+### Added
+
+- **Compound commands are rewritten segment by segment.** A command containing `&&`, `||`, `;`, `|`,
+  or a newline used to be rejected outright, excluding the most common shape in multi-repo work
+  (`cd <repo> && cargo test`). rtk rewrites per segment (`cd /tmp && cargo test` →
+  `cd /tmp && rtk cargo test`), so `lib/prefix-safety.ts` exposes `splitCommand`; constructs that
+  cannot be split (command substitution, redirection, background `&`, unbalanced quotes) and empty
+  segments still run unchanged.
+- **Rewrite verification and the deny table run per segment.** Both sides are split and the
+  separator sequence must match one for one; each segment runs P1–P4 (an untouched segment must be
+  byte-identical, a touched one may only gain a leading `rtk `). The information-loss deny table and
+  the vitest major gate are evaluated per segment too, so `cd x && git diff` no longer disables the
+  whole table. Any segment hitting a reason runs the whole command unchanged.
+- **Per-filter token accounting and a bar chart.** `byFilter` records `savedTokens`; the projection
+  gained `topFilters` and the card renders a per-filter bar chart with plain `div`s and inline CSS.
+  Tokens come from the host `tokenMeter`, falling back to `bytes / 4` when that service is absent.
+  The rewrite form still records command counts only; its original output never passes through the
+  plugin, so its saving is only visible through `rtk gain`.
+- **Settings are hot, and the master switch follows rtk readiness.** The prefix shadow and the
+  post-execute listener are no longer gated by the enabled form; each call reads `forms`, `enabled`,
+  and `supported` at the consumption point. Changing the form in the card takes effect on the next tool call — no
+  host restart. `enabled` has no static schema default: until set explicitly, it is on only when a
+  supported rtk is detected, and off when rtk is missing or below the floor. A manual toggle writes
+  an explicit value that wins. `prefix` remains the default form and `pipe` is opt-in.
+- **The stats card polls while open.** It refreshes `summary` and `status` every five seconds when
+  the document is visible, skipping a tick while the previous refresh is still in flight.
+
+### Fixed
+
+- **The chart's per-filter share used the wrong denominator.** `summarize` divided each filter's
+  saved tokens by total original tokens, so the percentages added up to the overall savings rate
+  (38.34% in the live check) instead of 100%. The projection field is now `sharePct` and divides by
+  total saved tokens; the row reads "占全部节省" and the chart explains that bar length is relative
+  to the largest filter and the percentage is a share of all tokens saved.
+- **An invalid number draft could survive a save.** `NumberField` keeps out-of-range input out of
+  `onChange`, so the card's dirty set never saw it: saving another valid field cleared the dirty
+  state and left the invalid draft plus its error in the field until a page reload. The card now
+  tracks field validity, blocks saving while any number field is invalid, and resets drafts/errors
+  after save or revert. `NumberField` gained the backward-compatible `onInvalidChange` and
+  `resetToken` props for this.
+- **Two settings hints stated the wrong scope.** The filter hint said filters only work in
+  "rewrite + output compression", but pipe-only uses them too; it now names every form that includes
+  output compression and lists all filter names from the pipe table instead of only the three
+  defaults. The master-switch hint now depends on the selected form.
+- **The form selector no longer needs a restart.** The old card showed the live configured value
+  while the running host still used the assembly-time layers. The restart note is gone; the live
+  value and the active behavior now agree.
+
 ## 0.1.0
 
 First functional release. The plugin mounts, renders its settings card, and stays out of the way

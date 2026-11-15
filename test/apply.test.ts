@@ -21,6 +21,7 @@ import plugin, {
   createLocaleMessages,
   diagOf,
   formsOr,
+  formsReaderOf,
   withDefault,
   loggerOf,
   makeCountRewrite,
@@ -366,6 +367,23 @@ describe("apply 的装配动作", () => {
     assert.deepEqual(seen.configure, [{ presentation: { auto: false }, owner: host.fiber }]);
   });
 
+  it("同一作用域第二次装配让路：不重复注册、不抛错（market 热挂 + bundle 层双路径）", () => {
+    const { host, seen } = makeHost();
+    applyTo(host, configSchema({}));
+    const injectsAfterFirst = seen.injects.length;
+    const effectsAfterFirst = seen.effects.length;
+    const registeredAfterFirst = seen.registered.size;
+    const warnsAfterFirst = seen.warns.length;
+    // 第一次装配经 `reflect.provide` 把单实例锁写进服务表；第二次同一个 host 读得到它 ⇒ 让路。
+    assert.doesNotThrow(() => {
+      applyTo(host, configSchema({}));
+    }, "让路那一份不该抛：撞名抛错正是这条锁要挡掉的形态");
+    assert.equal(seen.injects.length, injectsAfterFirst, "第二次不该再挂注入回调");
+    assert.equal(seen.effects.length, effectsAfterFirst, "第二次不该再挂效应");
+    assert.equal(seen.registered.size, registeredAfterFirst, "第二次不该再注册读取面");
+    assert.equal(seen.warns.length, warnsAfterFirst + 1, "让路时留一条日志");
+  });
+
   it("统计读面注册到 rtkStats（服务键 = 线上命名空间）", () => {
     const { host, seen } = makeHost();
     applyTo(host, configSchema({}));
@@ -598,50 +616,34 @@ function recording(host: HostServices): { readonly host: HostServices; readonly 
   return { host: wrapped, events };
 }
 
-describe("形态开关决定装哪条链", () => {
-  it("enabledForms 不含 pipe 时 B 形态不装（默认配置就是这一档）", () => {
+describe("形态常驻与运行期门禁", () => {
+  it("b 形态常驻：enabledForms 不含 pipe 时监听器也注册", () => {
     const { host: base } = makeHost();
     const { host, events } = recording(base);
     applyTo(host, configSchema({ enabled: true, enabledForms: ["prefix"] }));
-    assert.equal(events.includes(POST_EXECUTE), false);
-  });
-
-  it("enabledForms 含 pipe 时 B 形态挂上（它的门禁只有形态开关）", () => {
-    const { host: base } = makeHost();
-    const { host, events } = recording(base);
-    applyTo(host, configSchema({ enabled: true, enabledForms: ["prefix", "pipe"] }));
     assert.equal(events.includes(POST_EXECUTE), true);
   });
 
-  it.skipIf(!POSIX_ONLY)("enabledForms 不含 prefix 时 C 形态不装", () => {
-    // 同样要先把 rtk 造出来：不造的话这条负例在没装 rtk 的机器上**因为错的理由**通过
-    // （门禁第三条就把它挡掉了），而它要证的是「形态开关单独就能挡住装配」。
-    //
-    // 同理也必须是 POSIX-only：Windows 上平台门禁先把它挡掉，这条负例就成了「因为平台而通过」，
-    // 与它声称的判据（形态开关）无关。
+  it.skipIf(!POSIX_ONLY)("c 形态常驻：enabledForms 只有 pipe 时也注册 agent/created", () => {
+    // 先把 rtk 造出来：不造的话这台机器上「找不到 rtk」会先挡掉装配，测出来的
+    // 就不是「形态不再决定装不装」这条判据。POSIX-only 同前：Windows 平台门禁先挡。
     withRtkOnPath();
     const { host: base } = makeHost();
     const { host, events } = recording(base);
     applyTo(host, configSchema({ enabled: true, enabledForms: ["pipe"] }));
-    assert.equal(events.includes(AGENT_CREATED), false);
+    assert.equal(events.includes(AGENT_CREATED), true);
   });
 
-  it.skipIf(!POSIX_ONLY)(
-    "用户开关默认关闭时：C 形态照装（开关运行期才判），B 形态不装（形态不含 pipe）",
-    () => {
-      // 「默认关」不等于「不装」。`enabled` 是 volatile，用户是在卡片上打开它的，而 `apply` 只跑
-      // 一次——装配期若按 `enabled` 早退，用户之后打开开关就没有任何东西会去补装，默认路径整条
-      // 不通。所以装配期只判形态与环境，总开关留给执行期现读。
-      //
-      // 「环境」那一条是 PATH 上找得到 rtk：不自己造，这条断言测的就是跑测那台机器。
-      // 平台那一条（win32 不装）不在本用例的判据里，见 `POSIX_ONLY`。
-      withRtkOnPath();
-      const { host: base } = makeHost();
-      const { host, events } = recording(base);
-      applyTo(host, configSchema({}));
-      assert.deepEqual(events, [AGENT_CREATED]);
-    },
-  );
+  it.skipIf(!POSIX_ONLY)("默认配置 enabled 无静态值，两层都常驻", () => {
+    // 默认开启由版本探测结果兜底，不是 schema 静态默认；两层常驻是热切换的承重结构。
+    withRtkOnPath();
+    const { host: base } = makeHost();
+    const { host, events } = recording(base);
+    const config = configSchema({});
+    assert.equal(config.enabled.get(), undefined);
+    applyTo(host, config);
+    assert.deepEqual(events, [AGENT_CREATED, POST_EXECUTE]);
+  });
 });
 /**
  * 九个 volatile 全返空引用的配置。
@@ -680,7 +682,8 @@ function liveConfig(): {
   readonly set: (key: string, value: unknown) => void;
 } {
   const slots = new Map<string, unknown>([
-    ["enabled", false],
+    ["enabled", true],
+    ["enabledForms", ["prefix"]],
     ["denyCommands", []],
     ["warnHint", true],
     ["rewriteHostEnv", ""],
@@ -706,7 +709,7 @@ function liveConfig(): {
 
 describe("volatile 读到空引用时不崩（宿主的退化态）", () => {
   it.skipIf(!POSIX_ONLY)(
-    "九个 volatile 全空时装配照常完成：形态退到默认 ['prefix'] 只装 C 形态，总开关不在装配期判",
+    "九个 volatile 全空时装配照常完成：形态退到默认 ['prefix']，两层都常驻",
     () => {
       // 同上两条：C 形态的门禁第三条是 PATH 上有 rtk（不造出来这条判据就跟着跑测机器走），
       // 而平台那一条（win32 整层不装）不在本用例的判据里，见 `POSIX_ONLY`。
@@ -716,13 +719,13 @@ describe("volatile 读到空引用时不崩（宿主的退化态）", () => {
       applyTo(host, emptyVolatileConfig());
       assert.deepEqual(
         events,
-        [AGENT_CREATED],
-        "空引用等于「没配」：形态退默认、总开关留待执行期现读",
+        [AGENT_CREATED, POST_EXECUTE],
+        "空引用等于「没配」：形态退默认，两层仍常驻，运行期再判形态与总开关",
       );
     },
   );
 
-  it("status() 把空引用读成默认值：enabled=false、forms=['prefix']", () => {
+  it("status() 在受支持版本探测回来前把空 enabled 读成 false", () => {
     const { host, seen } = makeHost();
     applyTo(host, emptyVolatileConfig());
     const service = seen.registered.get(RTK_STATS_SERVICE_KEY) as {
@@ -739,16 +742,16 @@ describe("volatile 读到空引用时不崩（宿主的退化态）", () => {
 describe("volatile 的取值函数：装配期交出去的是「怎么读」，不是「读到的值」", () => {
   it("c 形态的四位：改配置之后取值函数读到的是新值（不是装配那一刻的快照）", () => {
     const { config, set } = liveConfig();
-    const readers = prefixReadersOf(config);
-    assert.equal(readers.enabled(), false);
+    const readers = prefixReadersOf(config, () => true);
+    assert.equal(readers.enabled(), true);
     assert.deepEqual([...readers.denyCommands()], []);
     assert.equal(readers.warnHint(), true);
     assert.equal(readers.rewriteHostEnv(), "");
-    set("enabled", true);
+    set("enabled", false);
     set("denyCommands", ["gh"]);
     set("warnHint", false);
     set("rewriteHostEnv", "openclaw");
-    assert.equal(readers.enabled(), true);
+    assert.equal(readers.enabled(), false);
     assert.deepEqual([...readers.denyCommands()], ["gh"]);
     assert.equal(readers.warnHint(), false);
     assert.equal(readers.rewriteHostEnv(), "openclaw");
@@ -756,34 +759,34 @@ describe("volatile 的取值函数：装配期交出去的是「怎么读」，�
 
   it("b 形态的五位：改配置之后取值函数读到的是新值", () => {
     const { config, set } = liveConfig();
-    const readers = pipeReadersOf(config);
-    assert.equal(readers.enabled(), false);
+    const readers = pipeReadersOf(config, () => true);
+    assert.equal(readers.enabled(), true);
     assert.deepEqual([...readers.enabledFilters()], ["cargo-test"]);
     assert.equal(readers.minBytes(), 256);
     assert.equal(readers.minGainRatio(), 0.95);
     assert.equal(readers.stdoutCapBytes(), 64_000);
-    set("enabled", true);
+    set("enabled", false);
     set("enabledFilters", ["pytest"]);
     set("minBytes", 1);
     set("minGainRatio", 0.5);
     set("stdoutCapBytes", 100);
-    assert.equal(readers.enabled(), true);
+    assert.equal(readers.enabled(), false);
     assert.deepEqual([...readers.enabledFilters()], ["pytest"]);
     assert.equal(readers.minBytes(), 1);
     assert.equal(readers.minGainRatio(), 0.5);
     assert.equal(readers.stdoutCapBytes(), 100);
   });
 
-  it("退化态（volatile 交回空引用）下两层各自的兜底与 schema 的默认值同值", () => {
+  it("退化态（volatile 交回空引用）下 enabled 跟随就绪探测，而不是写死 true", () => {
     // 这两份兜底散在 `apply` 里时没有任何判据：只有「volatile 读到空引用」那种退化态
     // 才会走它们，而正常装出来的行为一模一样。
-    const readers = prefixReadersOf(emptyVolatileConfig());
+    const readers = prefixReadersOf(emptyVolatileConfig(), () => false);
     assert.equal(readers.enabled(), false);
     assert.deepEqual([...readers.denyCommands()], []);
     assert.equal(readers.warnHint(), true);
     assert.equal(readers.rewriteHostEnv(), "");
-    const pipes = pipeReadersOf(emptyVolatileConfig());
-    assert.equal(pipes.enabled(), false);
+    const pipes = pipeReadersOf(emptyVolatileConfig(), () => true);
+    assert.equal(pipes.enabled(), true);
     assert.deepEqual([...pipes.enabledFilters()], [...DEFAULT_ENABLED_FILTERS]);
     assert.equal(pipes.minBytes(), 256);
     assert.equal(pipes.minGainRatio(), 0.95);
@@ -792,10 +795,30 @@ describe("volatile 的取值函数：装配期交出去的是「怎么读」，�
 
   it("c/b 两层读同一个 enabled：一处开关不能只作用于其中一层", () => {
     const { config, set } = liveConfig();
-    const prefix = prefixReadersOf(config);
-    const pipe = pipeReadersOf(config);
-    set("enabled", true);
+    const prefix = prefixReadersOf(config, () => true);
+    const pipe = pipeReadersOf(config, () => true);
+    set("enabled", false);
     assert.equal(prefix.enabled(), pipe.enabled(), "两层的总开关必须是同一个判据");
+  });
+
+  it("formsReaderOf 每次现读 enabledForms（形态热切换的数据面）", () => {
+    const { config, set } = liveConfig();
+    const forms = formsReaderOf(config);
+    assert.deepEqual([...forms()], ["prefix"]);
+    set("enabledForms", ["prefix", "pipe"]);
+    assert.deepEqual([...forms()], ["prefix", "pipe"]);
+  });
+
+  it("enabled 未显式设置时跟随就绪探测：ready 翻转后下一次读取就变", () => {
+    const { config, set } = liveConfig();
+    set("enabled", undefined);
+    let ready = false;
+    const readers = prefixReadersOf(config, () => ready);
+    assert.equal(readers.enabled(), false);
+    ready = true;
+    assert.equal(readers.enabled(), true);
+    set("enabled", false);
+    assert.equal(readers.enabled(), false, "显式 false 必须压过 ready=true");
   });
 });
 

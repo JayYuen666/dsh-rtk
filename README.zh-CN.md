@@ -49,11 +49,12 @@
 
 ## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 它做什么
 
-- **两种压缩形态，都默认关闭。** `prefix` 按 agent 遮蔽 `bash`、先过一遍 `rtk rewrite`；`pipe` 把已完成的 shell 结果喂给 `rtk pipe -f <filter>`，只替换模型可见的那段文本。
+- **两种压缩形态；总开关跟随 rtk 就绪状态。** `prefix` 按 agent 遮蔽 `bash`、先过一遍 `rtk rewrite`；`pipe` 把已完成的 shell 结果喂给 `rtk pipe -f <filter>`，只替换模型可见的那段文本。未显式设置 `enabled` 时，检测到受支持的 rtk 才默认开启；`prefix` 是默认形态，`pipe` 需要显式打开。
+- **复合命令逐段改写。** `cd <仓库> && cargo test` 这种多仓开发时最常见的形状会被拆成独立段，只换掉承载输出的那一段（`cd <仓库> && rtk cargo test`）；拆不开的构造（命令替换、重定向、后台 `&`、引号不配对）仍然整条原样执行。
 - **不值得压的一律不压。** 小于 `minBytes`（256）的输出、压缩率不足 `minGainRatio`（0.95）的改写，全部原样放行。插件不报它没做到的节省。
 - **失败用例保住原文。** 护栏会拒绝任何丢掉失败断言、file:line 或退出码 marker 的压缩——一条看不出为什么挂的失败比不压缩更糟。
 - **处处 fail-open。** rtk 没装、rtk 太旧、改写会破坏语义、命令不适合改写：原命令照跑、原文照样送达、什么都不丢。
-- **一张设置卡。** 按 filter 的调用计数与字节节省，经官方 Typert Remote 命名空间从宿主 storage domain 读出。
+- **一张设置卡。** 命令数、省下的 token 与节省率，外加一张按 filter 的 token 收益条形图，经官方 Typert Remote 命名空间从宿主 storage domain 读出。
 
 ## <img src="https://api.iconify.design/lucide/package.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 安装
 
@@ -88,8 +89,8 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 
 - `dsh.bundle.patch` 指向 `cordis.patch.yml`，它的 `insert:` 块只有一条 `- id: rtk`，`name: "@jayyuen66/dsh-rtk"`——**裸包名**才让宿主去扫客户端那一半。卡片组件打包进 `client.js`（只有 `react` / `zod` 留在宿主模块表外）。
 - 缺任何一个注入面都会让 cordis 不激活该条目（启动诊断：`pending (waiting for service: …)`）；ctx 形状不对则应用 apply 时抛 `required services … missing`。
-- 部署默认值写在注册行的 `config:` 上；优先级是卡片运行值 > 注册行 config > schema `.default()`。
-- **你不打开它，它什么都不做。** 默认 `enabled: false`：插件装载、卡片渲染、任何命令都不碰。
+- 部署默认值写在注册行的 `config:` 上；优先级是卡片运行值 > 注册行 config > schema `.default()`。`enabled` 没有静态 `.default()`：未设置时按 rtk 版本探测结果兜底。
+- **总开关跟随 rtk 就绪状态。** 未显式设置 `enabled` 时，rtk 缺失或低于支持下限就保持关闭，检测到受支持版本才默认开启。`prefix` 是默认形态；手动关掉或打开会固定你的选择。开关与形态选择都在下一次工具调用时生效。
 
 ## <img src="https://api.iconify.design/lucide/sliders-horizontal.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 两种形态
 
@@ -99,14 +100,17 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 | 做法 | 按 agent 遮蔽 `bash`，问 `rtk rewrite`，跑改写后的形态 | 把捕获到的 stdout 喂给 `rtk pipe -f <filter>` |
 | 模型看到什么 | 改写后命令的压缩输出 | 压缩输出，原始 marker 与退出码保持不变 |
 | 失败形态 | 改写被拒 → 原命令执行 | filter 不可用 → 原文送达 |
+| 复合命令 | 逐段改写：只换承载输出的那一段 | 整条命令的输出一起压 |
 | 默认 | `enabled` 打开时启用 | 关闭（等 rtk 覆盖更多形态） |
+
+`prefix` 的复合命令处理值得单独说一句：rtk 自己就是逐段改写的（`discover/registry.rs` 的 `rewrite_compound`），实测 `cd /tmp && cargo test` 的产物是 `cd /tmp && rtk cargo test`。插件把原命令与产物各拆成若干段，要求**分隔符序列逐一相同**、并让每一段各自通过 P1~P4 校验（没被动过的段逐字符不变，被动过的那段只允许「在开头多一个 `rtk `」）。改成别的形状一律拒绝、原命令执行。
 
 ## <img src="https://api.iconify.design/lucide/settings.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 设置项
 
 | 键 | 默认值 | 含义 |
 | --- | --- | --- |
-| `enabled` | `false` | 总开关 |
-| `enabledForms` | `['prefix']` | 允许生效的形态。卡片能写它，但两层都在装配期读：**改完要重启** |
+| `enabled` | 未设置 | 总开关；未设置时检测到受支持的 rtk 才默认开启 |
+| `enabledForms` | `['prefix']` | 允许生效的形态；下一次工具调用即生效 |
 | `denyCommands` | `[]` | 额外永不被改写的命令模式 |
 | `enabledFilters` | `['cargo-test','pytest','ctest']` | 允许生效的 pipe filter |
 | `minBytes` | `256` | 小于它的输出永不压缩 |
@@ -120,9 +124,7 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 | `vitestMaxMajor` | `5` | 重启生效；vitest 达到该主版本就不压 |
 | `logFilterMode` | `'off'` | 重启生效 |
 
-配置 schema 共 14 个字段，全部带内置默认值；其中卡上那 9 枚是 volatile —— 设置卡写它们，下一次工具调用就生效。剩下的**非 volatile 部署值**，共 5 枚，在装配时读一次，改完要重启。
-
-有一枚 volatile 是「下一次工具调用即生效」这句话的例外：`enabledForms` 决定**装哪几层**，两种形态都在装配期读一次。卡片仍然显示这个选择器（宿主只把 volatile 字段投影进 `describe()`），但改完要重启才生效。前缀形态还有一个需要知道的后果：它会写 rtk 自己的 `history.db`——真正跑的是改写后的那条命令。
+配置 schema 共 14 个字段；其中 13 个带内置默认值，`enabled` 在显式设置前跟随 rtk 就绪状态。其中卡上那 9 枚是 volatile —— 设置卡写它们，下一次工具调用就生效，`enabledForms` 也在其中。剩下的**非 volatile 部署值**，共 5 枚，在装配时读一次，改完要重启。前缀形态会写 rtk 自己的 `history.db`——真正跑的是改写后的那条命令。
 
 ## <img src="https://api.iconify.design/lucide/monitor.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 支持面
 
@@ -135,7 +137,8 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 ## <img src="https://api.iconify.design/lucide/lock.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 数据与隐私
 
 - **命令文本只以 argv 的形式离开宿主进程，交给你自己那个 `rtk` 二进制。** 本插件不发起任何网络请求。
-- **计数存在宿主的 storage domain 里**（`<DSH_HOME>/storages/`），每个 filter 一条记录加一条汇总。别的什么都不落盘。
+- **计数存在宿主的 storage domain 里**（`<DSH_HOME>/storages/`），每个 filter 一条记录加一条汇总；记录里有命令数、前后字节、前后 token。别的什么都不落盘。
+- **token 由宿主的 `tokenMeter` 估算**（服务缺席时按 `bytes / 4`，与 rtk 官方 `estimate_tokens_from_len` 同一口径）。改写形态看不到原始输出，它省下的量只能看 `rtk gain`；统计卡里的数字全部来自结果压缩形态。
 - **被压缩的原文可能落进宿主的 spill 区**——当它超过内联预算时，走的是宿主每个工具都在用的那套机制，同样的按会话分区。
 
 ## <img src="https://api.iconify.design/lucide/triangle-alert.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 已知边界
@@ -144,6 +147,7 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 - **`npm run <script>` 永不被改写。** rtk 把脚本名映射成工具名（`npm run lint` → `rtk lint`），那会跑 ESLint 而不是你的脚本。插件会丢掉任何「从原命令里拿掉了某个词」的改写。
 - **listing 类命令会折叠。** `ls`、`find`、`grep`/`rg` 可能把长列表换成 `+N more` 标记；护栏识别这一族标记并拒绝压缩，所以折叠后的列表不会经本插件到达模型。
 - **审批看到的是你请求的命令，不是改写后的命令。** 遮蔽层在 `execute` 里改 `args.command`，而 `execute` 跑在管线的 `tools/pre-execute` **之后**。所以通用命令审批（auto-review、danger-guard、Claude Code 风格的 hooks）求值的是冻结的原始参数（`cargo test`），实际跑的是改写形态（`rtk cargo test`）。沙箱升档审批在 `orig.execute` **之内**，原样保留——插件从不自己 spawn 命令。补在这道缝前面的三样减法由插件负责：信息损失拒绝表（`git diff` / `git log` / `git show <ref>` / `ls` / `find` / `grep` / `rg` / `cargo clippy` / `aws`）、P1~P4 改写校验（只允许剥前缀、不许丢脚本运行词）、以及 vitest 主版本门控。危险命令（`rm -rf`、`git push --force`）根本不在 rtk 的改写面里，因此原样执行、原样受审——danger-guard 没有被绕过。
+- **复合命令里任意一段命中拒绝表，整条都原样执行。** 拒绝表（`git diff` / `git log` / `ls` / `find` / `grep` / `rg` / `cargo clippy` / `aws` 等）与 vitest 主版本门控都按**段**判，因为 `cd x && git diff` 的首词是 `cd`——按整条判会让整张表失效。但命中之后不拆开执行：用户敲 `cd X && git status` 时预期是一次完整执行，替他把前半段交出去、后半段自己拼不是插件该做的事。
 - **`rtk pipe` 处理失败的 pytest 时保住用例名，但不一定保住断言正文。** 护栏检查「有没有成功声明」与「失败行还在不在」；一个两者都过、却仍然丢了细节的 filter 输出，是 filter 的已知边界，不是护栏的。
 
 ## <img src="https://api.iconify.design/lucide/wrench.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 开发

@@ -84,8 +84,14 @@ function summaryOf(
   compressedTokens: number;
   savedTokens: number;
   savingsPct: number;
-  byFilter: Record<string, { commands: number; savedBytes: number }>;
+  byFilter: Record<string, { commands: number; savedBytes: number; savedTokens: number }>;
   byForm: { prefix: number; pipe: number };
+  topFilters: readonly {
+    filter: string;
+    commands: number;
+    savedTokens: number;
+    sharePct: number;
+  }[];
 } {
   return {
     commands,
@@ -100,6 +106,7 @@ function summaryOf(
     savingsPct: 0,
     byFilter: {},
     byForm: { prefix: 0, pipe: 1 },
+    topFilters: [],
   };
 }
 
