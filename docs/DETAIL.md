@@ -60,3 +60,9 @@ normally, output comes through untouched, and the card tells you what to install
 
 - `docs/DETAIL.zh.md` — 中文版
 - `README.md` / `README.zh-CN.md` — configuration table and design notes
+
+## Feedback
+
+Issues and pull requests are welcome: [https://github.com/JayYuen666/dsh-rtk/issues](https://github.com/JayYuen666/dsh-rtk/issues).
+
+If a plugin fails to boot, include the dsh host version, the profile install shape, and the browser console line. The `missed the module table` line is especially useful: it tells us whether the shared client row was materialized.

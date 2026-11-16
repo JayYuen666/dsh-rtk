@@ -45,6 +45,7 @@
 - [ Data and privacy](#-data-and-privacy)
 - [ Known boundaries](#-known-boundaries)
 - [ Development](#-development)
+- [ Feedback](#feedback)
 - [ License](#-license)
 
 ## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> What it does
@@ -87,7 +88,7 @@ Remove with `dsh plugin --profile web remove @jayyuen66/dsh-rtk`. The package is
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Enabling it in dsh
 
-- `dsh.bundle.patch` points at `cordis.patch.yml`, whose `insert:` block carries a single `- id: rtk` entry with `name: "@jayyuen66/dsh-rtk"` — the **bare package name** is what makes the host scan the client half. The card components are bundled into `client.js` (only `react` / `zod` stay external to the host's module table).
+- `dsh.bundle.patch` points at `cordis.patch.yml`, whose `insert:` block carries a `- id: dsh-plugin-shared` supplier row (keep it enabled; disabling it removes the cards' shared component supply) plus the `- id: rtk` entry with `name: "@jayyuen66/dsh-rtk"` — the **bare package name** is what makes the host scan the client half. The card components come from the shared client row, externalized as `@jayyuen66/dsh-plugin-shared/client`; the host module table provides `react`, `zod` and that shared row.
 - A missing injected surface keeps cordis from activating the entry (startup diagnostic: `pending (waiting for service: …)`); a malformed ctx throws `required services … missing` from apply.
 - Deployment defaults go on the registration line's `config:`; precedence is card runtime value > row config > schema `.default()`.
 - **The master switch follows rtk readiness.** Until you set `enabled` explicitly, it stays off when rtk is missing or below the supported floor and turns on once a supported rtk is detected. `prefix` is the default form. Turn the switch off manually to pin it off, or on to pin it on; both the switch and the form selector take effect on the next tool call.
@@ -158,6 +159,12 @@ pnpm run check          # typecheck + lint + build + test + fmt:check
 ```
 
 `pnpm run smoke @jayyuen66/dsh-rtk` from the umbrella workspace mounts the package into a sandbox `DSH_HOME`; the accepted signal is the `--dump-config` layer line.
+
+## Feedback
+
+Issues and pull requests are welcome: [https://github.com/JayYuen666/dsh-rtk/issues](https://github.com/JayYuen666/dsh-rtk/issues).
+
+If a plugin fails to boot, include the dsh host version, the profile install shape, and the browser console line. The `missed the module table` line is especially useful: it tells us whether the shared client row was materialized.
 
 ## <img src="https://api.iconify.design/lucide/scale.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> License
 

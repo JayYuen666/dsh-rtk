@@ -34,12 +34,10 @@ export const FLOORS: readonly Floor[] = [
   {
     file: "client.js",
     // 首轮实测 53,930 B（卡片 + shared card-ui 随包进产物；react 外置）。
-    // 现量 87,700 B：涨的是设置页导航图标那一轮——图形是 rtk **官方标记**的 PNG 内联成
-    // data URI（约 29 KB base64），用户明确要求「直接使用 rtk 官方的…不要压缩，压缩之后
-    // 太丑啦」，所以这一档体积是为「图标不失真」付的价，不是可以随手省掉的余量。
-    // 下限不动（防截断的那把尺子按首轮 40% 给）；预算按「实测 × 1.25 向上取整」重算。
+    // 现量 45,081 B：shared 客户端行改为 external，产物只留本仓卡片与官方导航图标
+    // （PNG 内联成 data URI，约 29 KB base64）；构建已开启 minify。预算按实测 × 1.25 取整。
     floor: 25_000,
-    budget: 110_000,
-    note: "client 半：卡片 + shared card-ui + 官方导航图标（data URI）随包进产物；react 外置，不进这里",
+    budget: 57_000,
+    note: "client 半：本仓卡片 + 官方导航图标（data URI）；shared card-ui 由宿主行供应，不进这里",
   },
 ];

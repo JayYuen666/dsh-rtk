@@ -4,6 +4,10 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.2
+
+Bumped `@jayyuen66/dsh-plugin-shared` to `^0.2.10`. The settings-card sticky save bar no longer picks up an opaque background from an older fixed-id `CARD_UI_CSS`. The client bundle was rebuilt. No public tool, Remote method, or config surface changed.
+
 ## 0.1.1
 
 Feature and behavior update: compound command handling, per-filter token accounting with a bar

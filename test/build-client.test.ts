@@ -5,16 +5,19 @@
 // 又会让登记落在收集期之外，那条用例被静默丢掉（实测过：门禁从此不再跑，而套件照绿）。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { buildClient } from "../build-client.mjs";
 import { declareClientFreshness } from "./client-freshness.ts";
 import { declareSchemaCoverage } from "./schema-coverage.ts";
 
 describe("client 产物", () => {
-  it("包含 BUNDLE_PKG 与 PACKAGE_NAME 两个字面量（槽位键与 $mount 包名同源）", async () => {
+  it("产物带包名 id；槽位键与 $mount 包名在源码声明里同源", async () => {
     const body = await buildClient();
     assert.ok(body.includes('"@jayyuen66/dsh-rtk"'));
-    // 至少两处：verifyName 那两道核对分别读 BUNDLE_PKG 与 PACKAGE_NAME 的声明。
-    assert.ok((body.match(/"@jayyuen66\/dsh-rtk"/gu) ?? []).length >= 2);
+    const entry = readFileSync(new URL("../src/client-entry.ts", import.meta.url), "utf8");
+    assert.match(entry, /export const BUNDLE_PKG = "@jayyuen66\/dsh-rtk";/u);
+    const stats = readFileSync(new URL("../src/stats-reader.ts", import.meta.url), "utf8");
+    assert.match(stats, /export const PACKAGE_NAME = "@jayyuen66\/dsh-rtk";/u);
   });
 
   it("产物里带着设置页一级分区的三条注册（分区 + 图标 + 导航名）", async () => {
@@ -27,11 +30,11 @@ describe("client 产物", () => {
     // 断的是**注册调用**而不是裸槽名：`name: "settings.section.icon"` 这一行在注册体里也出现，
     // 只搜槽名的话「inject 那一侧被改坏」仍然通过（变异测试实测过这一条假阴性）。
     for (const needle of [
-      'inject("settings.section",',
-      'inject("settings.section.icon",',
-      "navLabel",
+      /inject\(\s*[`"']settings\.section[`"']\s*,/u,
+      /inject\(\s*[`"']settings\.section\.icon[`"']\s*,/u,
+      /navLabel/u,
     ]) {
-      assert.ok(body.includes(needle), `产物里找不到 ${needle}`);
+      assert.match(body, needle, `产物里找不到 ${String(needle)}`);
     }
   });
 
@@ -43,6 +46,19 @@ describe("client 产物", () => {
         body.includes('from "react"'),
     );
     assert.ok(!body.includes("useState=function"), "react 运行时被内联进产物了");
+  });
+
+  it("shared 客户端行被外置，且 manifest 与 patch 同步登记", async () => {
+    const body = await buildClient();
+    assert.match(body, /require\([`"']@jayyuen66\/dsh-plugin-shared\/client[`"']\)/u);
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+      dsh?: { client?: { external?: unknown } };
+    };
+    assert.deepEqual(pkg.dsh?.client?.external, ["@jayyuen66/dsh-plugin-shared/client"]);
+    const patch = readFileSync(new URL("../cordis.patch.yml", import.meta.url), "utf8");
+    assert.match(patch, /^\s*-\s+id:\s*dsh-plugin-shared\s*$/mu);
+    assert.match(patch, /^\s+name:\s*"@jayyuen66\/dsh-plugin-shared"\s*$/mu);
+    assert.match(patch, /必须保持开启/u);
   });
 });
 

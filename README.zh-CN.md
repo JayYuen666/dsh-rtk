@@ -45,6 +45,7 @@
 - [数据与隐私](#-数据与隐私)
 - [已知边界](#-已知边界)
 - [开发](#-开发)
+- [反馈](#反馈)
 - [许可证](#-许可证)
 
 ## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 它做什么
@@ -87,7 +88,7 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 在 dsh 里启用
 
-- `dsh.bundle.patch` 指向 `cordis.patch.yml`，它的 `insert:` 块只有一条 `- id: rtk`，`name: "@jayyuen66/dsh-rtk"`——**裸包名**才让宿主去扫客户端那一半。卡片组件打包进 `client.js`（只有 `react` / `zod` 留在宿主模块表外）。
+- `dsh.bundle.patch` 指向 `cordis.patch.yml`，它的 `insert:` 块含一条 `- id: dsh-plugin-shared` 供应行（必须保持开启；停用后卡片会失去 shared 组件供应），再加一条 `- id: rtk`、`name: "@jayyuen66/dsh-rtk"`——**裸包名**才让宿主去扫客户端那一半。卡片组件来自 shared 的客户端行，以 `@jayyuen66/dsh-plugin-shared/client` 外置；宿主模块表提供 `react`、`zod` 与这条 shared 供应。
 - 缺任何一个注入面都会让 cordis 不激活该条目（启动诊断：`pending (waiting for service: …)`）；ctx 形状不对则应用 apply 时抛 `required services … missing`。
 - 部署默认值写在注册行的 `config:` 上；优先级是卡片运行值 > 注册行 config > schema `.default()`。`enabled` 没有静态 `.default()`：未设置时按 rtk 版本探测结果兜底。
 - **总开关跟随 rtk 就绪状态。** 未显式设置 `enabled` 时，rtk 缺失或低于支持下限就保持关闭，检测到受支持版本才默认开启。`prefix` 是默认形态；手动关掉或打开会固定你的选择。开关与形态选择都在下一次工具调用时生效。
@@ -158,6 +159,12 @@ pnpm run check          # typecheck + lint + build + test + fmt:check
 ```
 
 在伞工作区里跑 `pnpm run smoke @jayyuen66/dsh-rtk` 会把包装进沙箱 `DSH_HOME`；被接受的判据是 `--dump-config` 的层行。
+
+## 反馈
+
+欢迎提 issue 和 PR：[https://github.com/JayYuen666/dsh-rtk/issues](https://github.com/JayYuen666/dsh-rtk/issues)。
+
+插件启动失败时，请附上 dsh 宿主版本、profile 安装形态和浏览器控制台原文。`missed the module table` 这一行尤其有用：它能直接说明 shared 客户端供应行有没有被物化。
 
 ## <img src="https://api.iconify.design/lucide/scale.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 许可证
 
