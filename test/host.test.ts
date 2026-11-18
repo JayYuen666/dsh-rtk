@@ -25,7 +25,10 @@ const DEFAULTS = {
   // 而 `as const` 交出来的是只读元组（类型上装不进去，运行期却没有区别）。
   enabledForms: ["prefix"] as ("prefix" | "pipe")[],
   denyCommands: [] as string[],
-  enabledFilters: ["cargo-test", "pytest", "ctest"] as string[],
+  // 默认集合是「前缀层交不出去的那几条」+ `vitest`：前三项会被 C 形态先改写成 `rtk <cmd>`，
+  // 结果侧再压只会命中 `already-rewritten`；而 `vitest` 的三种 test 形态（`pnpm/npm/yarn test`）
+  // 是 rtk 的规则**改不动**的（它要求显式 `run`，实测 rc=1），压缩由本包在内存里删 `✓` 行完成。
+  enabledFilters: ["git-log", "git-diff", "git-status", "grep", "find", "vitest"] as string[],
   minBytes: 256,
   minGainRatio: 0.95,
   stdoutCapBytes: 64_000,
@@ -77,7 +80,14 @@ describe("config 默认值", () => {
     const parsed = configSchema({}) as unknown as Record<string, unknown>;
     assert.equal(readField(parsed, "enabled"), undefined);
     assert.deepEqual(readField(parsed, "enabledForms"), ["prefix"]);
-    assert.deepEqual(readField(parsed, "enabledFilters"), ["cargo-test", "pytest", "ctest"]);
+    assert.deepEqual(readField(parsed, "enabledFilters"), [
+      "git-log",
+      "git-diff",
+      "git-status",
+      "grep",
+      "find",
+      "vitest",
+    ]);
     assert.equal(readField(parsed, "rewriteHostEnv"), "");
     assert.equal(readField(parsed, "vitestMaxMajor"), 5);
     assert.equal(readField(parsed, "logFilterMode"), "off");

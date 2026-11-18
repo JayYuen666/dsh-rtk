@@ -147,6 +147,20 @@ const CARD_CSS = [
   // 本组件——`useChart` 里那条 MutationObserver 观察到属性变化后，会重新读这里取色再 update。
   "body[data-ds-dark-theme]{--rtkc-chart-text:#9aa3b2;--rtkc-chart-grid:#ffffff1f}",
   ".rtkc-page{display:flex;flex-direction:column;gap:var(--rtkc-gap);padding:4px 0 12px}",
+  // 洞察页是主面板里的一整页，而宿主给它的容器**自己不滚**：ui-layout 的 `.centerCol`
+  // 声明 `overflow:hidden`（AppFrame.module.css），中间也没有任何带滚动能力的包装层——
+  // 官方两个一级页（插件页、任务页）都是页面自己开 `overflow-y:auto` 才滚得动。
+  // 缺了这一条的症状是「数据一多，下半页连同表格直接看不见，也没有滚动条」。
+  //
+  // 用 `[data-panel]` 限定：设置卡外壳 `RtkSection` 也复用 `.rtkc-page`，而那一层的滚动
+  // 由宿主设置页容器负责；在这里统一加 `flex:1` 会让卡片在设置页里被拉满整屏。
+  // `scrollbar-gutter:stable` 是为了内容增长时不左右跳（官方任务页同款）。
+  //
+  // 那三个 `--dsh-scrollbar-*` 是宿主 ui-theme `styles/scrollbar.css` 读的几何量：默认 5px 宽、
+  // 0px 边框，在深色卡片面上几乎看不出有滚动条。官方任务页（`TaskManagerPage.module.css` 的
+  // `.pageScroll`）也是 9px + 2px 内缩，这里跟它对齐：拇指实际 5px、离边 2px，才看得出「还能往下滚」。
+  // 配色用 l2 一对——本页的底色是卡片面，l1 那对是给基础面的。
+  ".rtkc-page[data-panel]{flex:1 1 auto;min-height:0;box-sizing:border-box;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;--dsh-scrollbar-width:9px;--dsh-scrollbar-thumb-border:2px;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2)}",
   ".rtkc-page-head{display:flex;align-items:center;justify-content:space-between;gap:12px}",
   ".rtkc-page-title{display:flex;align-items:center;gap:8px;font-size:1.05em;font-weight:600;margin:0}",
   // 刷新按钮：hover 才显出边框与底色。常驻边框会让页头看起来比页身还重。
@@ -182,6 +196,21 @@ const CARD_CSS = [
   ".rtkc-kpi:hover{border-color:var(--dsw-alias-border-l3,rgba(127,127,127,.42))}",
   ".rtkc-kpi-label{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-secondary,inherit);white-space:nowrap}",
   ".rtkc-kpi-value{font-size:17px;line-height:1.25;font-weight:600;font-variant-numeric:tabular-nums}",
+  // ---- 数字滚动（只在前三格次数上播一次）----
+  // 纯 CSS：注册一个整数型自定义属性让浏览器能对它插值，再用 `counter()` 把它画成文本。
+  // 没有 JS 定时器、没有逐帧 setState —— 动画不占主线程。
+  '@property --rtkc-count-target{syntax:"<integer>";initial-value:0;inherits:false}',
+  // 三条一起才成立：
+  // ① `font-size:0` 让元素自身文本不可见（否则浏览器画的是最终值，动画看起来没发生）；
+  // ② `counter-reset` 把计数器绑到那个自定义属性上，`::after` 用 `counter()` 画出来；
+  // ③ `content: counter(x) / ""` —— 斜杠后是替代文本，写空串表示「它是装饰、别再念一遍」，
+  //    否则读屏会把同一个数字念两次。
+  ".rtkc-kpi-value[data-count]{font-size:0;animation:rtkc-count-up 620ms cubic-bezier(.22,.61,.36,1) forwards;counter-reset:rtkc-count var(--rtkc-count-target)}",
+  '.rtkc-kpi-value[data-count]::after{content:counter(rtkc-count) / "";font-size:17px;font-variant-numeric:tabular-nums}',
+  "@keyframes rtkc-count-up{from{--rtkc-count-target:0}}",
+  // 减少动效时**不能删掉动画**：起手的 0 是靠 keyframes 给的，删了动画就只剩
+  // `initial-value:0`，数字会永远停在 0。把时长压到 1ms 等价于「直接给终值」。
+  "@media (prefers-reduced-motion:reduce){.rtkc-kpi-value[data-count]{animation-duration:1ms}}",
   ".rtkc-chart{width:100%;height:220px}",
   // 卡片小图：**不能矮于 120px**。ECharts 的 `grid` 上下各留 28/24px 给刻度与轴标签，
   // 64px 高时绘图区只剩约 10px——真机上表现为「一条横线 + 两个看不见的柱」，
@@ -204,18 +233,31 @@ const CARD_CSS = [
   // 表头**必须有实底**：它带 `position:sticky`，透明底时行会从字后面穿过去（深色主题下
   // 两行数字叠在一起）。底色用「半透明内层叠在不透明的卡片底上」——单用半透明层在浅色
   // 主题里几乎看不出，单用卡片底又和表体连成一片；叠出来的这一条在深浅两边都比表体深半档。
+  // `overscroll-behavior:contain`：横向滚到底时不要把手势继续交给外层页面（否则表格滚完
+  // 还在滚的同时页面也在滚，两件事叠在一起）。
   ".rtkc-tables{display:flex;flex-direction:column;gap:var(--rtkc-gap)}",
-  ".rtkc-table-wrap{overflow-x:auto;margin:0 -10px}",
+  ".rtkc-table-wrap{overflow:auto;margin:0 -10px;overscroll-behavior:contain}",
   ".rtkc-table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums}",
-  ".rtkc-table thead th{position:sticky;top:0;z-index:1;padding:7px 10px;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--dsw-alias-label-secondary,inherit);text-align:left;border-bottom:1px solid var(--rtkc-line);background:linear-gradient(var(--rtkc-tile),var(--rtkc-tile)),var(--rtkc-surface);white-space:nowrap}",
+  ".rtkc-table thead th{position:sticky;top:0;z-index:2;padding:7px 10px;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--dsw-alias-label-secondary,inherit);text-align:left;border-bottom:1px solid var(--rtkc-line);background:linear-gradient(var(--rtkc-tile),var(--rtkc-tile)),var(--rtkc-surface);white-space:nowrap}",
   ".rtkc-table tbody td{padding:9px 10px;border-bottom:1px solid var(--rtkc-line);vertical-align:middle;transition:background .1s}",
   // 斑马纹只给偶数行且比 hover 更淡：它是扫行时的辅助，hover 才是「我指着这一行」的反馈。
   ".rtkc-table tbody tr:nth-child(even) td{background:rgba(127,127,127,.032)}",
   ".rtkc-table tbody tr:last-child td{border-bottom:0}",
   ".rtkc-table tbody tr:hover td{background:var(--rtkc-hover)}",
-  // 首列是「身份列」（命令 / 目录 / 原因），比数字重一档；它吃余宽，把数字列推到右边成一条。
-  ".rtkc-table thead th:first-child,.rtkc-table tbody td:first-child{width:100%}",
+  // 首列是「身份列」（命令 / 目录 / 原因），比数字重一档。宽度用 `width:1px + nowrap` 的
+  // 老办法「收到内容宽」：写在最后一列上吃余宽。**不能**给首列 `width:100%`——那会让它自己
+  // 变成整表的定宽列，表格永远不产生横向溢出，sticky 首列于是永远没有可粘的位移（真机实测：
+  // 内层宽度一旦绑死到 100%，`scrollWidth === clientWidth`，`position:sticky` 形同虚设）。
+  ".rtkc-table thead th:first-child,.rtkc-table tbody td:first-child{width:1px;white-space:nowrap}",
+  ".rtkc-table thead th:last-child,.rtkc-table tbody td:last-child{width:100%}",
   ".rtkc-table tbody td:first-child{color:var(--dsw-alias-label-primary,inherit);font-weight:500}",
+  // 首列冻在左边：横滚时「这是哪一行」不该跟着数字一起滚走。
+  // 必须**不透明底**（sticky 元素的半透明底会让后面的字透过来），所以这里同样用
+  // 「半透明内层叠在不透明卡片底上」；右侧 1px 阴影是冻结面板的分界，粘住时才看得见。
+  // 角格（表头 × 首列）的 z-index 要压过两者：它同时满足两个 sticky，落单的那个会被盖住。
+  ".rtkc-table thead th:first-child,.rtkc-table tbody td:first-child{position:sticky;left:0;background:linear-gradient(var(--rtkc-tile),var(--rtkc-tile)),var(--rtkc-surface);box-shadow:inset -1px 0 0 var(--rtkc-line)}",
+  ".rtkc-table thead th:first-child{z-index:3}",
+  ".rtkc-table tbody td:first-child{z-index:1}",
   ".rtkc-num{text-align:right!important;white-space:nowrap}",
   ".rtkc-text{text-align:left}",
   // 数值格：细量条 + 数字**同一行**并排。量条压在数字上方时行高会被撑到 60px。

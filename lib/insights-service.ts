@@ -505,6 +505,10 @@ function prefixSeriesOf(
 function prefixCommandRows(rows: readonly LedgerCommandRow[]): CommandRow[] {
   const groups = new Map<string, EventGroup>();
   for (const row of rows) {
+    // `original_cmd` 是**被改写的那一段**，不是整条命令行：实测 `cd x && rtk git diff &&
+    // rtk cargo test` 在 rtk 的 `commands` 表里落成两行（`git diff` 与 `cargo test`），
+    // `cd x` 那一段没有行。所以直接折家族就是「按被替换的段统计」，不需要再拆一次命令；
+    // 反过来拿整条命令折会得到 `cd`，那是从没被改写过的段。
     const family = commandFamilyOf(row.original_cmd);
     const group = groups.get(family) ?? emptyGroup();
     group.commands += row.commands;

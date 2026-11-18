@@ -9,7 +9,7 @@ import { MESSAGES } from "../lib/messages.ts";
 
 // 写死的期望键集，**不从 MESSAGES 自己取键**：从被测对象推期望值，删掉一个键两边一起少，
 // 这条断言永远绿。表里只留真的从宿主发出去了的键——卡片文案归 src/ui-messages.ts。
-const KEYS = ["cargoTestWarnHint", "spillSummary", "spillLocation"] as const;
+const KEYS = ["cargoTestWarnHint", "spillSummary", "spillLocation", "spillRelaxed"] as const;
 
 describe("messages 两语字典同源", () => {
   it("zh/en 键集合相等", () => {
@@ -26,7 +26,7 @@ describe("messages 两语字典同源", () => {
 });
 
 describe("messages 关键文案", () => {
-  it("键集恰好是这两个宿主消息，不多带卡片文案", () => {
+  it("键集恰好是这几个宿主消息，不多带卡片文案", () => {
     assert.deepEqual(Object.keys(MESSAGES.zh).toSorted(), [...KEYS].toSorted());
     assert.deepEqual(Object.keys(MESSAGES.en).toSorted(), [...KEYS].toSorted());
   });

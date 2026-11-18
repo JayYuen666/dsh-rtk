@@ -21,6 +21,13 @@ const PIPED = "cargo test: 1 passed";
 
 /** 一段像 cargo test 的原始输出：带结构标记、带 marker、尾巴有日志行可压。 */
 const RAW = `running 1 test\ntest result: ok. 1 passed; 0 failed\n${"log line\n".repeat(40)}[exit code: 0]`;
+// 放宽放行那两条用例共用的一组输入：一条 log 块 + 一段被 rtk 折掉的行。
+const LOG_TWO_HASHES = `abc1234 one\ndef5678 two\n${"log line\n".repeat(40)}[exit code: 0]`;
+const LOG_ONE_HASH = "abc1234 one";
+// 「省下不到 1 KiB」那一格用的小输入：两个 hash 但正文很短，压完只少十几个字节。
+const SMALL_TWO_HASHES = "abc1234 one\ndef5678 two\n[exit code: 0]";
+// 「省下超过 1 KiB」那一格：同一形状，但被折掉的日志足够多，单位要切到 KB。
+const BIG_TWO_HASHES = `abc1234 one\ndef5678 two\n${"log line\n".repeat(200)}[exit code: 0]`;
 
 /** 取 accept 决定里的 value（判据需要它的形状，测试里收窄比断言短）。 */
 function acceptedValue(decision: unknown): Record<string, unknown> {
@@ -298,7 +305,11 @@ describe("b 形态监听器", () => {
     host.dispose();
   });
 
-  it("vitest filter 在 vitest 5 项目里不压（pipe 侧同样要过版本门控）", async () => {
+  it("vitest filter 在 vitest 5 项目里照样压：本地删通过行，不 spawn rtk", async () => {
+    // 这一条早先断言的是「5.x 整条不压」（版本门）。现在那一路改成 `strip` 模式：输入是模型
+    // 本来就会看到的那份文本，删掉 `✓` 行即可，与 rtk 的解析器无关——所以判据翻成
+    // 「压成了**且**一次都没 spawn」。`piped === 0` 是这条用例的半条命：一旦有人把 vitest
+    // 改回走 `rtk pipe`，spawn 计数会立刻变成 1。
     const project = path.join(tempDir(), "v5");
     mkdirSync(path.join(project, "node_modules", "vitest"), { recursive: true });
     writeFileSync(
@@ -309,10 +320,15 @@ describe("b 形态监听器", () => {
       pipe: { exitCode: 0, stdout: PIPED },
       filters: ["vitest"],
     });
-    const raw = `Test Files  1 failed (1)\nTests  1 failed | 1 passed (2)\n${"log\n".repeat(20)}[exit code: 1]`;
+    const passing = "   ✓ passes two\n".repeat(40);
+    const raw = `Test Files  1 failed (1)\nTests  1 failed | 1 passed (2)\n${passing}   × fails A\n FAIL  test/a.test.mjs > fails A\nAssertionError: expected +0 to be 99\n[exit code: 1]`;
     const out = await host.run(raw, { command: "vitest run", cwd: project });
-    assert.deepEqual(out.decision, { kind: "accept" });
+    const text = stdoutText(out.decision);
     assert.equal(out.piped, 0);
+    // 通过行必须消失、失败证据必须逐字留着——这两条一起才证明删的是「通过」而不是「失败」。
+    assert.equal(text.includes("✓ passes two"), false);
+    assert.ok(text.includes("AssertionError: expected +0 to be 99"), text);
+    assert.ok(text.includes("Tests  1 failed | 1 passed (2)"), text);
     host.dispose();
   });
 
@@ -503,6 +519,109 @@ describe("b 形态监听器", () => {
     host.dispose();
   });
 
+  it("护栏因丢 hash 拒、而原文落得进 spill 时放行：正文第一行写出路径与省略量", async () => {
+    // 这一格外加的是「放宽」的完整链路：护栏原本判 lost-hash（压完少了一个 hash），
+    // 但原文落得进宿主的 spill 存储，于是先落库、再放行，并把路径写进**正文第一行**——
+    // 模型很可能只看正文，路径只挂在 additionalContexts 上等于没说。
+    const store = spillStub();
+    const input = LOG_TWO_HASHES;
+    const host = startPipeHost({
+      pipe: { exitCode: 0, stdout: LOG_ONE_HASH },
+      spillStore: store,
+      filters: ["git-log"],
+    });
+    const out = await host.run(input, { command: "git log" });
+    assert.equal((out.decision as { readonly kind?: unknown }).kind, "accept");
+    const text = stdoutText(out.decision);
+    const [first] = text.split("\n");
+    assert.ok(String(first).includes(SPILL_LOCATOR), `首行没有路径：${String(first)}`);
+    assert.ok(String(first).includes("grep this path"), `首行没有取回指引：${String(first)}`);
+    // 省略量按字节算：原文比压缩体多出来的那部分。
+    assert.ok(String(first).includes("KB") || String(first).includes(" B"), String(first));
+    assert.equal(store.saved.length, 1);
+    // 首行之后是 rtk 给的那一段压缩体（marker 由 `reassemble` 拼回尾部，不在这一段里）。
+    assert.ok(text.split("\n").includes(LOG_ONE_HASH), text);
+    host.dispose();
+  });
+
+  it("省略量小于 1 KiB 时按字节写，不硬撑成 KB", async () => {
+    // 同一支放宽链路，只是原文小到「省下不到 1 KiB」。单位切档是纯展示，但写错会说成
+    // 「0.0 KB」——读者只能把它理解成「没省」。
+    const store = spillStub();
+    const host = startPipeHost({
+      pipe: { exitCode: 0, stdout: LOG_ONE_HASH },
+      spillStore: store,
+      filters: ["git-log"],
+    });
+    const out = await host.run(SMALL_TWO_HASHES, { command: "git log" });
+    const [first] = stdoutText(out.decision).split("\n");
+    assert.ok(String(first).includes(" B"), `省略量该按字节写：${String(first)}`);
+    assert.equal(String(first).includes("KB"), false, `不该出现 KB：${String(first)}`);
+    host.dispose();
+  });
+
+  it("省下的量跨过 1 KiB 时按 KB 写：大段被折掉的日志不该说成几千字节", async () => {
+    // 与上一条同一支链路，只是省下的量跨过 1 KiB 那一档。两档在真机上都出现过：
+    // 几百字节的小段说「803 B」，几 KB 的日志说「3.5 KB」。只测小档会让大档那一支
+    // 永远不被走到——覆盖率红在那里是实话，不是噪声。
+    const store = spillStub();
+    const host = startPipeHost({
+      pipe: { exitCode: 0, stdout: LOG_ONE_HASH },
+      spillStore: store,
+      filters: ["git-log"],
+    });
+    const out = await host.run(BIG_TWO_HASHES, { command: "git log" });
+    const [first] = stdoutText(out.decision).split("\n");
+    // 形状是 `12.3 KB`：一位小数 + 空格 + KB。只断言「含 KB」会漏掉小数位被吃掉的情形。
+    assert.match(String(first), /\d+\.\d KB/u, String(first));
+    assert.equal(store.saved.length, 1);
+    host.dispose();
+  });
+
+  it("放宽放行时缺 spillRelaxed 模板：首行退到裸 locator 与取回指引", async () => {
+    // 与 notice 同一条取舍：措辞是装饰品、路径是本体。模板缺席时不能因此放弃整段压缩，
+    // 更不能抛——那会把「压成了」退化成「什么都没压」（这条路径真在宿主上踩过）。
+    const store = spillStub();
+    const host = startPipeHost({
+      pipe: { exitCode: 0, stdout: LOG_ONE_HASH },
+      spillStore: store,
+      filters: ["git-log"],
+      messages: () => ({
+        cargoTestWarnHint: "",
+        spillSummary: "压缩前的完整输出已另存为文件",
+        spillLocation: "压缩前的完整输出已存为 {path}。{hint}",
+        spillRelaxed: undefined as unknown as string,
+      }),
+    });
+    const out = await host.run(LOG_TWO_HASHES, { command: "git log" });
+    assert.equal((out.decision as { readonly kind?: unknown }).kind, "accept");
+    const [first] = stdoutText(out.decision).split("\n");
+    // 落到的正是兜底模板 `{path} {hint}`：路径在前、宿主的取回句在后，中间一个空格。
+    assert.equal(
+      String(first),
+      `${SPILL_LOCATOR} Use read with offset/limit, or grep this path to search within it.`,
+      String(first),
+    );
+    assert.equal(store.saved.length, 1);
+    host.dispose();
+  });
+
+  it("同一拒但落不进 spill 时照旧拒绝：没有取回通道的有损压缩不进上下文", async () => {
+    const input = LOG_TWO_HASHES;
+    const host = startPipeHost({
+      pipe: { exitCode: 0, stdout: LOG_ONE_HASH },
+      filters: ["git-log"],
+    });
+    const out = await host.run(input, { command: "git log" });
+    const record = host.pipeRecords.find((row) => row.kind === "pipe-skip");
+    assert.ok(record?.kind === "pipe-skip");
+    assert.equal(record.reason, "guard:lost-hash");
+    // 拒了就退回下游原决定：不留 value、不挂 additionalContexts，模型看到的仍是原文。
+    assert.deepEqual(out.decision, { kind: "accept" });
+    assert.equal(Object.hasOwn(out.decision as object, "additionalContexts"), false);
+    host.dispose();
+  });
+
   it("没有 spill 后端时 warn 一行：压缩照做，但模型手里没有取回通道", async () => {
     const warns: string[] = [];
     const host = startPipeHost({ pipe: { exitCode: 0, stdout: PIPED }, warns });
@@ -530,6 +649,7 @@ describe("b 形态监听器", () => {
         cargoTestWarnHint: "",
         spillSummary: "压缩前的完整输出已另存为文件",
         spillLocation: undefined as unknown as string,
+        spillRelaxed: "{omitted} {path} {hint}",
       }),
     });
     const out = await host.run(RAW);

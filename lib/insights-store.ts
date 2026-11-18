@@ -656,6 +656,9 @@ function applyPrefix(ctx: WriteContext, record: PrefixRecord): void {
       form: "prefix",
       status: "rewritten",
       reason: "rewritten",
+      // 记的是**被改写的那几段**里的第一段，不是整条命令的家族：`commandFamilyOf(raw)` 在
+      // `cd x && git diff && cargo test` 上会给出 `cd`——那一段根本没被改写。空表也真实存在
+      // （rtk 改了一段但家族认不出来），`unknown` 是 `commandFamilyOf` 自己的兜底名。
       commandFamily: record.families[0] ?? "unknown",
       workdir: record.workdir,
       filter: null,

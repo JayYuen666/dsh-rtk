@@ -18,3 +18,4 @@ coverage/
 
 # 统一构建件的原子写入草稿目录（shared/lib/build-artifacts 的 writeArtifact）。
 /.tmp/
+/.vitest/

@@ -51,6 +51,9 @@ interface Recorded {
 /** 默认启用名单里的那个 filter：三处断言共用这条字面量。 */
 const FILTER_CARGO = "cargo-test";
 
+/** 开库失败那句 warn 的锚点（三处断言共用，别各写一份）。 */
+const OPEN_FAILED = "cannot open the stats tables";
+
 const POST_EXECUTE = "tools/post-execute";
 
 /** `agent/created` 的事件名（C 形态的判据）。 */
@@ -235,6 +238,15 @@ function makeHost(
     // 恰好又冒出一个文件）。所以先按注册逆序跑一遍 disposer（`openInsightsStore` 挂的
     // 那个会 close），再删；`maxRetries` 兜住「关掉这一瞬间还有一次 WAL checkpoint」。
     onTestFinished(async () => {
+      // 先等异步开库那一趟落定再删。`apply` 里是 `void insights.load()`，测试收尾时它可能
+      // 还在飞；先删目录、它随后醒来，`ensureParentDir` 与 SQLite 会把 `rtk/history.db`
+      // 重新建出来——临时目录就这么漏了（实测全量并行 + 覆盖率时一次漏 5~8 个，
+      // 单文件跑永远漏不出来）。
+      await eventually(
+        () =>
+          seen.effects.includes("rtk: insights store") ||
+          warnLines(seen).some((line) => line.includes(OPEN_FAILED)),
+      );
       await disposeAll(seen.disposers);
       rmSync(homeRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     });
@@ -538,11 +550,9 @@ describe("apply 的装配动作", () => {
     // 而不是到了 console——装配层用的是具名 logger，回退到 console 是另一条路径。
     const { host, seen } = makeHost({ homeDir: unbuildableDir() });
     applyTo(host, configSchema({}));
-    await eventually(() =>
-      warnLines(seen).some((line) => line.includes("cannot open the stats tables")),
-    );
+    await eventually(() => warnLines(seen).some((line) => line.includes(OPEN_FAILED)));
     const lines = warnLines(seen);
-    const failure = lines.find((line) => line.includes("cannot open the stats tables"));
+    const failure = lines.find((line) => line.includes(OPEN_FAILED));
     assert.ok(failure !== undefined, `没留下开库失败那句话：${lines.join(" | ")}`);
     assert.match(failure, /report it as unavailable/u);
     // 统计库开不出来不该打掉装配：服务照常注册。
@@ -1038,7 +1048,13 @@ describe("b 形态的走线（经 apply 装配之后才拿得到的那一份依�
     };
     applyTo(
       wrapped as unknown as HostServices,
-      configSchema({ enabled: true, enabledForms: ["prefix", "pipe"] }),
+      // filter 显式给：默认集合装的是前缀层交不出去的那几条（git-log/git-diff/…），
+      // 这条用例要吃的是 `cargo-test` 这一支，靠默认值会连 pipe 都不 spawn。
+      configSchema({
+        enabled: true,
+        enabledForms: ["prefix", "pipe"],
+        enabledFilters: [FILTER_CARGO],
+      }),
     );
     assert.ok(listener !== undefined, "开了 pipe 形态却没挂监听器");
     const exec = { callId: "call-1", name: "bash", arguments: { command: "cargo test" } };

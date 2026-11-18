@@ -1,8 +1,8 @@
 // lib/command-filter.ts 单测：命令形态 → rtk pipe filter 的对照表。
 //
-// 这张表只服务 B 形态（`rtk pipe -f <filter>`），与 C 形态的命令范围无关——C 的范围由
-// `rtk rewrite` 的输出定义。B 形态默认关闭，但表与测试全部保留，等官方补齐 vitest 5
-// 之类的缺口后可以直接打开。
+// 这张表只服务 B 形态（`rtk pipe -f <filter>`）的查表这一步，与 C 形态的命令范围无关——
+// C 的范围由 `rtk rewrite` 的输出定义。查到 filter 之后由谁压是另一件事：`vitest` 那一路
+// 不 spawn rtk，改由 `lib/vitest-strip.ts` 本地删通过行（见 `host.ts` 的 `modeOf`）。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import {
@@ -16,6 +16,10 @@ import {
 // 生产路径把它原样传进来，所以判据必须是「这行的 filter 在不在集合里」。
 // 四行共用 `vitest` 是有意的——它们是四个入口，同一个过滤器。
 const CARGO_FILTER = "cargo-test";
+// 新默认集里出现三次的那个字面量：单独成常量，测试读起来也更清楚。
+const GIT_LOG = "git-log";
+const GIT_DIFF = "git-diff";
+const GIT_STATUS = "git-status";
 const KNOWN = new Set([
   CARGO_FILTER,
   "pytest",
@@ -26,9 +30,9 @@ const KNOWN = new Set([
   "vitest",
   "grep",
   "find",
-  "git-log",
-  "git-diff",
-  "git-status",
+  GIT_LOG,
+  GIT_DIFF,
+  GIT_STATUS,
   "mypy",
   "ruff-check",
   "ruff-format",
@@ -73,7 +77,7 @@ describe("filterOf", () => {
   });
 
   it("git diff → git-diff", () => {
-    assert.equal(filterOf("git diff HEAD~1", ALL), "git-diff");
+    assert.equal(filterOf("git diff HEAD~1", ALL), GIT_DIFF);
   });
 
   it("未命中表返回 undefined", () => {
@@ -126,8 +130,8 @@ const SAMPLES: readonly (readonly [string, string])[] = [
   ["mypy src", "mypy"],
   ["ruff check .", "ruff-check"],
   ["ruff format .", "ruff-format"],
-  ["git log --oneline", "git-log"],
-  ["git diff HEAD~1", "git-diff"],
+  ["git log --oneline", GIT_LOG],
+  ["git diff HEAD~1", GIT_DIFF],
   ["git status", "git-status"],
   ["grep -rn foo .", "grep"],
   ["rg -n foo", "grep"],
@@ -158,10 +162,21 @@ describe("表结构与默认值", () => {
     }
   });
 
-  it("默认启用集合恰三个 filter（v3.5 起 vitest 不在其中）", () => {
+  it("默认启用集合是交不出压缩的那五项 + vitest（这一路由本地删行接管）", () => {
     // 期望值是**独立写死**的一份，不从表里筛：早先这条用 `PIPE_TABLE.filter(defaultEnabled)`
     // 自比，改一行表它就跟着改，用户看到的默认集合却由 schema 另写一份字面量决定。
-    assert.deepEqual([...DEFAULT_ENABLED_FILTERS].toSorted(), [CARGO_FILTER, "ctest", "pytest"]);
+    //
+    // 为什么多了一个 `vitest`：`pnpm test` / `npm test` / `yarn test` 是**前缀层改不动**的
+    // 三种形态（rtk 的规则要求显式 `run`，实测 `pnpm test` rc=1），而它那一路的压缩现在
+    // 由本包在内存里删 `✓` 通过行完成（`host.ts` 的 `modeOf`），不再依赖 rtk 的解析器。
+    assert.deepEqual([...DEFAULT_ENABLED_FILTERS].toSorted(), [
+      "find",
+      GIT_DIFF,
+      GIT_LOG,
+      GIT_STATUS,
+      "grep",
+      "vitest",
+    ]);
     // 默认集合里的每个 filter 都必须在表里有一行，否则「默认开」的开关永远命中不到任何命令。
     for (const filter of DEFAULT_ENABLED_FILTERS) {
       assert.ok(
@@ -179,11 +194,13 @@ describe("表结构与默认值", () => {
     assert.equal(new Set(PIPE_TABLE.map((entry) => entry.id)).size, PIPE_TABLE.length);
   });
 
-  it("vitest 行保留但不在默认集合里", () => {
-    const row = PIPE_TABLE.find((entry) => entry.filter === "vitest");
+  it("vitest 的四行共用同一个 filter 名，且都在默认集合里", () => {
+    // 四个入口（直接跑、三种包管理器的裸 test）落同一个 filter：启用集合里只有一个字符串，
+    // 用户勾一次就覆盖四种形态。行 id 与 filter 名不是一一对应，这里把两边都钉住。
+    const ids = PIPE_TABLE.filter((entry) => entry.filter === "vitest").map((entry) => entry.id);
 
-    assert.ok(row !== undefined);
-    assert.equal(DEFAULT_ENABLED_FILTERS.includes("vitest"), false);
+    assert.deepEqual(ids.toSorted(), ["npm test", "pnpm test", "vitest", "yarn test"]);
+    assert.equal(DEFAULT_ENABLED_FILTERS.includes("vitest"), true);
   });
 
   it("duplicate filter 允许（三行 npm/pnpm/yarn test 共用 vitest）", () => {

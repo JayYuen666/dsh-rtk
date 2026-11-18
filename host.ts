@@ -42,7 +42,7 @@ import { commandFamilyOf, rewrittenFamilies } from "./lib/command-family.ts";
 import { ALL_FILTERS, DEFAULT_ENABLED_FILTERS, filterOf } from "./lib/command-filter.ts";
 import type { RewrittenCalls } from "./lib/dedup.ts";
 import { createRewrittenCalls, shouldSkipPipe } from "./lib/dedup.ts";
-import { guardCompressed } from "./lib/guard.ts";
+import { guardCompressed, keptOutputOf } from "./lib/guard.ts";
 import type { PipeRecord, PipeSkipReason, PrefixRecord } from "./lib/insights-shape.ts";
 import { createInsightsService } from "./lib/insights-service.ts";
 import { createDeferredInsights } from "./lib/insights-sink.ts";
@@ -52,7 +52,8 @@ import { findOnPath, pipeStructuralReject } from "./lib/prefix-safety.ts";
 import { createRewriter } from "./lib/rewrite.ts";
 import type { RewriteCache } from "./lib/rewrite-cache.ts";
 import { createRewriteCache } from "./lib/rewrite-cache.ts";
-import { resolveWorkdir, shouldSkipRewrite } from "./lib/rewrite-gate.ts";
+import { resolveWorkdir, restoreGatedSegments, shouldSkipRewrite } from "./lib/rewrite-gate.ts";
+import type { RewriteGateOptions } from "./lib/rewrite-gate.ts";
 import { verifyRewrite } from "./lib/rewrite-verify.ts";
 import { createRtkLedger, ensureRtkDir, registerRtkWritableRoot } from "./lib/rtk-ledger.ts";
 import { resolveLedgerPaths, withRtkDbPath, withoutRtkDbEnv } from "./lib/rtk-paths.ts";
@@ -69,7 +70,7 @@ import { tokenPricerOf } from "./lib/tokens.ts";
 import type { TokenPricer } from "./lib/tokens.ts";
 import { MIN_RTK_VERSION, probeRtkVersion } from "./lib/rtk-version.ts";
 import { localDayKey } from "./lib/time-buckets.ts";
-import { detectVitestMajor } from "./lib/vitest-major.ts";
+import { stripPassingTests } from "./lib/vitest-strip.ts";
 import { appendWarnHint, isCargoTest } from "./lib/warn-hint.ts";
 
 /**
@@ -624,11 +625,18 @@ async function planPrefixRewrite(
       isAgent(target) ? ctx.workingDirectory.ensure(target, exec.signal) : undefined,
     invocation.forwarded["workdir"],
   );
-  const skip = shouldSkipRewrite(raw, {
+  // 闸门只在「**全部**段都不能改写」时才整条跳；只要有一段能改，整条就交给 rtk，
+  // 再由下面 `restoreGatedSegments` 把不能改的那几段还原。为什么必须这样分两步：
+  // `rtk rewrite` 自己是逐段改写的，它会连同不能改的段一起加前缀（实测
+  // `aws s3 ls && cargo test` → 两段都加），所以「整条交出去 + 逐段还原」才能既拿到
+  // 能改的那部分、又不让不能改的段被改。用户裁定（2026-11）：默认形态 = rtk 支持什么
+  // 就改写什么，输出变短是缩略该做的事，不是拒绝改写的理由。
+  const gateOptions: RewriteGateOptions = {
     denyCommands: options.denyCommands(),
     cwd,
     vitestMaxMajor: options.vitestMaxMajor,
-  });
+  };
+  const skip = shouldSkipRewrite(raw, gateOptions);
   if (skip !== undefined) {
     safeRecord(() => {
       deps.insights.recordPrefix({
@@ -682,7 +690,11 @@ async function planPrefixRewrite(
     return PASS_THROUGH;
   }
   // P1~P4：改写结果必须只是「在原命令前面加 rtk」那一种形状，其余一律丢弃、原样执行。
-  const rejected = verifyRewrite(raw, attempt.command);
+  //
+  // 先还原被闸门挡住的段，再校验形状：还原用的是 `segment.text` 原样（含段尾空白），
+  // 少一个空格会让那一段过不了「未改动段」的判据、把整条丢回原样执行。
+  const restored = restoreGatedSegments(raw, attempt.command, gateOptions);
+  const rejected = verifyRewrite(raw, restored);
   if (rejected !== undefined) {
     safeRecord(() => {
       deps.insights.recordPrefix({
@@ -699,11 +711,11 @@ async function planPrefixRewrite(
   }
   return {
     kind: "rewritten",
-    command: attempt.command,
+    command: restored,
     raw,
     forwarded: invocation.forwarded,
     latencyMs,
-    families: rewrittenFamilies(raw, attempt.command),
+    families: rewrittenFamilies(raw, restored),
     workdir: cwd,
   };
 }
@@ -981,7 +993,6 @@ export interface PipeOptions {
   readonly minGainRatio: () => number;
   readonly stdoutCapBytes: () => number;
   readonly pipeTimeoutMs: number;
-  readonly vitestMaxMajor: number;
   /**
    * 诊断日志：非 `undefined` 时每次管道决策记一行。由 `logFilterMode`（部署级，重启生效）装配，
    * 默认 `undefined` = 关。热路径上不打印，所以它不是常驻开销。
@@ -1015,6 +1026,13 @@ export interface PipeDeps {
 
 /** B 形态单条输入上限：超过它说明用户要的不是这段输出，读进内存只会白占。 */
 const MAX_PIPE_INPUT = 10 * 1024 * 1024;
+
+/**
+ * 走「本包原地删通过行」的那一个 filter。
+ *
+ * 只写一处字面量：`modeOf` 拿它判分支，测试拿它当同一枚常量。
+ */
+const VITEST_FILTER = "vitest";
 
 /**
  * spill 存储里本插件唯一用到的方法。
@@ -1099,6 +1117,14 @@ function spillNotice(readMessages: () => Messages, spilled: SpilledOriginal): Us
 /** 跑完前置判据之后要压的那一份：filter、工作目录、拆好的回执、真正喂给 pipe 的正文。 */
 interface PipePlan {
   readonly filter: string;
+  /**
+   * 这一次的压缩在哪一侧做。
+   *
+   * `rtk` = spawn 一次 `rtk pipe -f <filter>`；`strip` = 本包原地删掉 vitest 的通过行。
+   * 分支存在的原因是 vitest 5 上 `rtk pipe -f vitest` 走 Tier2 正则、把断言整段吃掉
+   * （实测 4 个失败的 `AssertionError` 计数 4→0，护栏还判它通过）。
+   */
+  readonly mode: PipeMode;
   readonly cwd: string;
   readonly extracted: Extracted;
   readonly input: string;
@@ -1109,6 +1135,9 @@ interface PipePlan {
   /** 同一个可见面的字节数：可复算的物理量，与 token 各记一次。 */
   readonly originalBytes: number;
 }
+
+/** 压缩落在哪一侧。见 `PipePlan.mode`。 */
+type PipeMode = "rtk" | "strip";
 
 /**
  * 一条回执的 pipe 判定结果。
@@ -1194,12 +1223,6 @@ function visibleSurface(extracted: Extracted): string {
   return visible;
 }
 
-/** vitest 的版本门：主版本判不出来也算不通过（宁可这条不压）。 */
-function vitestAllowed(cwd: string, command: string, maxMajor: number): boolean {
-  const major = detectVitestMajor(cwd, command);
-  return major !== undefined && major < maxMajor;
-}
-
 /**
  * 「值得压」的两条量：长度不低于 `minBytes`（按 **UTF-8 字节**）、形态预检通过。
  *
@@ -1255,6 +1278,19 @@ function recordSkip(input: BaseContext, decision: Extract<PipeDecision, { kind: 
   safeRecordPipe(input.deps, () => skipRecordOf(decision, Date.now()), input.options.log);
 }
 
+/**
+ * 这一条 filter 的压缩落在哪一侧。
+ *
+ * `vitest` 一律走 `strip`，**与 vitest 主版本无关**。理由不是「5.x 有 bug，4.x 没有」：
+ * 实测 5.x 上 rtk 三级解析全失败、只回一行通告；而 4.x 上它虽然能把 JSON 解开，代价是
+ * 走 `--reporter=json` + 结构化摘要，真实的通过行与失败细节仍要被它自己的渲染重写一遍。
+ * 本地删行的输入是**模型本来就会看到的那份文本**，删掉的只有 `✓` 行——失败块逐字不动，
+ * 也不依赖 rtk 的版本行为。一条路径胜过两条，所以版本门在 B 形态这一侧不再需要。
+ */
+function modeOf(filter: string): PipeMode {
+  return filter === VITEST_FILTER ? "strip" : "rtk";
+}
+
 /** 回执拆解与输入判据那一段。 */
 async function pipedPlan(
   input: PlanContext & { readonly filter: string; readonly command: string },
@@ -1282,6 +1318,7 @@ async function pipedPlan(
               kind: "plan",
               plan: {
                 filter,
+                mode: modeOf(filter),
                 cwd,
                 extracted,
                 input: candidate,
@@ -1294,29 +1331,6 @@ async function pipedPlan(
     }
   }
   return decision;
-}
-
-/**
- * filter 拿到了之后的判定：vitest 版本门，然后交给 `pipedPlan`。
- *
- * `cwd` 由调用方给（`decide` 解析一次）：vitest 版本门要从这个目录向上找
- * `node_modules/vitest`，拿错起点会判错主版本——该压的不压，或把 5.x 上会吞输出的
- * filter 放过去。同一份 cwd 还要进 `PipePlan` 当 spawn 的工作目录。
- */
-async function planForFilter(
-  input: PlanContext & { readonly filter: string; readonly command: string },
-): Promise<PipeDecision> {
-  const { filter, command, cwd, options } = input;
-  if (filter === "vitest" && !vitestAllowed(cwd, command, options.vitestMaxMajor)) {
-    return {
-      kind: "skip",
-      reason: "vitest-gate",
-      filter,
-      commandFamily: commandFamilyOf(command),
-      workdir: cwd,
-    };
-  }
-  return pipedPlan(input);
 }
 
 /**
@@ -1337,7 +1351,7 @@ function recordPotential(input: PlanContext, command: string): void {
   }
 }
 
-/** 命令拿到了之后的判定：共用拒绝层、去重、filter 查表，然后交给 `planForFilter`。 */
+/** 命令拿到了之后的判定：共用拒绝层、去重、filter 查表，然后交给 `pipedPlan`。 */
 async function planForCommand(
   input: PlanContext & { readonly command: string },
 ): Promise<PipeDecision> {
@@ -1362,7 +1376,7 @@ async function planForCommand(
     recordPotential(input, command);
     return { kind: "skip", reason: "no-filter", commandFamily, workdir: cwd };
   }
-  return planForFilter({ ...input, filter });
+  return pipedPlan({ ...input, filter });
 }
 
 /** 把一条回执喂给 pipe 之前要过的全部判据。 */
@@ -1384,28 +1398,66 @@ interface RenderInput {
   readonly plan: PipePlan;
 }
 
+/** 省掉的字节数写成人话：`12345` → `12.1 KB`。只用于那一行正文首行，不参与任何账目。 */
+function omittedTextOf(bytes: number): string {
+  return bytes < 1024 ? `${String(bytes)} B` : `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+/**
+ * 放宽放行时写进压缩体首行的取回指引。
+ *
+ * 形状照抄宿主 `dsh-spill-policy` 的 notice（省了多少 + locator + retrievalHint）：官方自己
+ * 也是这三段，只是它进 `additionalContexts`，我们这份必须进正文——这一份正文本身少了东西。
+ * 模板缺席时退到裸 locator（与 `spillNotice` 同一取舍）：措辞是装饰，路径才是本体。
+ */
+function relaxedHeaderOf(
+  readMessages: () => Messages,
+  spilled: SpilledOriginal,
+  omitted: number,
+): string {
+  const template = readMessages().spillRelaxed;
+  const text = typeof template === "string" ? template : "{path} {hint}";
+  return text
+    .replace("{omitted}", omittedTextOf(omitted))
+    .replace("{path}", spilled.locator)
+    .replace("{hint}", spilled.retrievalHint);
+}
+
+/** 把命令的原始可见面落进 spill：取回通道的唯一实现。 */
+async function spillOf(input: RenderInput): Promise<SpilledOriginal | undefined> {
+  const { ctx, exec, plan } = input;
+  // 原文落 spill 用的 owner 是会话 id：`Agent.id` 就是 `SessionId`，不必绕去 header。
+  const sessionId = isAgent(exec.agent) ? exec.agent.id : undefined;
+  // 单出口：`consistent-return` 不接受「一支 return、一支 return await」的混写，而
+  // `return-await` 又不许在 try 外写 await —— 两个规则夹出来的正解是先赋给局部再 return。
+  let spilled: SpilledOriginal | undefined;
+  if (sessionId !== undefined) {
+    spilled = await spillOriginal({
+      spillStore: readSpillStore(ctx),
+      owner: sessionId,
+      toolName: exec.name,
+      callId: exec.callId,
+      text: plan.input,
+    });
+  }
+  return spilled;
+}
+
 /** 压成功之后：落 spill、记账、拼回原形状。 */
 async function finishCompressed(
   input: RenderInput & {
     readonly visible: string;
     readonly output: string;
     readonly latencyMs: number;
+    /** 已经落好的原文：给了就不再落第二次（放宽判定那条路会先落一次）。 */
+    readonly spilled?: SpilledOriginal | undefined;
+    /** 护栏原本拒了、因为原文取得回来才放行：正文首行必须点明路径。 */
+    readonly relaxed?: boolean;
   },
 ): Promise<PostToolDecision | undefined> {
-  const { ctx, options, deps, exec, plan, visible, output, latencyMs } = input;
+  const { options, deps, plan, visible, output, latencyMs, relaxed = false } = input;
   const capped = capCompressed(output, options.stdoutCapBytes());
-  // 原文落 spill 用的 owner 是会话 id：`Agent.id` 就是 `SessionId`，不必绕去 header。
-  const sessionId = isAgent(exec.agent) ? exec.agent.id : undefined;
-  const spilled =
-    sessionId === undefined
-      ? undefined
-      : await spillOriginal({
-          spillStore: readSpillStore(ctx),
-          owner: sessionId,
-          toolName: exec.name,
-          callId: exec.callId,
-          text: plan.input,
-        });
+  const spilled = input.spilled ?? (await spillOf(input));
   // 取回通道成不成，四个后果里只有「模型看不到原文」是不可见的：
   // - 落了库：诊断日志留一行 locator（默认关时这行不花一次字符串拼接）；
   // - 没落成：warn 一次。压缩照常生效，但模型手里没有取回通道 —— 那是配置或后端的问题，
@@ -1418,10 +1470,22 @@ async function finishCompressed(
     options.log(`[rtk] spill: saved ${spilled.locator}`);
   }
   const originalBytes = Buffer.byteLength(visible, "utf8");
-  const compressedBytes = Buffer.byteLength(capped, "utf8");
+  // 放宽放行的这一次（护栏原本判 `lost-hash` / `folded-entries`）：正文第一行必须写出路径。
+  // 它进正文而不是只进 `additionalContexts`，因为这一份正文本身少了东西——模型很可能只看正文。
+  const header =
+    relaxed && spilled !== undefined
+      ? relaxedHeaderOf(
+          deps.messages,
+          spilled,
+          Math.max(originalBytes - Buffer.byteLength(capped, "utf8"), 0),
+        )
+      : undefined;
+  const body = header === undefined ? capped : `${header}\n${capped}`;
+  const compressedBytes = Buffer.byteLength(body, "utf8");
   // token 与字节各算一次：宿主扣钱按前者、可复算的物理量是后者。两侧都用同一个定价函数，
   // 「省下多少」才是同一把尺子量出来的（`savedTokens` 与 `savedBytes` 因此不会互相矛盾）。
-  const compressedTokens = deps.tokensOf(capped);
+  // 两个都按 `body` 算：放宽放行时那一行首行也在上下文里、也要花 token，漏掉它账就虚了。
+  const compressedTokens = deps.tokensOf(body);
   safeRecordPipe(
     deps,
     () => ({
@@ -1439,7 +1503,7 @@ async function finishCompressed(
     }),
     options.log,
   );
-  const rebuilt = reassemble(plan.extracted, capped);
+  const rebuilt = reassemble(plan.extracted, body);
   let accepted: PostToolDecision | undefined;
   /* v8 ignore next —— `reassemble` 只会把 JSON 值原样传回或包一层 `{...value, stdout}`，
      而 `value` 来自一次成功的工具执行（`ToolExecutionSuccess.value` 的类型就是 `JsonValue`），
@@ -1457,43 +1521,107 @@ async function finishCompressed(
   return accepted;
 }
 
+/**
+ * 护栏拒：记一格 `guard:<reason>`，并把这一条留给面板解释「为什么这次没压」。
+ *
+ * 同步函数：拒绝路径上除了记账没有别的异步动作，`async` 只会让调用点多一层 await
+ * （`typescript(require-await)` 也是这么判的）。
+ */
+function rejectCompressed(
+  input: RenderInput & { readonly latencyMs: number },
+  reason: string,
+): PostToolDecision | undefined {
+  input.options.log?.(`[rtk] pipe ${input.plan.filter}: skipped (${reason})`);
+  safeRecordPipe(
+    input.deps,
+    () => ({
+      kind: "pipe-skip",
+      ts: Date.now(),
+      reason: `guard:${reason}`,
+      filter: input.plan.filter,
+      commandFamily: input.plan.commandFamily,
+      workdir: input.plan.cwd,
+      originalTokens: input.plan.originalTokens,
+      originalBytes: input.plan.originalBytes,
+      latencyMs: input.latencyMs,
+    }),
+    input.options.log,
+  );
+  return undefined;
+}
+
 /** pipe 成功了：过护栏，然后交给 `finishCompressed`。 */
 async function acceptCompressed(
   input: RenderInput & { readonly piped: string; readonly latencyMs: number },
 ): Promise<PostToolDecision | undefined> {
   const visible = visibleSurface(input.plan.extracted);
+  // 这一次判定是**最终判定**：护栏不因为「原文可能落得进 spill」而改变自己的结论——答案是
+  // 落库之后才知道的，替它先断言「取得到」就是把条件写在事实之前。所以它只看文本本身。
   const guarded = guardCompressed({
     filter: input.plan.filter,
     input: visible,
     output: input.piped,
     minGainRatio: input.options.minGainRatio(),
   });
-  let accepted: PostToolDecision | undefined;
   if (guarded.ok) {
     input.options.log?.(
       `[rtk] pipe ${input.plan.filter}: ${String(Buffer.byteLength(visible, "utf8"))}B -> ${String(Buffer.byteLength(guarded.output, "utf8"))}B`,
     );
-    accepted = await finishCompressed({ ...input, visible, output: guarded.output });
-  } else {
-    // 护栏拒是最值得记的一格：用户开诊断日志通常就是为了问「为什么这次没压」。
-    input.options.log?.(`[rtk] pipe ${input.plan.filter}: skipped (${guarded.reason})`);
-    safeRecordPipe(
-      input.deps,
-      () => ({
-        kind: "pipe-skip",
-        ts: Date.now(),
-        reason: `guard:${guarded.reason}`,
-        filter: input.plan.filter,
-        commandFamily: input.plan.commandFamily,
-        workdir: input.plan.cwd,
-        originalTokens: input.plan.originalTokens,
-        originalBytes: input.plan.originalBytes,
-        latencyMs: input.latencyMs,
-      }),
-      input.options.log,
-    );
+    return finishCompressed({ ...input, visible, output: guarded.output });
   }
-  return accepted;
+  if (guarded.recoverable !== true) {
+    return rejectCompressed(input, guarded.reason);
+  }
+  // 这一拒的成因是「压完少了东西」（`lost-hash` / `folded-entries`）。少了的东西在原文里，
+  // 所以先试着把原文落库：落成了模型一条 read 就能看全，压缩可以放行；落不成（没装 spill、
+  // 没有会话 id、saveText 失败）就照旧按拒绝处理——**没有取回通道的有损压缩不该进上下文**。
+  // 次序是「先落库、再放行」，不是「先放行、再补路径」。
+  const spilled = await spillOf(input);
+  if (spilled === undefined) {
+    input.options.log?.(
+      `[rtk] pipe ${input.plan.filter}: skipped (${guarded.reason}): no retrieval path`,
+    );
+    return rejectCompressed(input, guarded.reason);
+  }
+  // 落库成功后取收尾之后的那一段（summary 类要折重复行、补 FAILURES 对账）。这里不再判
+  // 「会不会被拒」：能走到这一行，说明第一处违规是可被取回通道救回的那两条
+  // （`GUARD_RULES` 里带 `recoverable: true` 的 `lost-hash` / `folded-entries`）——其余各道的
+  // 结论与上面那次判定逐条相同，而原文此刻已经有了 locator。
+  input.options.log?.(
+    `[rtk] pipe ${input.plan.filter}: accepted with the original spilled (${spilled.locator})`,
+  );
+  return finishCompressed({
+    ...input,
+    visible,
+    output: keptOutputOf({ filter: input.plan.filter, input: visible, output: input.piped }),
+    spilled,
+    relaxed: true,
+  });
+}
+
+/**
+ * 按 `plan.mode` 拿到「压完之后的那一段」；拿不到（`rtk pipe` 失败）返回 `undefined`。
+ *
+ * `strip` 那一支不 spawn 任何进程：它只在内存里删掉 `✓` 通过行。这样做的理由是 rtk 在
+ * vitest 上拿不到可用的结构化输入（见 `lib/vitest-strip.ts` 的头注释），而模型本来会看到的
+ * 就是这份纯文本——删通过行是「同一份文本变短」，不是「换一条渲染路径重新描述结果」。
+ *
+ * 计时口径两边一致：调用方在调这里之前取起点，所以面板里的 `latency_ms` 在 `strip` 档
+ * 量到的是纯 CPU 耗时（通常 < 1 ms），在 `rtk` 档照旧含 spawn。
+ */
+async function pipedTextOf(input: RenderInput): Promise<string | undefined> {
+  const { ctx, options, plan } = input;
+  if (plan.mode === "strip") {
+    return stripPassingTests(plan.input).text;
+  }
+  const piped = await runRtkPipe({
+    subprocess: ctx.subprocess,
+    filter: plan.filter,
+    stdin: plan.input,
+    cwd: plan.cwd,
+    timeoutMs: options.pipeTimeoutMs,
+  });
+  return piped.ok ? piped.stdout : undefined;
 }
 
 /**
@@ -1502,22 +1630,14 @@ async function acceptCompressed(
  * 返回 `undefined` 表示这一条不该换值（pipe 失败 / 护栏拒 / 拼回来不是 JSON 值）。
  */
 async function renderCompressed(input: RenderInput): Promise<PostToolDecision | undefined> {
-  const { ctx, options, plan } = input;
-  // 计时起点必须在 spawn **之前**：pipe 本身慢是面板里唯一能解释「为什么这条压缩很迟」的量，
+  const { options, plan } = input;
+  // 计时起点必须在动手**之前**：这一段本身慢是面板里唯一能解释「为什么这条压缩很迟」的量，
   // 把两行相邻写上量到的永远是 0。
   const startedAt = performance.now();
-  const piped = await runRtkPipe({
-    subprocess: ctx.subprocess,
-    filter: plan.filter,
-    stdin: plan.input,
-    cwd: plan.cwd,
-    timeoutMs: options.pipeTimeoutMs,
-  });
+  const piped = await pipedTextOf(input);
   const latencyMs = Math.max(0, Math.round(performance.now() - startedAt));
   let accepted: PostToolDecision | undefined;
-  if (piped.ok) {
-    accepted = await acceptCompressed({ ...input, piped: piped.stdout, latencyMs });
-  } else {
+  if (piped === undefined) {
     safeRecordPipe(
       input.deps,
       () => ({
@@ -1533,6 +1653,8 @@ async function renderCompressed(input: RenderInput): Promise<PostToolDecision | 
       }),
       options.log,
     );
+  } else {
+    accepted = await acceptCompressed({ ...input, piped, latencyMs });
   }
   return accepted;
 }
@@ -1568,8 +1690,9 @@ async function applyPipeDecision(
   if (!isShellTool(exec.name)) {
     return fallback;
   }
-  // 工作目录解析一次，闸门（它要拿去跑 `detectVitestMajor`）与 `PipePlan`（spawn 的 cwd）共用。
-  // 与 C 形态同一真源：模型按调用传的 `workdir` 优先，其次是会话 cwd 的两级兜底。
+  // 工作目录解析一次：`PipePlan` 拿它当 spawn 的 cwd（`strip` 档不 spawn，但记账里的
+  // `workdir` 仍要是同一个值），与 C 形态同一真源——模型按调用传的 `workdir` 优先，
+  // 其次是会话 cwd 的两级兜底。
   const cwd = await resolveWorkdir(
     exec,
     async (target) =>
@@ -2176,7 +2299,6 @@ function apply(ctx: unknown, config: Config): void {
       ...pipeReadersOf(config, supported),
       forms: formsReaderOf(config),
       pipeTimeoutMs: config.pipeTimeoutMs,
-      vitestMaxMajor: config.vitestMaxMajor,
       log: diag,
       supported,
     },

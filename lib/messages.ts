@@ -31,6 +31,15 @@ export interface Messages {
    * 模型看到的是「去读那个路径」却没有任何路径 —— 取回通道等于不存在。
    */
   spillLocation: string;
+  /**
+   * 「放宽放行」时写在**压缩体首行**的那一句。
+   *
+   * 与 `spillLocation` 分开：那条挂在 `additionalContexts` 上（官方 `form: "notice"`），模型
+   * 读得到但不一定与正文一起被再读一遍；`lost-hash` / `folded-entries` 被放行的这一次，正文
+   * 本身少了东西，路径必须就在正文第一行。形状照抄宿主 `dsh-spill-policy` 的 notice（省了
+   * 多少 + 路径 + 指引），差别只是它进上下文附注、这份进正文。
+   */
+  spillRelaxed: string;
 }
 
 export const MESSAGES: MessagesCatalog<Messages> = {
@@ -39,11 +48,13 @@ export const MESSAGES: MessagesCatalog<Messages> = {
       "[rtk] cargo test 前缀不保留编译警告；需要看警告请直接跑 cargo build / cargo check",
     spillSummary: "压缩前的完整输出已另存为文件",
     spillLocation: "压缩前的完整输出已存为 {path}。{hint}",
+    spillRelaxed: "[rtk] 这一段删掉了 {omitted}；完整原文在 {path}。{hint}",
   },
   en: {
     cargoTestWarnHint:
       "[rtk] cargo test prefix drops compile warnings; run cargo build / cargo check to see them",
     spillSummary: "The full pre-compression output was saved to a file",
     spillLocation: "The full pre-compression output is stored at {path}. {hint}",
+    spillRelaxed: "[rtk] this excerpt dropped {omitted}; the full text is at {path}. {hint}",
   },
 };

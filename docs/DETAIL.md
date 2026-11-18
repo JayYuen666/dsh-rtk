@@ -20,8 +20,11 @@ Compound commands (`cd <repo> && cargo test`) are handled **segment by segment**
 per segment (`cd /tmp && cargo test` → `cd /tmp && rtk cargo test`), so the plugin splits both the
 original command and the product, requires the separator sequence to match one for one, and verifies
 each segment on its own. Constructs that cannot be split (command substitution, redirection,
-background `&`, unbalanced quotes) and the case where any segment hits the deny list both run the
-whole command unchanged.
+background `&`, unbalanced quotes) run the whole command unchanged. A segment that fails the gate is
+put back verbatim while the rest still gets rewritten: `cd x && aws s3 ls && cargo test` becomes
+`cd x && aws s3 ls && rtk cargo test`. The gate holds one entry only — `aws`, where rewriting changes
+the exit code (127 natively vs 1 through rtk when the CLI is missing); "the output would get shorter"
+is not a reason to refuse a rewrite.
 
 Nothing is compressed unless it is measurably worth it: outputs below `minBytes` (256) and rewrites
 that save less than `minGainRatio` (0.95) are passed through unchanged. Failures always keep their
@@ -41,8 +44,9 @@ The settings card keeps the configuration and shows one line of today's summary 
 sidebar**: form switch, 7 / 30 / 90-day window, day / week / month granularity; a KPI row (calls,
 attempts, successes, coverage or success rate, tokens saved, savings rate); a combination chart (bars =
 tokens saved, line = savings or coverage, dual axis); "why this one was not compressed" for the latest
-event plus the top reasons in the window; detail tables (prefix by command family and working
-directory, pipe by filter, command family and working directory); suggestions (low-yield filters,
+event plus the top reasons in the window; detail tables (prefix by the families of the segments that
+were actually rewritten, plus working directory; pipe by filter, command family and working directory);
+suggestions (low-yield filters,
 enabled-but-never-hit filters, disabled-but-clearly-compressible filters, low-yield command families);
 and a data note (start date, plus the concrete reason when a ledger cannot be read). Fewer than three
 days of data falls back to bars — two points joined by a line cannot show a trend, only suggest one.
@@ -96,7 +100,7 @@ These are read once at assembly and need a host restart to take effect:
 | `logFilterMode` | `'off'` |
 | `rewriteCacheSize` | `256` |
 | `rewriteTimeoutMs` | `2000` |
-| `vitestMaxMajor` | `5` |
+| `vitestMaxMajor` | `5` (command rewriting only) |
 
 ## What it needs from outside
 

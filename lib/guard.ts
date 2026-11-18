@@ -18,8 +18,15 @@
 import { classOf } from "./filter-class.ts";
 import type { FilterClass } from "./filter-class.ts";
 
-/** 护栏结论；`ok: true` 时 `output` 是最终要替换进上下文的那一段。 */
-export type GuardResult = { ok: true; output: string } | { ok: false; reason: string };
+/**
+ * 护栏结论；`ok: true` 时 `output` 是最终要替换进上下文的那一段。
+ *
+ * `recoverable: true` 只在被拒时出现，表示「这条拒的理由是信息有损，而原文可以落库取回」。
+ * 调用方据此决定要不要落库后放行；放行那一步取收尾结果用 `keptOutputOf`（见它自己的注释）。
+ */
+export type GuardResult =
+  | { ok: true; output: string }
+  | { ok: false; reason: string; recoverable?: true };
 
 /**
  * 「成功宣告」词表。输出里出现它们、而输入里含失败标记 —— 就是伪造成功。
@@ -199,6 +206,16 @@ function foldedEntries(filter: string, input: string, output: string): boolean {
 interface GuardRule {
   readonly reason: string;
   readonly violated: (input: GuardInput, filterClass: FilterClass) => boolean;
+  /**
+   * 这条拒是不是「信息有损、但原文可取回」。
+   *
+   * 只有 `lost-hash` 与 `folded-entries` 是。它们拦的事实都是「压缩体里少了东西」，
+   * 而少了的东西在原文里——原文一旦落进宿主的 spill 存储，模型一条 `read` 就能看全。
+   * 另三道不是这个形状：`empty-output`（压成空等于没有结果）、`low-gain`（省得不够多，
+   * 原文在不在都该拒）、`fabricated-success`（**原文本身就不支持那句成功宣告**，取回原文
+   * 只会让模型看到矛盾的两个人说法），它们没有「取回就好」这一说。
+   */
+  readonly recoverable?: true;
 }
 
 /** 判据共用的输入面。 */
@@ -217,18 +234,37 @@ const GUARD_RULES: readonly GuardRule[] = [
   { reason: "fabricated-success", violated: (now) => fabricatedSuccess(now.input, now.output) },
   {
     reason: "lost-hash",
+    recoverable: true,
     violated: (now, filterClass) => filterClass === "vcs" && lostHash(now.input, now.output),
   },
   {
     reason: "folded-entries",
+    recoverable: true,
     violated: (now, filterClass) =>
       filterClass === "listing" && foldedEntries(now.filter, now.input, now.output),
   },
 ];
 
-/** 第一个被违反的判据给出的原因；全部通过时 undefined。 */
-function firstViolation(now: GuardInput, filterClass: FilterClass): string | undefined {
-  return GUARD_RULES.find((rule) => rule.violated(now, filterClass))?.reason;
+/** 第一个被违反的判据；全部通过时 undefined。 */
+function firstViolation(now: GuardInput, filterClass: FilterClass): GuardRule | undefined {
+  return GUARD_RULES.find((rule) => rule.violated(now, filterClass));
+}
+
+/**
+ * 通过之后真正要交出去的那一段：summary 类做两步收尾，其余类原样。
+ *
+ * 单独导出是给「放宽放行」那条路用的：那一支已经知道判定会通过（能走到那儿，说明第一处
+ * 违规是可被取回通道救回的那两条，而其余五道的结论与第一次判定时逐条相同），若再返回一个
+ * 联合类型，调用点就得写一个**永远走不到**的兜底分支——那既没人测得到，也说不清它想兜什么。
+ */
+export function keptOutputOf(options: {
+  readonly filter: string;
+  readonly input: string;
+  readonly output: string;
+}): string {
+  return classOf(options.filter) === "summary"
+    ? clarifyFailureCount(options.input, collapseAdjacentDuplicates(options.output))
+    : options.output;
 }
 
 /**
@@ -236,6 +272,14 @@ function firstViolation(now: GuardInput, filterClass: FilterClass): string | und
  *
  * summary 类的收尾有两步：先折相邻重复行（rtk 会把 `test result:` 重复打），再给
  * `FAILURES (N):` 补一句对账（那个 N 是输出行数，不是失败测试数，见 `clarifyFailureCount`）。
+ *
+ * **这一层不判「原文能不能取回」**：它只回答「压成这样行不行」。`recoverable` 是给调用方的
+ * 一个信号——这一拒的成因是「少了东西」，而少的东西在原文里。要不要靠落库放行，是调用方的
+ * 事：本插件在 `acceptCompressed` 里先落库、拿到 locator 才放行，并把路径写进压缩体首行。
+ * 护栏自己不去落库，是因为它没有 `ctx`、也不该有。
+ *
+ * 这道函数**不决定要不要放宽**：它只把「这一拒是有损可救的」标成 `recoverable`。放宽发生在
+ * 调用方——先把原文落进 spill、拿到 locator，再用 `keptOutputOf` 取收尾后的那一段。
  */
 export function guardCompressed(options: {
   readonly filter: string;
@@ -244,10 +288,15 @@ export function guardCompressed(options: {
   readonly minGainRatio: number;
 }): GuardResult {
   const filterClass = classOf(options.filter);
-  const reason = filterClass === undefined ? "unclassified" : firstViolation(options, filterClass);
-  const keep =
-    filterClass === "summary"
-      ? clarifyFailureCount(options.input, collapseAdjacentDuplicates(options.output))
-      : options.output;
-  return reason === undefined ? { ok: true, output: keep } : { ok: false, reason };
+  const violated = filterClass === undefined ? undefined : firstViolation(options, filterClass);
+  const keep = keptOutputOf(options);
+  if (filterClass === undefined) {
+    return { ok: false, reason: "unclassified" };
+  }
+  if (violated === undefined) {
+    return { ok: true, output: keep };
+  }
+  return violated.recoverable === true
+    ? { ok: false, reason: violated.reason, recoverable: true }
+    : { ok: false, reason: violated.reason };
 }

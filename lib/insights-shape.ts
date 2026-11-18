@@ -289,6 +289,10 @@ export type PipeSkipReason =
   | "already-rewritten"
   | "structural-reject"
   | "no-filter"
+  /**
+   * 早期版本在 B 形态这一侧按 vitest 主版本拒绝压缩（5.x 上 rtk 只回一行 passthrough）。
+   * 那条路现在改成本地删通过行（`lib/vitest-strip.ts`），不再有产生点；这一支只为读旧库保留。
+   */
   | "vitest-gate"
   | "no-output"
   | "too-small"

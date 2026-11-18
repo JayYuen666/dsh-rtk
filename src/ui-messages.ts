@@ -215,7 +215,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     formPrefixAndPipe: "改写 + 结果压缩",
     formPipeOnly: "仅结果压缩",
     pipeDisabledHint:
-      "结果压缩当前关闭：rtk 的 vitest filter 在 5.x 上只剩一行 passthrough，等官方修好再开。",
+      "结果压缩当前关闭：命令输出原样交给模型。打开它会按 filter 再压一遍——vitest 那一路是本包自己删掉通过行（不依赖 rtk 的解析器）。",
     denyLabel: "额外拒绝的命令（首词）",
     denyHint: "逗号分隔。命中即不改写，如 gh,npm。内置的信息损失拒绝表不受此项影响。",
     filtersLabel: "启用的结果过滤器",
@@ -357,7 +357,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     formPrefixAndPipe: "Rewrite + output compression",
     formPipeOnly: "Output compression only",
     pipeDisabledHint:
-      "Output compression is currently off: rtk's vitest filter collapses to one passthrough line on 5.x. Re-enable once upstream fixes it.",
+      "Output compression is currently off: command output reaches the model untouched. Turning it on compresses by filter — the vitest path drops passing lines in this plugin itself, without depending on rtk's parser.",
     denyLabel: "Extra denied commands (first word)",
     denyHint:
       "Comma separated. A match skips rewriting, e.g. gh,npm. The built-in information-loss table is not affected.",

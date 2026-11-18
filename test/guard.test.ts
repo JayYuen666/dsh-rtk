@@ -147,6 +147,7 @@ describe("vcs 类查 hash 守恒", () => {
     assert.deepEqual(guardCompressed(opts("abc1234 x\ndef5678 y\n", "abc1234 x", "git-log")), {
       ok: false,
       reason: "lost-hash",
+      recoverable: true,
     });
   });
 
@@ -158,6 +159,7 @@ describe("vcs 类查 hash 守恒", () => {
     assert.deepEqual(guardCompressed(opts(input, output, "git-log")), {
       ok: false,
       reason: "lost-hash",
+      recoverable: true,
     });
   });
 
@@ -194,6 +196,7 @@ describe("listing 类查折叠标记", () => {
     assert.deepEqual(guardCompressed(opts(many, "./dir0\n+180 more dirs", "find")), {
       ok: false,
       reason: FOLDED,
+      recoverable: true,
     });
   });
 
@@ -201,6 +204,7 @@ describe("listing 类查折叠标记", () => {
     assert.deepEqual(guardCompressed(opts(GREP_HITS, "f:1:a\n+2", "grep")), {
       ok: false,
       reason: FOLDED,
+      recoverable: true,
     });
   });
 
@@ -226,6 +230,7 @@ describe("listing 类查折叠标记", () => {
     assert.deepEqual(guardCompressed(opts(SHORT_INPUT, `./a\n${marker}`, "find")), {
       ok: false,
       reason: FOLDED,
+      recoverable: true,
     });
   });
 
@@ -246,6 +251,7 @@ describe("listing 类查折叠标记", () => {
     assert.deepEqual(guardCompressed(opts(input, "./entry0\n./entry1", "find")), {
       ok: false,
       reason: FOLDED,
+      recoverable: true,
     });
   });
 

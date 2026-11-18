@@ -270,7 +270,6 @@ async function startListener(options) {
     minGainRatio: () => 0.95,
     stdoutCapBytes: () => 64_000,
     pipeTimeoutMs: 5000,
-    vitestMaxMajor: 5,
   };
   /** @type {import("../host.ts").PipeDeps} */
   const listenerDeps = {
@@ -278,6 +277,7 @@ async function startListener(options) {
       cargoTestWarnHint: "",
       spillSummary: "压缩前的完整输出已存",
       spillLocation: "压缩前的完整输出已存为 {path}。{hint}",
+      spillRelaxed: "这一段删掉了 {omitted}；完整原文在 {path}。{hint}",
     }),
     rewrittenCalls: createRewrittenCalls(8),
     // 定价口径见上面的 `tokenCount`（真装配走 `ctx.tokenMeter`）。

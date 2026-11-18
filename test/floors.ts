@@ -57,8 +57,16 @@ export const FLOORS: readonly Floor[] = [
     // 上一档咬不住——把尺子跟着现值一路抬，它就永远量不出增长。
     // 再按 227,777 B 复核（同一轮末尾补的那一行：`HOST_EXECUTABLE` 在模块加载时把宿主策略
     // 钉住，见 `lib/prefix-safety.ts` 的同名注释）：227,777 × 1.25 = 284,721.25 → 284,722。
+    // 现量 232,539 B，涨的是「结果压缩真能用」那一轮：护栏的 `recoverable` 两档（`lost-hash` /
+    // `folded-entries` 可被取回通道救回）、`acceptCompressed` 的先落库再放行、`spillOf` 的抽出、
+    // `rejectCompressed` 的独立，以及放宽放行时写进正文首行的 `relaxedHeaderOf` 与
+    // `omittedTextOf`。232,539 × 1.25 = 290,673.75 → 290,674，比上一档高 5,952。
+    // 现量 238,090 B，涨的是「vt 那一轮」：`lib/vitest-strip.ts`（console 块与文件结果行的分界、
+    // 单趟删行）连同它的调用面 `pipedTextOf`，以及 `PipePlan.mode` 与 `modeOf` 那一支分流；
+    // 同时 `vitestAllowed` 与 `planForFilter` 的版本门**被删掉**（两者相抵，净涨 5,555）。
+    // 238,090 × 1.25 = 297,612.5 → 297,613。
     floor: 40_000,
-    budget: 284_722,
+    budget: 297_613,
     note: "host 半：Config + 两形态装配 + 四库 + 记账的字节/token 双口径。宿主按包名载入，字节是真实装载成本",
   },
   {
@@ -78,8 +86,13 @@ export const FLOORS: readonly Floor[] = [
     // 「实测 × 1.25 向上取整」：83,059 × 1.25 = 103,824。
     // 现量 83,212 B（同上那一轮：`ChartBlock` 的嵌套翻译拆开、按原因码查文案）。
     // 103,887 这一档仍罩得住（83,212 × 1.25 = 104,015），理由同上：尺子不跟着现值跑。
+    // 现量 84,687 B，涨的是两段纯 CSS：表格首列冻结（sticky + 不透明底 + 角格 z-index）
+    // 与 KPI 数字滚动（`@property` / `counter` / `@keyframes` / 减少动效那一支）。
+    // 84,687 × 1.25 = 105,858.75 → 105,859。
+    // 现量 84,928 B（vt 那一轮：`pipeDisabledHint` 两语改写，旧文案的前提已不成立）。
+    // 84,928 × 1.25 = 106,160，越过上一档 105,859 一格，按同一口径重算。
     floor: 25_000,
-    budget: 103_887,
+    budget: 106_160,
     note: "client 半：设置卡 + Insights 页入口（不含 ECharts）；shared card-ui 由宿主行供应，不进这里",
   },
   {

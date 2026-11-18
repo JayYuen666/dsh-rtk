@@ -175,22 +175,59 @@ function Picker<Value extends string | number>(props: {
   );
 }
 
+/**
+ * 数字滚动只在本页**第一次**挂载时播一次。
+ *
+ * 每回一次请求都从头数一遍很吵：切页签、换窗口、点刷新都会重发请求，读者会以为数字在抖。
+ * 模块级的这一位在整个页面生命周期里只翻一次；`useRef` 的初值保证同一次挂载内六格读到的是
+ * 同一个答案，`useEffect` 在绘制之后才把它置位（不在渲染期写外部状态）。
+ *
+ * 这里刻意**不用 state**：一旦在 effect 里 `setAnimate(false)`，属性与 animation 会随那次
+ * 重渲染一起消失，动画刚起就断在中间（真机实测 KPI 一格都没动过）。要的是「这一次挂载全程
+ * 带这个属性」，播不播由 CSS 的 `animation` 自己决定——同一个元素上它只跑一次。
+ */
+let countupPlayed = false;
+
+function useCountupOnce(): { readonly animate: boolean } {
+  const firstMount = useRef(!countupPlayed);
+  useEffect(() => {
+    countupPlayed = true;
+  }, []);
+  return { animate: firstMount.current };
+}
+
 /** 一格 KPI：标签在上、数值在下。抽出来是为了不在 `KpiRow` 里叠四层 createElement。 */
-function KpiCell(props: { readonly t: Translate; readonly row: KpiRowSpec }): ReactNode {
-  const { t, row } = props;
+function KpiCell(props: {
+  readonly t: Translate;
+  readonly row: KpiRowSpec;
+  readonly animate: boolean;
+}): ReactNode {
+  const { t, row, animate } = props;
   const label = createElement("span", { className: "rtkc-kpi-label" }, t(row.labelKey));
-  const value = createElement("strong", { className: "rtkc-kpi-value" }, row.value);
+  // 只有次数格带 `count`：它是可数整数。省下的 token 与百分比都是格式化串（`4.0k`/`62%`），
+  // 反解析回来只是近似，拿去当动画目标等于把近似当精确，所以它们不播。
+  const counted = animate && row.count !== undefined;
+  const style = counted ? ({ "--rtkc-count-target": String(row.count) } as const) : undefined;
+  const value = createElement(
+    "strong",
+    {
+      className: "rtkc-kpi-value",
+      ...(counted ? { "data-count": row.count, style } : {}),
+    },
+    row.value,
+  );
   return createElement("div", { className: "rtkc-kpi", key: row.key }, label, value);
 }
 
 /** KPI 行：六格，窄屏由 CSS 折行。文案键由 `kpiRowsOf` 按形态选好，这里不再判形态。 */
 function KpiRow(props: { readonly t: Translate; readonly response: InsightsResponse }): ReactNode {
   const { t, response } = props;
+  const { animate } = useCountupOnce();
   const rows = kpiRowsOf(response.totals, response.form);
   const cells = createElement(
     "div",
     { className: "rtkc-kpis" },
-    ...rows.map((row) => createElement(KpiCell, { t, row, key: row.key })),
+    ...rows.map((row) => createElement(KpiCell, { t, row, animate, key: row.key })),
   );
   // 改写形态只有平均（日表没留峰值），压缩形态才连最大值一起报。
   // 一次都没量到就不画这一句：`formatDuration(0)` 会渲染成「平均改写耗时: 0 ms」，那读起来

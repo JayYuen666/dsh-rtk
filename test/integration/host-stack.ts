@@ -479,6 +479,7 @@ export async function startPrefixHost(
       cargoTestWarnHint: "cargo build / cargo check",
       spillSummary: "",
       spillLocation: "{path} {hint}",
+      spillRelaxed: "{omitted} {path} {hint}",
     }),
     rewriteCache: createRewriteCache(16),
     rewrittenCalls: createRewrittenCalls(16),
@@ -756,6 +757,7 @@ export function startPipeHost(options: PipeHostOptions = {}): PipeHost {
     spillSummary: "压缩前的完整输出已另存为文件",
     // 用真字典里的同一句模板：这里若换一句自造文案，测出来的就不是生产会发的那句。
     spillLocation: "压缩前的完整输出已存为 {path}。{hint}",
+    spillRelaxed: "这一段删掉了 {omitted}；完整原文在 {path}。{hint}",
   };
   const deps: PipeDeps = {
     messages: options.messages ?? (() => defaultMessages),
@@ -793,7 +795,6 @@ export function startPipeHost(options: PipeHostOptions = {}): PipeHost {
         return options.stdoutCapBytes?.() ?? 64_000;
       },
       pipeTimeoutMs: 300,
-      vitestMaxMajor: 5,
     },
     deps,
   );

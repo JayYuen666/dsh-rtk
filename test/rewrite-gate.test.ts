@@ -16,7 +16,6 @@ const BASE = { denyCommands: [] as readonly string[], cwd: "/tmp", vitestMaxMajo
 
 /** 被大量复用的命令串与原因串：一处改名，全部断言跟着走。 */
 const CARGO_TEST = "cargo test";
-const GIT_SHOW_HEAD = "git show HEAD";
 const VITEST_VERSION = "vitest-version";
 const DENY_TABLE = "deny-table";
 /** 复合命令的两段样例：后半段命中拒绝表那一组反复用同一串。 */
@@ -81,15 +80,14 @@ describe("结构判据", () => {
     assert.equal(gate("cargo test &"), "compound");
   });
 
-  it("复合命令逐段判：后半段命中拒绝表就整条原样执行", () => {
-    // 放开复合命令之后必须补这一组，否则「首词是 cd」会让内建表整片失效：
-    // `cd x && git diff` 会被 rtk 改成 `cd x && rtk git diff`，丢 5 行 patch 头且不可 apply。
-    assert.equal(gate(`${CD_PREFIX}git diff`), DENY_TABLE);
-    assert.equal(gate(`${CD_PREFIX}git log`), DENY_TABLE);
-    assert.equal(gate(`${CD_PREFIX}cargo clippy`), DENY_TABLE);
-    assert.equal(gate(`${CD_PREFIX}ls`), DENY_TABLE);
-    assert.equal(gate(`${CD_PREFIX}find . -name x`), DENY_TABLE);
-    // 没命中的照常放行（逐段判不等于整条拒）。
+  it("复合命令：有一段能改就整条交出去（不能改的段由还原步骤收回原文）", () => {
+    // 口径（2026-11 用户裁定）：默认形态 = rtk 支持什么就改写什么。`rtk rewrite` 对
+    // `git diff` / `git log` / `ls` / `find` / `grep` 全都回 rc=3（实测），所以它们都该改。
+    assert.equal(gate(`${CD_PREFIX}git diff`), undefined);
+    assert.equal(gate(`${CD_PREFIX}git log`), undefined);
+    assert.equal(gate(`${CD_PREFIX}cargo clippy`), undefined);
+    assert.equal(gate(`${CD_PREFIX}ls`), undefined);
+    assert.equal(gate(`${CD_PREFIX}find . -name x`), undefined);
     assert.equal(gate(`${CD_PREFIX}cargo test`), undefined);
     assert.equal(gate(`${CD_PREFIX}cargo build`), undefined);
   });
@@ -120,58 +118,40 @@ describe("用户拒绝前缀", () => {
   });
 });
 
-describe("内建信息损失表", () => {
-  it("git log 任意形态", () => {
-    assert.equal(gate("git log --oneline -20"), DENY_TABLE);
-    assert.equal(gate("git log -p"), DENY_TABLE);
-  });
-
-  it("git diff 无统计 flag 拒", () => {
-    assert.equal(gate("git diff"), DENY_TABLE);
-    assert.equal(gate("git diff HEAD~1 -- src/a.ts"), DENY_TABLE);
-  });
-
-  it("git diff 带统计 flag 放行", () => {
-    for (const flag of [
-      "--stat",
-      "--name-only",
-      "--name-status",
-      "--porcelain",
-      "--numstat",
-      "--shortstat",
-    ]) {
-      assert.equal(gate(`git diff ${flag}`), undefined, flag);
-    }
-  });
-
-  it("git show <ref>:<path> 放行（逐字节保真）", () => {
-    assert.equal(gate("git show HEAD:src/a.ts"), undefined);
-    assert.equal(gate("git show main:docs/x.md"), undefined);
-  });
-
-  it("git show <commit-ish> 拒", () => {
-    assert.equal(gate(GIT_SHOW_HEAD), DENY_TABLE);
-    assert.equal(gate("git show abc1234"), DENY_TABLE);
-  });
-
-  it("列表类首命令拒", () => {
-    for (const command of [
+describe("内建拒绝表（只留结论会变错的那条）", () => {
+  it("rtk 支持的命令一律放行：输出变短是缩略该做的事", () => {
+    // 这一组是**口径断言**，不是「这些命令安全」的直觉。依据是实测：`rtk rewrite` 对下面
+    // 每一条都回 rc=3（= 支持改写），所以拒绝改写的唯一正确理由只能是「改写让结论变错」。
+    // 上一版这里曾有九条、前八条的依据是「输出会变短」，那是把插件的目标判反了。
+    const SUPPORTED = [
+      "git log --oneline -20",
+      "git log -p",
+      "git diff",
+      "git diff HEAD~1 -- src/a.ts",
+      "git diff --stat",
+      "git show HEAD",
+      "git show abc1234",
+      "git show HEAD:src/a.ts",
       "ls",
       "ls -la",
       "find . -name x.ts",
       "grep -rn boot src",
       "rg boot src",
-    ]) {
-      assert.equal(gate(command), DENY_TABLE, command);
+      "cargo clippy --all-targets",
+    ];
+    for (const command of SUPPORTED) {
+      assert.equal(gate(command), undefined, command);
     }
   });
 
-  it("cargo clippy 拒（warning 全丢）", () => {
-    assert.equal(gate("cargo clippy --all-targets"), DENY_TABLE);
+  it("aws 拒（退出码换含义：命令不存在时 127 变 1）", () => {
+    assert.equal(gate("aws s3 ls"), DENY_TABLE);
+    assert.equal(gate("aws ec2 describe-instances"), DENY_TABLE);
   });
 
-  it("aws 拒（退出码失真）", () => {
-    assert.equal(gate("aws s3 ls"), DENY_TABLE);
+  it("只比首词：`aws` 的拒绝不外溢到别的程序", () => {
+    assert.equal(gate("awscli foo"), undefined);
+    assert.equal(gate("git aws"), undefined);
   });
 
   it("显式保留的放行", () => {

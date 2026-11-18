@@ -113,6 +113,14 @@ export interface KpiRow {
   readonly key: string;
   readonly labelKey: KpiLabelKey;
   readonly value: string;
+  /**
+   * 纯整数的原始值：只给前三格（次数类）填。
+   *
+   * 卡片那边用它播一次数字滚动（纯 CSS `@property` + `counter`，没有 JS 定时器）。
+   * `value` 是对外文本，`count` 是动画的目标值——两个都留着而不是从 `value` 反解析：
+   * `4.0k` 这种短写反解析回来是 4000，可 `1.5k` 是 1500 上下，反解析等于把近似当精确。
+   */
+  readonly count?: number;
 }
 
 /**
@@ -126,16 +134,23 @@ export function kpiRowsOf(totals: Totals, form: InsightsForm): readonly KpiRow[]
   const rows: KpiRow[] = [
     // 前三格是**计数**，写个位原文；`formatTokens` 会把 1500 写成 `1.5k`，而调用次数是精确
     // 可数的，折成近似值等于把「1500 次」说成「1500 上下」。
-    { key: "bashCalls", labelKey: "kpiBashCalls", value: String(totals.bashCalls) },
+    {
+      key: "bashCalls",
+      labelKey: "kpiBashCalls",
+      value: String(totals.bashCalls),
+      count: totals.bashCalls,
+    },
     {
       key: "attempts",
       labelKey: prefix ? "kpiAttemptsPrefix" : "kpiAttemptsPipe",
       value: String(totals.attempts),
+      count: totals.attempts,
     },
     {
       key: "succeeded",
       labelKey: prefix ? "kpiSucceededPrefix" : "kpiSucceededPipe",
       value: String(totals.compressed),
+      count: totals.compressed,
     },
     {
       key: "coverage",

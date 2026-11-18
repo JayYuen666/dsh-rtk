@@ -4,6 +4,78 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.1
+
+Compression stops being decorative. The default filter set now covers the commands command rewriting
+cannot take — including vitest, whose passing lines this plugin strips itself instead of asking rtk —
+the two loss-based guard rules became recoverable when the original really was saved to a spill file,
+and the Insights page gained a frozen first column plus a one-shot count animation.
+
+### Changed
+
+- **The default `enabledFilters` follow what command rewriting cannot take.** `['cargo-test',
+  'pytest', 'ctest']` → `['git-log', 'git-diff', 'git-status', 'grep', 'find', 'vitest']`. `rtk
+  rewrite` answers rc=3 for the old three and rewrites them to `rtk <cmd>`, so the compression pass
+  could only ever report `already-rewritten`; on a real profile 64 bash calls produced `compressed 0`,
+  `no-filter 58`, `already-rewritten 3`. The first five are the shapes rewriting still hands back, so
+  filtering them is the only chance left. `vitest` joins them because `pnpm test` / `npm test` /
+  `yarn test` are the forms rtk **cannot** rewrite (its rules require an explicit `run`, measured
+  rc=1) — and that path does not call rtk at all (see Added).
+- **The command table counts the segments that were actually rewritten.** rtk's own ledger already
+  stores one row per rewritten segment (`cd x && rtk git diff && rtk cargo test` becomes two rows,
+  `git diff` and `cargo test`; `cd x` has none), so the prefix detail tables are already
+  per-segment — what changed is the wording plus the value in `dsh_last_events.command_family`:
+  a rewrite now takes the first **rewritten** family, where the previous version took
+  `commandFamilyOf(whole line)` and printed `cd` for exactly those commands.
+- **The deny table is down to one entry: `aws`.** The other eight (`git log` / `git diff` /
+  `git show` / `ls` / `find` / `grep` / `rg` / `cargo clippy`) refused a rewrite because the output
+  would get shorter — that is the compression shapes' question, not the rewrite gate's. Rewriting
+  them is now the default, and "output got shorter" is answered by the guard. `aws` stays because
+  rewriting changes the exit code: a missing `aws` gives 127 natively and 1 through rtk.
+- **A segment that fails the gate is restored; the rest still gets rewritten.** `cd x && aws s3 ls &&
+  cargo test` → `cd x && aws s3 ls && rtk cargo test`. rtk rewrites every segment it recognizes, so
+  handing the whole line over and putting the gated segments back verbatim is the only way to keep
+  both halves. `restoreGatedSegments` uses each segment's **original text including trailing
+  whitespace** — trimming it makes that segment fail the "untouched segment" check.
+
+### Added
+
+- **The vitest path compresses without rtk.** `lib/vitest-strip.ts` drops `✓` passing lines from the
+  stdout segment in memory: `host.ts` routes `filter === "vitest"` to a `strip` mode instead of
+  spawning `rtk pipe -f vitest`, so no process is started and no version gate applies. Measured on
+  this repo's own suite: 4,105 B → 412 B (73 lines dropped, 90%), with `Test Files 52 passed (52)` /
+  `Tests 860 passed (860)` / `Duration` intact. The reason is not preference: rtk's vitest parser gets
+  nothing usable on vitest 5 (its injected `--reporter=json` writes a file, stdout keeps one notice
+  line), `--outputFile=/dev/stdout` dies at 65,536 B on a non-blocking pipe (a real 850-test JSON is
+  149 KB), and feeding it plain text loses every assertion (`AssertionError` 4 → 0, and the guard said
+  `ok`). Console blocks (`stdout | …`) are left whole — a user's `console.log` can look exactly like a
+  passing line.
+- **A recoverable rejection can be relaxed, and then says where the original is.** Two guard rules
+  — `lost-hash` and `folded-entries` — are now marked `recoverable`: what they object to is *missing*
+  content, and that content is in the original. `host.ts` therefore saves the original to the host's
+  spill store **first**, and only then finishes the compressed body; the relaxed
+  pass writes `spillRelaxed` (omitted bytes + locator + the host's own `retrievalHint`) as the **first
+  line of the compressed body**, not just into `additionalContexts` — a model usually reads only the
+  body. Without a retrieval path the old behaviour stands: no lossy compression enters the context.
+  The other four rules stay hard rejects (`fabricated-success` would show the model a contradiction).
+- **The first table column is frozen, and the scroll chain stops at the table.** `tbody td:first-child`
+  is `position: sticky; left: 0` over an opaque background with a hairline divider (the header cell
+  keeps `z-index: 3` so the corner cell wins both axes), and `.rtkc-table-wrap` gained
+  `overscroll-behavior: contain`.
+- **The KPI counters count up once.** Three integer cells (bash calls, attempts, succeeded) animate
+  from 0 to their value with pure CSS — a registered `@property --rtkc-count-target`,
+  `counter-reset` + `counter()` in `::after`, no timers and no per-frame re-render. Only the first
+  render after mount animates (a module-level flag); `prefers-reduced-motion` shortens the animation
+  to 1 ms instead of removing it, because the starting `0` comes from the keyframes.
+
+### Tests
+
+- 866 cases across 53 files with the four coverage dimensions at 100%. New cases pin the failure
+  header reconciliation, the relaxed pass (with and without a spill store), the new default filter
+  set, `KpiRow.count` staying absent on the three formatted cells, the gate-restoration path, and the
+  six behaviours of `stripPassingTests` (console blocks kept, `↓`/`□`/`×`/`→` kept, all-passing keeps
+  its summary, no passing line means `dropped: 0` so the gain rule rejects it).
+
 ## 0.2.0
 
 Statistics move out of one cumulative card and into a page of their own, split by shape. The old

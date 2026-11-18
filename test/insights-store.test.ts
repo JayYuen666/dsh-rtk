@@ -25,6 +25,7 @@ const CARGO_FILTER = "cargo-test";
 const GIT_FILTER = "git-log";
 const CARGO_FAMILY = "cargo test";
 const GIT_FAMILY = "git log";
+const REWRITTEN = "prefix-rewritten";
 const REPO_WORKDIR = "/repo";
 const STATS_DB = "stats.db";
 
@@ -312,7 +313,7 @@ describe("prefix 的写入与读取", () => {
     });
     store.recordPrefix({ kind: "prefix-attempt", ts: ANCHOR });
     store.recordPrefix({
-      kind: "prefix-rewritten",
+      kind: REWRITTEN,
       ts: ANCHOR,
       latencyMs: 30,
       families: [CARGO_FAMILY],
@@ -628,7 +629,7 @@ describe("size_bucket 的四档与 unknown", () => {
     const store = await openStore(dbPath);
     // families 为空表：rtk 改了一段但家族认不出来（例如整段是变量展开）。
     store.recordPrefix({
-      kind: "prefix-rewritten",
+      kind: REWRITTEN,
       ts: ANCHOR,
       latencyMs: 8,
       families: [],
@@ -640,6 +641,24 @@ describe("size_bucket 的四档与 unknown", () => {
     assert.equal(last.status, "rewritten");
     assert.equal(last.command_family, "unknown");
     assert.equal(last.size_bucket, "unknown");
+  });
+
+  it("复合命令被改了两段时，last_event 记的是**被改的那几段**里的第一段", async () => {
+    const dbPath = await tempDbPath();
+    const store = await openStore(dbPath);
+    // `cd x && git diff && cargo test` 只改后两段：整条命令的家族是 `cd`（首词），
+    // 而 `cd` 根本没被改写。这一格要印「改了什么」，所以取 families[0]。
+    store.recordPrefix({
+      kind: REWRITTEN,
+      ts: ANCHOR,
+      latencyMs: 12,
+      families: [GIT_FAMILY, CARGO_FAMILY],
+      workdir: REPO_WORKDIR,
+    });
+    await store.flush();
+    const [last] = store.readLastEvents(5);
+    assert.ok(last !== undefined);
+    assert.equal(last.command_family, GIT_FAMILY);
   });
 });
 

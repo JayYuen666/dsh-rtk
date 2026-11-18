@@ -17,8 +17,8 @@ const CARGO_TEST = "cargo test";
 const RTK_CARGO_TEST = "rtk cargo test";
 const GIT_STATUS = "git status";
 const RTK_GIT_STATUS = "rtk git status";
-const GIT_LOG = "git log --oneline";
-const GIT_LOG_FAMILY = "git log";
+const AWS_S3_LS = "aws s3 ls";
+const AWS_FAMILY = "aws s3";
 const NPM_RUN_LINT = "npm run lint";
 const RTK_LINT = "rtk lint";
 
@@ -93,15 +93,16 @@ describe("c 形态：统计埋点", () => {
   });
 
   it("闸门跳过 → 只有 bash-call 与 gate-skip，一条 attempt 都没有", async () => {
-    // `git log` 在内建的信息损失表里（`--oneline -20` 与原生逐字节相同），闸门在 spawn 之前就拒。
+    // `aws` 是内建拒绝表里**唯一**剩下的一条（退出码换含义：命令不存在时原生 127、rtk 回 1），
+    // 闸门在 spawn 之前就拒。`git log` 之类不再被拒——它们的输出变短是缩略该做的事。
     const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_GIT_STATUS }]);
     try {
       const host = await startPrefixHost();
-      await host.withAgent().execute({ command: GIT_LOG }, exec(GIT_LOG));
+      await host.withAgent().execute({ command: AWS_S3_LS }, exec(AWS_S3_LS));
       assert.deepEqual(kindsOf(host.prefixRecords), [KIND_BASH_CALL, KIND_GATE_SKIP]);
       const skip = at(host.prefixRecords, 1, KIND_GATE_SKIP);
       assert.equal(skip.kind === KIND_GATE_SKIP && skip.reason, "deny-table");
-      assert.equal(skip.kind === KIND_GATE_SKIP && skip.commandFamily, GIT_LOG_FAMILY);
+      assert.equal(skip.kind === KIND_GATE_SKIP && skip.commandFamily, AWS_FAMILY);
       // 没 spawn 过：跳过是真的跳过，不是「跑了再丢结论」。
       assert.equal(rtk.spawned(), 0);
     } finally {

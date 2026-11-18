@@ -115,7 +115,7 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 | `enabled` | 未设置 | 总开关；未设置时检测到受支持的 rtk 才默认开启 |
 | `enabledForms` | `['prefix']` | 允许生效的形态；下一次工具调用即生效 |
 | `denyCommands` | `[]` | 额外永不被改写的命令模式 |
-| `enabledFilters` | `['cargo-test','pytest','ctest']` | 允许生效的 pipe filter |
+| `enabledFilters` | `['git-log','git-diff','git-status','grep','find','vitest']` | 允许生效的 pipe filter。`git-log`/`git-diff`/`git-status`/`grep`/`find` 是命令改写仍有形态交不回来的那几条，结果压缩是唯一机会。`vitest` 覆盖 `vitest run` 与 **rtk 改不动**的 `pnpm test`/`npm test`/`yarn test`（rtk 的规则要求显式 `run`）；这一路完全不调 rtk——由插件自己删掉通过行（`✓`），因为 rtk 的 vitest 解析器在 vitest 5 上拿不到可用结果。`cargo-test`/`pytest`/`ctest` 默认关闭：它们会被改写成 `rtk <cmd>`，再让 pipe 压一遍只会命中「已被改写过」 |
 | `minBytes` | `256` | 小于它的输出永不压缩 |
 | `minGainRatio` | `0.95` | 压缩后仍占 ≥95% 字节的，丢弃 |
 | `stdoutCapBytes` | `64000` | filter 回执的字节上限：压缩后的正文截尾到这个字节数（退出标记保留） |
@@ -124,7 +124,7 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 | `pipeTimeoutMs` | `3000` | 重启生效 |
 | `rewriteTimeoutMs` | `2000` | 重启生效 |
 | `rewriteCacheSize` | `256` | 重启生效 |
-| `vitestMaxMajor` | `5` | 重启生效；vitest 达到该主版本就不压 |
+| `vitestMaxMajor` | `5` | 重启生效；命令改写侧达到该主版本就不改写 vitest（`enabledFilters` 里的 `vitest` 那一路不受它管——它不调 rtk，没有版本门） |
 | `logFilterMode` | `'off'` | 重启生效 |
 
 配置 schema 共 14 个字段；其中 13 个带内置默认值，`enabled` 在显式设置前跟随 rtk 就绪状态。其中卡上那 9 枚是 volatile —— 设置卡写它们，下一次工具调用就生效，`enabledForms` 也在其中。剩下的**非 volatile 部署值**，共 5 枚，在装配时读一次，改完要重启。
@@ -138,7 +138,7 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 - **KPI 行**：调用、尝试、成功、覆盖率（pipe）或成功率（prefix）、节省 token、节省率。
 - **组合图**：柱是每桶省下的 token，折线是节省率或覆盖率，双轴。**不足三天退回柱状图**——两个点连出来的线不是趋势，是误导。
 - **为什么这次没压**：最近一条事件 + 窗口内的原因 Top。
-- **明细表**：prefix 按命令家族与工作目录，pipe 按 filter、命令家族与工作目录。
+- **明细表**：prefix 按被改写的那几段折出的命令家族与工作目录，pipe 按 filter、命令家族与工作目录。复合命令只算真的被加过 `rtk` 的段——rtk 的账本本身就是一段一行，`cd x && rtk git diff && rtk cargo test` 落成 `git diff` 与 `cargo test` 两行，`cd x` 没有行。
 - **建议区**：低收益 filter、已启用却从没命中、没启用但明显可压、低收益命令家族。
 - **数据说明**：起始日，以及读不到账本时的具体原因（只读沙箱、库不存在、读坏了、形状不对）。
 
@@ -167,9 +167,9 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 - **`rtk rewrite` 分不清某个 flag 是不是在要更多细节。** 它把 `cargo test -- --nocapture` 和 `pytest -vv` 跟安静形态一样改写，细节随后被压掉。插件拒绝改写任何带详情 flag 的命令；真压的时候，损失由护栏兜住，不由 rtk 兜。
 - **`npm run <script>` 永不被改写。** rtk 把脚本名映射成工具名（`npm run lint` → `rtk lint`），那会跑 ESLint 而不是你的脚本。插件会丢掉任何「从原命令里拿掉了某个词」的改写。
 - **listing 类命令会折叠。** `ls`、`find`、`grep`/`rg` 可能把长列表换成 `+N more` 标记；护栏识别这一族标记并拒绝压缩，所以折叠后的列表不会经本插件到达模型。
-- **审批看到的是你请求的命令，不是改写后的命令。** 遮蔽层在 `execute` 里改 `args.command`，而 `execute` 跑在管线的 `tools/pre-execute` **之后**。所以通用命令审批（auto-review、danger-guard、Claude Code 风格的 hooks）求值的是冻结的原始参数（`cargo test`），实际跑的是改写形态（`rtk cargo test`）。沙箱升档审批在 `orig.execute` **之内**，原样保留——插件从不自己 spawn 命令。补在这道缝前面的三样减法由插件负责：信息损失拒绝表（`git diff` / `git log` / `git show <ref>` / `ls` / `find` / `grep` / `rg` / `cargo clippy` / `aws`）、P1~P4 改写校验（只允许剥前缀、不许丢脚本运行词）、以及 vitest 主版本门控。危险命令（`rm -rf`、`git push --force`）根本不在 rtk 的改写面里，因此原样执行、原样受审——danger-guard 没有被绕过。
-- **复合命令里任意一段命中拒绝表，整条都原样执行。** 拒绝表（`git diff` / `git log` / `ls` / `find` / `grep` / `rg` / `cargo clippy` / `aws` 等）与 vitest 主版本门控都按**段**判，因为 `cd x && git diff` 的首词是 `cd`——按整条判会让整张表失效。但命中之后不拆开执行：用户敲 `cd X && git status` 时预期是一次完整执行，替他把前半段交出去、后半段自己拼不是插件该做的事。
-- **`rtk pipe` 处理失败的 pytest 时保住用例名，但不一定保住断言正文。** 护栏检查「有没有成功声明」与「失败行还在不在」；一个两者都过、却仍然丢了细节的 filter 输出，是 filter 的已知边界，不是护栏的。
+- **审批看到的是你请求的命令，不是改写后的命令。** 遮蔽层在 `execute` 里改 `args.command`，而 `execute` 跑在管线的 `tools/pre-execute` **之后**。所以通用命令审批（auto-review、danger-guard、Claude Code 风格的 hooks）求值的是冻结的原始参数（`cargo test`），实际跑的是改写形态（`rtk cargo test`）。沙箱升档审批在 `orig.execute` **之内**，原样保留——插件从不自己 spawn 命令。补在这道缝前面的三样减法由插件负责：拒绝表（只剩 `aws` 一条——改写会让退出码变含义：命令不存在时原生 127、经 rtk 是 1）、P1~P4 改写校验（只允许剥前缀、不许丢脚本运行词）、以及 vitest 主版本门控。危险命令（`rm -rf`、`git push --force`）根本不在 rtk 的改写面里，因此原样执行、原样受审——danger-guard 没有被绕过。
+- **过不了闸门的那一段被还原回去，其余段照样改写。** `cd x && aws s3 ls && cargo test` 会变成 `cd x && aws s3 ls && rtk cargo test`：rtk 会把每一段它认得的都加上前缀，所以插件把那几段原样放回，而不是整条交回。闸门按**段**判，因为 `cd x && git diff` 的首词是 `cd`——按整条判会让整张表失效。它不再做的事是「因为输出会变短就拒绝改写」：`git diff` / `git log` / `ls` / `find` / `grep` 现在照常改写，「输出变短」这个问题归压缩形态管。
+- **`rtk pipe` 处理失败的 pytest 时保住用例名，但不一定保住断言正文。** 护栏检查「有没有成功声明」与「失败行还在不在」；一个两者都过、却仍然丢了细节的 filter 输出，是 filter 的已知边界，不是护栏的。vitest 那一路不调 rtk，所以不受这条限制（见上面的 `enabledFilters`）。
 
 ## <img src="https://api.iconify.design/lucide/wrench.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 开发
 

@@ -326,6 +326,29 @@ describe("c 形态", () => {
       }
     });
 
+    it("复合命令里有一段过不了闸门时：只还原那一段，其余段照样改写", async () => {
+      // 用户裁定（2026-11）：默认形态是「rtk 支持什么就改写什么」，所以 `git diff` 这类
+      // 被放进改写范围；但 `aws` 仍要拦（命令不存在时退出码 127 变 1，结论会变错）。
+      //
+      // `rtk rewrite` 自己是逐段改写的，它会把 `aws s3 ls` 也加上前缀（实测两段都加），
+      // 所以「整条交出去」之后必须由 `restoreGatedSegments` 把那一段收回原文——这一格钉的
+      // 就是那个还原：转调出去的命令是 `aws s3 ls && rtk cargo test`，不是 rtk 的原文。
+      const compound = "aws s3 ls && cargo test";
+      const rtkSays = "rtk aws s3 ls && rtk cargo test";
+      const restored = "aws s3 ls && rtk cargo test";
+      const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: rtkSays }]);
+      try {
+        const host = await startPrefixHost();
+        await host
+          .withAgent()
+          .execute({ command: compound }, exec({ arguments: { command: compound } }));
+        assert.equal(rtk.spawned(), 1);
+        assert.deepEqual(host.fake.received, [restored]);
+      } finally {
+        rtk.restore();
+      }
+    });
+
     it("复合命令的改写被拆开/换分隔符时不采用（校验层按段拦）", async () => {
       // 反向判据：产物把两段并成一段（`not-segmentable`）时，命令必须原样执行——
       // 「按段校验」这个改动的全部意义就在这一格。

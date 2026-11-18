@@ -210,6 +210,20 @@ describe("kpi 行", () => {
     );
   });
 
+  it("只有前三格带整数原值：动画目标值不能从短写反解析", () => {
+    const rows = kpiRowsOf(TOTALS, "pipe");
+    // 前三格是次数（可数整数），组件拿 `count` 做数字滚动；
+    // 后三格是百分比与短写 token，反解析 `4.0k` 回来只是近似，不给 `count`。
+    assert.deepEqual(
+      rows.map((row) => row.count),
+      [120, 40, 12, undefined, undefined, undefined],
+    );
+    // 两项必须能对上：`count` 是动画的落点，`value` 是落定之后要显示的文本。
+    assert.equal(String(rows[0]?.count), rows[0]?.value);
+    assert.equal(String(rows[1]?.count), rows[1]?.value);
+    assert.equal(String(rows[2]?.count), rows[2]?.value);
+  });
+
   it("中间三格的文案按形态换词：改写说尝试/改写成功，压缩说命中/压缩成功", () => {
     const prefix = kpiRowsOf(TOTALS, "prefix");
     const pipe = kpiRowsOf(TOTALS, "pipe");
