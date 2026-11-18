@@ -1,6 +1,6 @@
 {
   "name": "@jayyuen66/dsh-rtk",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "dsh 输出压缩插件（rtk）：遮蔽 bash 加 rtk 前缀 + post-execute pipe 兜底 + 自记账设置卡。",
   "keywords": [
     "compression",
@@ -30,6 +30,7 @@
     "THIRD_PARTY_NOTICES.md",
     "host.js",
     "client.js",
+    "client.insights-echarts.js",
     "cordis.patch.yml"
   ],
   "type": "module",
@@ -68,9 +69,11 @@
     "@deepseek-ai/cordis": "4.1.0",
     "@deepseek-ai/dsh-agent": "0.2.2-rc.2",
     "@deepseek-ai/dsh-client-locale": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.2.2-rc.2",
     "@deepseek-ai/dsh-client-ui-settings": "0.2.2-rc.2",
     "@deepseek-ai/dsh-client-ui-slots": "0.2.2-rc.2",
     "@deepseek-ai/dsh-error": "0.2.2-rc.2",
+    "@deepseek-ai/dsh-home-paths": "0.2.2-rc.2",
     "@deepseek-ai/dsh-llm": "0.2.2-rc.2",
     "@deepseek-ai/dsh-output-retention": "0.2.2-rc.2",
     "@deepseek-ai/dsh-session": "0.2.2-rc.2",
@@ -86,6 +89,7 @@
     "@types/node": "catalog:",
     "@types/react": "catalog:",
     "@vitest/coverage-v8": "catalog:",
+    "echarts": "6.1.0",
     "eslint-plugin-regexp": "catalog:",
     "eslint-plugin-sonarjs": "catalog:",
     "eslint-plugin-zod": "catalog:",
@@ -100,6 +104,7 @@
   },
   "peerDependencies": {
     "@deepseek-ai/dsh": "^0.2.2-rc.2",
+    "@deepseek-ai/dsh-home-paths": "^0.2.2-rc.2",
     "@deepseek-ai/dsh-llm": "^0.2.2-rc.2",
     "@deepseek-ai/dsh-output-retention": "^0.2.2-rc.2",
     "@deepseek-ai/dsh-storage-domain": "^0.2.2-rc.2",

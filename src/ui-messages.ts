@@ -10,21 +10,31 @@ export interface UiMessages {
   /** 设置页左侧一级分区的导航名（`settings.section` 的 label）。 */
   readonly navLabel: string;
   readonly statusSection: string;
-  readonly statsCommands: string;
-  readonly statsSaved: string;
-  /** 按形态分账那行：改写（prefix）与结果压缩（pipe）各自的命令数（spec §6）。 */
-  readonly statsByForm: string;
-  readonly statsSavings: string;
-  /** 图表标题：按 filter 的 token 收益排行。 */
-  readonly statsChartTitle: string;
-  /** 图表口径说明：柱长相对最大项、百分比是占全部节省 token 的比例。 */
-  readonly statsChartHint: string;
-  /** 一条柱子的说明：这张 filter 省了多少 token、占全部省下量的百分之几。 */
-  readonly statsChartRow: string;
-  /** 还没有任何 pipe 记账时的空态（不是错误）。 */
-  readonly statsChartEmpty: string;
+  /** 今日摘要的小标题（只报今天；历史窗口在 Insights 页）。量纲不写在这里：两格各自带单位。 */
+  readonly todayTitle: string;
+  /** 今日摘要里改写形态那一行的标签。 */
+  readonly todayPrefix: string;
+  /** 今日摘要里结果压缩形态那一行的标签。 */
+  readonly todayPipe: string;
+  /** 今日某一形态一次都没被用上时的替换文案（不印三个 0）。 */
+  readonly todayIdle: string;
+  /** 次数那个数字后面的量纲词。 */
+  readonly todayCommandsUnit: string;
+  /** 省下的 token 那个数字后面的量纲词。 */
+  readonly todaySavedUnit: string;
   readonly statsUnavailable: string;
   readonly resetStats: string;
+  /**
+   * 清零的二次确认。四段文案由宿主的 `RiskConfirmation` 消费：标题、正文、勾选项、
+   * 确认按钮，另一枚「取消」与无障碍用的「关闭」也在这里——弹窗没有默认文案，
+   * 少给一个键就是运行期缺字（类型上它们是必填的，所以漏键在这里就编译期红）。
+   */
+  readonly resetConfirmTitle: string;
+  readonly resetConfirmDescription: string;
+  readonly resetConfirmAcknowledge: string;
+  readonly resetConfirmAction: string;
+  readonly resetCancel: string;
+  readonly resetClose: string;
   readonly switchSection: string;
   readonly enabledLabel: string;
   /** 仅改写形态的总开关说明。 */
@@ -71,6 +81,93 @@ export interface UiMessages {
   readonly rtkTooOldHint: string;
   /** 已装且版本够：写出解析到的二进制与版本（README 承诺的「就绪行」就是这一句）。 */
   readonly rtkReadyHint: string;
+
+  // ---- Insights 页（左侧栏一级面板）----
+  /** 侧栏行与页面标题。与设置分区的 `navLabel` 分开：一个进设置列表，一个进侧栏。 */
+  readonly panelLabel: string;
+  readonly tabPrefix: string;
+  readonly tabPipe: string;
+  readonly range7: string;
+  readonly range30: string;
+  readonly range90: string;
+  readonly granularityDay: string;
+  readonly granularityWeek: string;
+  readonly granularityMonth: string;
+  readonly kpiBashCalls: string;
+  readonly kpiAttemptsPrefix: string;
+  readonly kpiAttemptsPipe: string;
+  readonly kpiSucceededPrefix: string;
+  readonly kpiSucceededPipe: string;
+  readonly kpiCoveragePrefix: string;
+  readonly kpiCoveragePipe: string;
+  readonly kpiSaved: string;
+  readonly kpiSavings: string;
+  /** 时间筛选区的标题：窗口与粒度只属于时间，不该和形态页签挤在一行。 */
+  readonly timeFilterLabel: string;
+  /** 两个下拉各自的无障碍名称：`<select>` 不能只有 `data-field`。 */
+  readonly rangeLabel: string;
+  readonly granularityLabel: string;
+  /** 图表加载失败时填进 `loadFailed` 的 `{reason}`：写死英文会漏进中文界面。 */
+  readonly loadFailedChart: string;
+  /** 窗口内该形态一次调用都没有：整页换这一句话，不摊一堆 0。`{form}` 是页签名。 */
+  readonly emptyWindow: string;
+  readonly chartTitle: string;
+  readonly chartEmpty: string;
+  /** 有节省的天少于 3 天时那句说明：只在退柱时出现。 */
+  readonly chartSparseNote: string;
+  /** 「最近一次」那一块的标题：两种形态问的不是同一个问题。 */
+  readonly recentTitlePrefix: string;
+  readonly recentTitlePipe: string;
+  readonly whyNone: string;
+  /** `{status}`/`{family}`/`{reason}`/`{size}` 四个位。 */
+  readonly whyLast: string;
+  /** 同上但省掉 `{reason}`：status 与 reason 说同一件事的那两支（已改写 / 已压缩）用它。 */
+  readonly whyLastPlain: string;
+  /** 没量到字节时用这两条。改写形态量的是指令本身，落库恒为 `unknown`；照模板印出来
+   *  就是「输入 unknown」——没量到就整段不印，不要拿占位词伪装成量到的值。 */
+  readonly whyLastNoSize: string;
+  readonly whyLastPlainNoSize: string;
+  readonly lastCompressed: string;
+  readonly lastSkipped: string;
+  readonly lastRewritten: string;
+  readonly lastFailed: string;
+  /** 改写形态只报平均（日表没留峰值），压缩形态连最大值一起报。 */
+  readonly latencyLabelPrefix: string;
+  readonly latencyLabelPipe: string;
+  readonly dataStartLabel: string;
+  readonly dataStartUnknown: string;
+  readonly loadFailed: string;
+  readonly loadingLabel: string;
+  readonly refresh: string;
+  readonly tableFilters: string;
+  readonly tableCommands: string;
+  readonly tableWorkdirs: string;
+  readonly tableReasons: string;
+  readonly colName: string;
+  readonly colFamily: string;
+  readonly colWorkdir: string;
+  readonly colCommands: string;
+  readonly colSaved: string;
+  readonly colSavings: string;
+  readonly colCoverage: string;
+  readonly colReason: string;
+  readonly colCount: string;
+  readonly tableEmpty: string;
+  readonly reasonsEmpty: string;
+  readonly suggestionsTitle: string;
+  readonly suggestionsEmpty: string;
+  /** 建议区的四种模板：参数由 service 给（`Suggestion.params`），句子在这里拼。
+   *  服务端拼中文的后果是 en 界面整块中文——界面语言只有客户端知道。 */
+  readonly suggestLowYieldFilter: string;
+  readonly suggestUnusedFilter: string;
+  readonly suggestPotentialFilter: string;
+  readonly suggestLowYieldCommand: string;
+  /** 账本/统计不可用的五个原因码。空数组时整行不出现（两个形态都可用）。 */
+  readonly availPrefixReadonly: string;
+  readonly availPrefixMissing: string;
+  readonly availPrefixUnreadable: string;
+  readonly availPrefixSchema: string;
+  readonly availPipeUnavailable: string;
 }
 
 /** 本包的 locale 命名空间。必须与 `cordis.patch.yml` 的 `id` 一致（`rtk`）。 */
@@ -90,16 +187,21 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     cardTitle: "rtk 输出压缩",
     navLabel: "rtk 压缩",
     statusSection: "自记账统计",
-    statsCommands: "已压缩命令",
-    statsSaved: "节省 token",
-    statsByForm: "按形态分账（改写 / 结果压缩）",
-    statsSavings: "节省率",
-    statsChartTitle: "按过滤器省下的 token",
-    statsChartHint: "柱长相对最大项；百分比是这条过滤器在全部节省 token 里占的份额。",
-    statsChartRow: "{filter} · {tokens} 个 token · 占全部节省 {share}%",
-    statsChartEmpty: "还没有按过滤器记账的数据（改写形态看不到输出，这里只会统计结果压缩）",
+    todayTitle: "今日",
+    todayPrefix: "改写命令",
+    todayPipe: "结果压缩",
+    todayIdle: "今天还没有记录",
+    todayCommandsUnit: "次",
+    todaySavedUnit: "token",
     statsUnavailable: "统计读面未连接（压缩本身不受影响）",
     resetStats: "清零统计",
+    resetConfirmTitle: "清零统计？",
+    resetConfirmDescription:
+      "会清掉 dsh 自己的账本（$DSH_HOME/rtk/history.db）里 commands 等五张表的全部记录，以及插件写在同一文件里的 dsh_* 统计表。这里只影响 dsh 会话的统计，你在自己终端里跑的 rtk 与它的全局账本不受影响；此操作不可撤销。",
+    resetConfirmAcknowledge: "我知道这会清掉 dsh 会话的全部统计，且不可撤销",
+    resetConfirmAction: "清零",
+    resetCancel: "取消",
+    resetClose: "关闭",
     switchSection: "开关",
     enabledLabel: "启用 rtk 压缩",
     enabledHintPrefix:
@@ -142,28 +244,106 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     outOfRange: "超出范围",
     invalidFields: "有字段超出范围，先修正或撤销后再保存。",
     statsNote:
-      "统计由插件自记账（rtk pipe 不写 rtk gain）。token 由宿主的 tokenMeter 估算（服务缺席时按 bytes/4），节省率按 token 算；改写形态看不到原始输出，它省下的量请看 rtk gain。",
+      "只统计 dsh 会话：改写量与压缩量的明细都记在 dsh 自己的账本（$DSH_HOME/rtk/history.db）里，rtk 由插件指到该文件，所以你终端里跑的 rtk 与 rtk gain 不受影响、也不计入这里。token 由宿主的 tokenMeter 估算（服务缺席时按 bytes/4），节省率按 token 算。",
     rtkMissingHint:
       "rtk not found：PATH 上找不到 rtk，压缩不会生效。macOS 用 brew install rtk，Windows 用 winget install rtk-ai.rtk。",
     rtkTooOldHint: "探到的 rtk 是 {version}，低于支持的 {minimum}：请升级 rtk 后再打开压缩。",
     rtkReadyHint: "就绪：{version}（{path}）",
+    panelLabel: "rtk 统计",
+    tabPrefix: "命令改写",
+    tabPipe: "结果压缩",
+    range7: "近 7 天",
+    range30: "近 30 天",
+    range90: "近 90 天",
+    granularityDay: "按日",
+    granularityWeek: "按周",
+    granularityMonth: "按月",
+    kpiBashCalls: "bash 调用",
+    kpiAttemptsPrefix: "尝试改写",
+    kpiAttemptsPipe: "命中 filter",
+    kpiSucceededPrefix: "改写成功",
+    kpiSucceededPipe: "压缩成功",
+    kpiCoveragePrefix: "改写覆盖",
+    kpiCoveragePipe: "压缩覆盖",
+    kpiSaved: "节省 token",
+    kpiSavings: "节省率",
+    timeFilterLabel: "时间范围",
+    rangeLabel: "时间范围",
+    granularityLabel: "聚合粒度",
+    loadFailedChart: "图表模块没有加载起来",
+    emptyWindow: "近 {days} 天没有{form}记录。换一个时间范围，或先跑几条命令。",
+    chartTitle: "节省量与比率",
+    chartEmpty: "窗口内还没有数据。跑几条命令再回来。",
+    chartSparseNote: "有节省的时间段不足 3 段：只画柱子，不连折线（连起来会像趋势）。",
+    recentTitlePrefix: "最近一次改写",
+    recentTitlePipe: "最近一次压缩",
+    whyNone: "窗口内还没有任何一次尝试。",
+    whyLast: "{status} · {family} · {reason} · 输入 {size}",
+    whyLastPlain: "{status} · {family} · 输入 {size}",
+    whyLastNoSize: "{status} · {family} · {reason}",
+    whyLastPlainNoSize: "{status} · {family}",
+    lastCompressed: "已压缩",
+    lastSkipped: "已跳过",
+    lastRewritten: "已改写",
+    lastFailed: "已失败",
+    latencyLabelPrefix: "平均改写耗时",
+    latencyLabelPipe: "平均 / 最大耗时",
+    dataStartLabel: "数据起始",
+    dataStartUnknown: "还没有数据",
+    loadFailed: "统计读面没有响应：{reason}",
+    loadingLabel: "读取中…",
+    refresh: "刷新",
+    tableFilters: "按过滤器",
+    tableCommands: "按命令",
+    tableWorkdirs: "按目录",
+    tableReasons: "跳过原因 Top",
+    colName: "过滤器",
+    colFamily: "命令",
+    colWorkdir: "目录",
+    colCommands: "次数",
+    colSaved: "节省 token",
+    colSavings: "节省率",
+    colCoverage: "覆盖率",
+    colReason: "原因",
+    colCount: "次数",
+    tableEmpty: "窗口内没有记录。",
+    reasonsEmpty: "窗口内没有跳过记录。",
+    suggestionsTitle: "建议",
+    suggestionsEmpty: "没有需要调整的项。",
+    suggestLowYieldFilter:
+      "filter {filter} 收益偏低：{days} 天内命中 {attempts} 次，压成 {compressed} 次，只省下 {savingsPct}%。可以关掉它，也可以留着看长尾。配置键：enabledFilters。",
+    suggestUnusedFilter:
+      "filter {filter} 最近 {days} 天没有一条命令命中它。不必急着关——不命中的 filter 没有代价。配置键：enabledFilters。",
+    suggestPotentialFilter:
+      "最近 {days} 天有 {matches} 条命令能命中 {filter}，但它没启用。配置键：enabledFilters。",
+    suggestLowYieldCommand:
+      "{family} 改写收益偏低：{days} 天内改写 {attempts} 次，加权节省 {savingsPct}%。要在这类命令上省时间，得先让输出本身变小。",
+    availPrefixReadonly: "沙箱是只读模式：改写的节省量读不到（改写计数照常）。",
+    availPrefixMissing: "还没有 dsh 的 rtk 账本：这个 host 里还没有发生过一次成功的命令改写。",
+    availPrefixUnreadable: "dsh 的 rtk 账本存在但读不出来（权限、损坏，或另一个进程正占着它）。",
+    availPrefixSchema: "dsh 的 rtk 账本形状不认识（rtk 大版本变了？）。",
+    availPipeUnavailable:
+      "统计库打不开（node:sqlite 不可用或文件损坏）：压缩统计不可用，压缩本身不受影响。",
   },
   en: {
     cardTitle: "rtk output compression",
     navLabel: "rtk compression",
     statusSection: "Self-accounted stats",
-    statsCommands: "Compressed commands",
-    statsSaved: "Tokens saved",
-    statsByForm: "Per form (rewrite / output compression)",
-    statsSavings: "Savings",
-    statsChartTitle: "Tokens saved per filter",
-    statsChartHint:
-      "Bar length is relative to the largest filter; the percentage is that filter's share of all tokens saved.",
-    statsChartRow: "{filter} · {tokens} tokens · {share}% of total saved",
-    statsChartEmpty:
-      "No per-filter records yet (the rewrite form cannot see output, so only output compression is counted here)",
+    todayTitle: "Today",
+    todayPrefix: "Command rewrite",
+    todayPipe: "Output compression",
+    todayIdle: "Nothing recorded today",
+    todayCommandsUnit: "runs",
+    todaySavedUnit: "tokens",
     statsUnavailable: "Stats channel unavailable (compression itself is unaffected)",
     resetStats: "Reset stats",
+    resetConfirmTitle: "Reset the statistics?",
+    resetConfirmDescription:
+      "This deletes every row from the five rtk tables in dsh's own ledger ($DSH_HOME/rtk/history.db — commands and its siblings), plus the dsh_* tables the plugin keeps in the same file. Only dsh sessions are affected: the rtk you run in your own terminal and its global ledger are untouched. There is no undo.",
+    resetConfirmAcknowledge: "I understand this clears all dsh session statistics, with no undo",
+    resetConfirmAction: "Reset",
+    resetCancel: "Cancel",
+    resetClose: "Close",
     switchSection: "Switches",
     enabledLabel: "Enable rtk compression",
     enabledHintPrefix:
@@ -210,11 +390,91 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     outOfRange: "out of range",
     invalidFields: "Some fields are out of range; fix them or revert before saving.",
     statsNote:
-      "Stats are self-accounted by this plugin (rtk pipe does not write rtk gain). Tokens are estimated by the host tokenMeter (bytes/4 when that service is absent) and the savings rate is computed on tokens; the rewrite form never sees the original output — read `rtk gain` for that saving.",
+      "Dsh sessions only: rewrite and compression details both live in dsh's own ledger ($DSH_HOME/rtk/history.db), and the plugin points rtk at that file, so the rtk you run in your own terminal and `rtk gain` are neither affected nor counted here. Tokens are estimated by the host tokenMeter (bytes/4 when that service is absent) and the savings rate is computed on tokens.",
     rtkMissingHint:
       "rtk not found on PATH, so compression cannot run. macOS: brew install rtk. Windows: winget install rtk-ai.rtk.",
     rtkTooOldHint:
       "Found rtk {version}, below the supported {minimum}: upgrade rtk before enabling compression.",
     rtkReadyHint: "Ready: {version} ({path})",
+    panelLabel: "rtk stats",
+    tabPrefix: "Command rewrite",
+    tabPipe: "Output compression",
+    range7: "Last 7 days",
+    range30: "Last 30 days",
+    range90: "Last 90 days",
+    granularityDay: "By day",
+    granularityWeek: "By week",
+    granularityMonth: "By month",
+    kpiBashCalls: "bash calls",
+    kpiAttemptsPrefix: "Rewrite attempts",
+    kpiAttemptsPipe: "Filter hits",
+    kpiSucceededPrefix: "Rewritten",
+    kpiSucceededPipe: "Compressed",
+    kpiCoveragePrefix: "Rewrite coverage",
+    kpiCoveragePipe: "Compression coverage",
+    kpiSaved: "Tokens saved",
+    kpiSavings: "Savings",
+    timeFilterLabel: "Time range",
+    rangeLabel: "Time range",
+    granularityLabel: "Granularity",
+    loadFailedChart: "the chart module did not load",
+    emptyWindow:
+      "No {form} activity in the last {days} days. Try another range, or run a few commands first.",
+    chartTitle: "Tokens saved and rate",
+    chartEmpty: "No data in this window yet. Run a few commands and come back.",
+    chartSparseNote:
+      "Fewer than 3 buckets with savings: bars only, no line (a line would imply a trend that is not there).",
+    recentTitlePrefix: "Latest rewrite",
+    recentTitlePipe: "Latest compression",
+    whyNone: "No attempt in this window yet.",
+    whyLast: "{status} · {family} · {reason} · input {size}",
+    whyLastPlain: "{status} · {family} · input {size}",
+    whyLastNoSize: "{status} · {family} · {reason}",
+    whyLastPlainNoSize: "{status} · {family}",
+    lastCompressed: "compressed",
+    lastSkipped: "skipped",
+    lastRewritten: "rewritten",
+    lastFailed: "failed",
+    latencyLabelPrefix: "Avg rewrite latency",
+    latencyLabelPipe: "Avg / max latency",
+    dataStartLabel: "Data starts",
+    dataStartUnknown: "no data yet",
+    loadFailed: "The stats channel did not respond: {reason}",
+    loadingLabel: "Loading...",
+    refresh: "Refresh",
+    tableFilters: "By filter",
+    tableCommands: "By command",
+    tableWorkdirs: "By directory",
+    tableReasons: "Top skip reasons",
+    colName: "Filter",
+    colFamily: "Command",
+    colWorkdir: "Directory",
+    colCommands: "Calls",
+    colSaved: "Tokens saved",
+    colSavings: "Savings",
+    colCoverage: "Coverage",
+    colReason: "Reason",
+    colCount: "Count",
+    tableEmpty: "No records in this window.",
+    reasonsEmpty: "No skips recorded in this window.",
+    suggestionsTitle: "Suggestions",
+    suggestionsEmpty: "Nothing to adjust.",
+    suggestLowYieldFilter:
+      "Filter {filter} yields little: {attempts} hits in {days} days, {compressed} actually compressed, only {savingsPct}% saved. Turn it off, or keep it for the long tail. Config key: enabledFilters.",
+    suggestUnusedFilter:
+      "Filter {filter} was enabled but nothing matched it in the last {days} days. No rush to disable it — a filter that never matches costs nothing. Config key: enabledFilters.",
+    suggestPotentialFilter:
+      "{matches} commands in the last {days} days could match {filter}, which is not enabled. Config key: enabledFilters.",
+    suggestLowYieldCommand:
+      "Rewriting {family} yields little: {attempts} rewrites in {days} days, {savingsPct}% weighted savings. To save time on these, the output itself has to get smaller.",
+    availPrefixReadonly:
+      "The sandbox is read-only, so rewrite savings cannot be read (counts still work).",
+    availPrefixMissing:
+      "No rtk ledger for dsh yet: no successful rewrite has happened in this host.",
+    availPrefixUnreadable:
+      "The rtk ledger for dsh exists but cannot be read (permissions, corruption, or another process holding it).",
+    availPrefixSchema: "The rtk ledger for dsh has an unrecognised shape (did rtk change majors?).",
+    availPipeUnavailable:
+      "The stats database cannot be opened (node:sqlite missing or file corrupt): compression stats are unavailable, compression itself is unaffected.",
   },
 };

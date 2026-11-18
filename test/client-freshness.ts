@@ -7,7 +7,11 @@
 // client.js 逐字节比对。src 任何变更未重建 → 字节必差 → 红。
 //
 // 用法（各包 test/build-client.test.ts 顶部引入后调用；**必须 await**，理由见那里）：
-//   await declareClientFreshness(import.meta.url)   // 自动定位 ../client.js 与 ../build-client.mjs
+//   await declareClientFreshness(import.meta.url)   // 自动定位产物与 ../build-client.mjs
+//
+// **包内 chunk 一起比**：本仓除 `client.js` 外还有 `client.insights-echarts.js`（ECharts）。
+// 只比入口的话，改完 chunk 的源（`src/insights-echarts.ts`）而没重建时，入口可能恰好不变、
+// 这道门照绿，而浏览器拿到的是上一版的绘图代码——「新鲜」在这里必须是**全部产物**的属性。
 //
 // 注意：buildClient() 必须是确定性构建（同输入同输出）。当前 8 包的
 // build-client.mjs 均不含时间戳/随机数（rollup 无 banner hash 变量），
@@ -29,6 +33,56 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 /** 产物摘要：失败信息只给长度 + 哈希前 12 位，不把数百 KB 正文塞进报告。 */
 function digestOf(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex").slice(0, 12);
+}
+
+/**
+ * 逐件比对包内 chunk。
+ *
+ * 只在 build-client.mjs 导出了 `buildClientFiles` 时才比：不导出的仓没有 chunk，
+ * 这里静默跳过而不是判红——否则这道共用门禁会把「本仓没有 chunk」也当成失败。
+ * @param pkgDir - 包根
+ * @param pkgName - 包名（报错用）
+ * @param mod - 已载入的 build-client.mjs
+ */
+async function assertChunksFresh(
+  pkgDir: string,
+  pkgName: string,
+  mod: { buildClientFiles?: unknown },
+): Promise<void> {
+  if (typeof mod.buildClientFiles !== "function") {
+    return;
+  }
+  const buildAll = mod.buildClientFiles as () => Promise<
+    readonly {
+      readonly fileName: string;
+      readonly text: string;
+    }[]
+  >;
+  const artifacts = await buildAll();
+  // 入口那件在上面已经比过，这里只看 chunk。
+  const chunks = artifacts.filter((artifact) => artifact.fileName !== "client.js");
+  // 一次读齐再逐件比：`for ... await` 会被 `no-await-in-loop` 判红，而这条规则在本仓是硬性的。
+  const onDisk = await Promise.all(
+    chunks.map(async (artifact) => {
+      const target = path.resolve(pkgDir, artifact.fileName);
+      try {
+        return await readFile(target, "utf8");
+      } catch (error: unknown) {
+        throw new Error(
+          `[${pkgName}] ${artifact.fileName} 不存在：这道门读的是 build 的产出，请先运行 node build-client.mjs`,
+          { cause: error },
+        );
+      }
+    }),
+  );
+  for (const [index, artifact] of chunks.entries()) {
+    const text = onDisk[index] ?? "";
+    assert.equal(
+      `${text.length}/${digestOf(text)}`,
+      `${artifact.text.length}/${digestOf(artifact.text)}`,
+      `[${pkgName}] ${artifact.fileName} 已过期：它的源（或依赖）变更后未重建。请运行：cd ${pkgDir} && node build-client.mjs`,
+    );
+  }
 }
 
 /**
@@ -60,10 +114,11 @@ export async function declareClientFreshness(testFileUrl: string): Promise<void>
       // 动态 import 的 .mjs 模块为 any：用类型断言收窄 buildClient 签名（测试
       // 豁免 no-unsafe-type-assertion），避免对 any 的 unsafe 调用/赋值。
       // 载入失败带上下文：报错点在「请先构建」，而不是一句没有路径信息的 ENOENT。
-      let mod: { buildClient?: unknown };
+      let mod: { buildClient?: unknown; buildClientFiles?: unknown };
       try {
         mod = (await import(pathToFileURL(path.resolve(pkgDir, "build-client.mjs")).href)) as {
           buildClient?: unknown;
+          buildClientFiles?: unknown;
         };
       } catch (error: unknown) {
         throw new Error(
@@ -94,6 +149,7 @@ export async function declareClientFreshness(testFileUrl: string): Promise<void>
         );
       }
       if (onDisk === expected) {
+        await assertChunksFresh(pkgDir, pkgName, mod);
         return;
       }
       assert.equal(

@@ -1,4 +1,4 @@
-import { accessSync, constants, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import path from "node:path";
 
 /** 结构性拒绝的四种形态；`rewrite-gate` 把它们折进 `RewriteSkipReason`。 */
@@ -234,12 +234,60 @@ export function pipeStructuralReject(command: string): PipeStructuralReject | un
 }
 
 /**
+ * mode 里有没有任何一个执行位（owner / group / other 任一枚）。
+ *
+ * 用整除取余而不是 `mode & 0o111`：本仓基线禁位运算（`eslint(no-bitwise)`），而这一判的语义
+ * 值得逐位写清楚——权限三元组每组的 4/2/1 里只有 1 是「执行」，所以三组各自的低位只要有一个
+ * 是 1 就算可执行。
+ */
+function hasExecBit(mode: number): boolean {
+  const permission = mode % 0o1000;
+  const owner = Math.floor(permission / 0o100) % 2;
+  const group = Math.floor(permission / 0o010) % 2;
+  const other = permission % 2;
+  return owner + group + other > 0;
+}
+
+/**
+ * 「这个文件算不算可执行」——平台语义在这里分叉，所以单独抽出来。
+ *
+ *   · **POSIX**：看 mode 的执行位（`0o111`）。不用 `accessSync(X_OK)`，理由两条：它对
+ *     **目录**也成立（早先就因此把目录当成了二进制），且它把「当前进程是不是 root」这种
+ *     运行环境带进了判定——同一份目录树换个 uid 就该有同一个答案。mode 位是文件自己的事实。
+ *   · **win32**：NTFS 没有 POSIX 执行位，`chmodSync(file, 0o644)` 之后 `accessSync(X_OK)`
+ *     照样通过（Node 在 win32 上只判「存在且可读」）。那条平台上的约定是「扩展名对 +
+ *     文件存在」，执行位不是判据。
+ *
+ * 抽出来的第二个理由是可测：两条 policy 都能在任何平台上直接跑，测试不必再按宿主 OS 跳过
+ * （早先那条「无执行位就不算」在 Windows 上恒假，只能 `skipIf`）。
+ */
+export function executableOf(platform: NodeJS.Platform): (full: string) => boolean {
+  if (platform === "win32") {
+    return (full) => {
+      try {
+        return statSync(full).isFile();
+      } catch {
+        return false;
+      }
+    };
+  }
+  return (full) => {
+    try {
+      const info = statSync(full);
+      return info.isFile() && hasExecBit(info.mode);
+    } catch {
+      return false;
+    }
+  };
+}
+
+/**
  * 在 PATH 上找**可执行文件**；找不到返回 `undefined`（调用方据此整层不装）。
  *
  * 两判都要，缺一条就会把目录当成二进制：
- *   · `accessSync(X_OK)` 回答「这个路径能不能执行」——**目录也能通过**（POSIX 上目录的
+ *   · 可执行判定（见 `executableOf`）——**目录也能通过 `accessSync(X_OK)`**（POSIX 上目录的
  *     搜索位就是 X）。实测把一个目录命名成 `rtk` 放进 PATH，旧实现把它当成了 rtk。
- *   · `statSync().isFile()` 回答「它到底是不是文件」。
+ *   · `statSync().isFile()` 回答「它到底是不是文件」——两条 policy 里都带着这一判。
  * 少了第二条的后果是静默的：装配期门禁误判「rtk 装好了」，遮蔽层照装，而每次改写 spawn 那个
  * 目录都拿 `EACCES`、fail-open 原样执行；`status().rtkPath` 报出那条伪路径，版本探测又探不到
  * （`supported === null`），于是卡片既不报「没装」也不报「版本过低」——看着一切正常，压缩从不生效。
@@ -247,10 +295,26 @@ export function pipeStructuralReject(command: string): PipeStructuralReject | un
  * `platform` 可注入只为可测：win32 的三档后缀在 POSIX 机器上永远走不到，若把平台判定
  * 焊死在 `process.platform` 上，那一条分支在本仓覆盖率统计里永远是半条，只能靠放宽阈值
  * 或 ignore 注释糊过去——两样这个工作区都不做。
+ *
+ * `executable` 的缺省跟着**宿主**（`process.platform`）而不是 `platform` 参数：这两个参数
+ * 回答的是两个不同的问题。`platform` 说「目标平台上的 rtk 叫什么名字」（`.exe`/`.cmd`/裸名，
+ * 那条机器上 PATH 的约定）；`executable` 说「我脚下这个文件系统怎么算可执行」（POSIX 看
+ * mode 位、NTFS 只看存在）。让后者跟着前者走，等于在 POSIX 机器上假装 win32 时用 NTFS 的
+ * 规则去读 APFS——名字档位测对了，可执行判定却是任何一台真机都不会有的组合。
+ *
+ * `executable` 的缺省读的是**模块加载时**记下的宿主平台（`HOST_EXECUTABLE`），不是调用那一刻的
+ * `process.platform`。这一位有真实牙齿：`process.platform` 是 `configurable` 的，测试里
+ * （`forceShadowPlatform`）会把它改成 `linux` 好让 Windows runner 也跑 C 形态；若缺省跟着
+ * 调用那一刻读，Windows 上的 rtk 就会被 POSIX 的 mode 位判成不可执行——装配期门禁直接 return，
+ * 整层不装，而症状只是「卡片说 rtk 没装」。实测复现过：伪造 win32 加载模块、再把平台改成
+ * linux，`findOnPath("fakebin")` 对一个 0644 文件返回 `undefined`。
  */
+const HOST_EXECUTABLE: (full: string) => boolean = executableOf(process.platform);
+
 export function findOnPath(
   bin: string,
   platform: NodeJS.Platform = process.platform,
+  executable: (full: string) => boolean = HOST_EXECUTABLE,
 ): string | undefined {
   const dirs = (process.env["PATH"] ?? "").split(path.delimiter).filter((each) => each !== "");
   // Windows 的 PATHEXT 常见三档一并在候选里试（`.exe`/`.cmd`，最后一档是裸名）；
@@ -263,14 +327,8 @@ export function findOnPath(
         break;
       }
       const full = path.join(dir, bin + ext);
-      try {
-        accessSync(full, constants.X_OK);
-        // 目录能过 X_OK：同名目录不算找到了二进制。
-        if (statSync(full).isFile()) {
-          found = full;
-        }
-      } catch {
-        // 这一档不可执行：继续试下一个扩展名/目录。
+      if (executable(full)) {
+        found = full;
       }
     }
   }

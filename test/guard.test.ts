@@ -5,6 +5,7 @@
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import { guardCompressed } from "../lib/guard.ts";
+import type { GuardResult } from "../lib/guard.ts";
 
 const CARGO_FILTER = "cargo-test";
 const MIN_GAIN = 0.95;
@@ -21,6 +22,22 @@ function opts(
   filter = CARGO_FILTER,
 ): Parameters<typeof guardCompressed>[0] {
   return { filter, input, output, minGainRatio: MIN_GAIN };
+}
+
+/**
+ * 取「通过」分支的输出。
+ *
+ * 不用 `assert.equal(result.ok, true)` 再 `result.ok && result.output`：断言会把 `ok` 收窄成
+ * 字面量 `true`，后面的 `result.ok &&` 就成了 lint 眼里的恒真条件（`no-unnecessary-condition`）。
+ * 这里用 `if` 做收窄，`assert.fail` 只是把「不该走到」变成一条看得懂的红。
+ * @param result - 护栏结论
+ * @returns 最终要替换进上下文的那一段
+ */
+function accepted(result: GuardResult): string {
+  if (!result.ok) {
+    assert.fail(`guard rejected with ${result.reason}`);
+  }
+  return result.output;
 }
 
 describe("通用护栏", () => {
@@ -264,6 +281,64 @@ describe("listing 类查折叠标记", () => {
       guardCompressed(opts(input, "cargo test: 3 passed\n+5 more", CARGO_FILTER)).ok,
       true,
     );
+  });
+});
+
+describe("failures 题头对账", () => {
+  /**
+   * rtk 的 `FAILURES (N):` 里 N 是**输出行数**而不是失败测试数（它的解析器把失败块里的每个
+   * 非空行都算一条）。模型把 N 读成「失败了 N 个测试」是这行唯一有害的读法，所以护栏在
+   * summary 类收尾时补一句对账。
+   */
+  const BLOCK = "---- fails_one stdout ----\nthread panicked at tests/x.rs:1:1:\n";
+  const TWO_BLOCKS = `${BLOCK}${BLOCK.replace("fails_one", "fails_two")}`;
+  const WRONG_COUNT = `FAILURES (5):\n1. ---- fails_one stdout ----\n2. thread panicked…\n\n… +3 more failures\n`;
+
+  it("块数与题头不符时补一句，说清 N 是行数并给出真正的失败数", () => {
+    const result = guardCompressed(opts(TWO_BLOCKS.repeat(20), WRONG_COUNT));
+
+    // 断言是整段：既要题头还在，也要那句 note 紧跟其后。
+    assert.equal(
+      accepted(result).split("\n").slice(0, 2).join("\n"),
+      `FAILURES (5):\nnote: the count above counts output lines, not failing tests — this run has 40 failing tests, and not every failing block is expanded below.`,
+    );
+  });
+
+  it("块数与题头相等时一个字都不加", () => {
+    const result = guardCompressed(opts(BLOCK, "FAILURES (1):\n1. ---- fails_one stdout ----\n"));
+
+    assert.equal(accepted(result), "FAILURES (1):\n1. ---- fails_one stdout ----\n");
+  });
+
+  it("没有折叠标记时不带「没展开完」那半句", () => {
+    // 同一份输入，但输出里没有 `… +N more failures`：对账照样要补，只是不能声称「下面没展开」。
+    const result = guardCompressed(
+      opts(TWO_BLOCKS.repeat(20), "FAILURES (5):\n1. ---- one ----\n"),
+    );
+
+    assert.equal(
+      accepted(result).split("\n")[1],
+      "note: the count above counts output lines, not failing tests — this run has 40 failing tests.",
+    );
+  });
+
+  it("输入里数不出失败块时放行（不编一个自己没数到的数）", () => {
+    const result = guardCompressed(opts("no blocks here\n".repeat(40), WRONG_COUNT));
+
+    assert.equal(accepted(result).includes("note:"), false);
+  });
+
+  it("没有题头时不碰输出", () => {
+    const result = guardCompressed(opts(TWO_BLOCKS, "cargo test: 2 failed\n"));
+
+    assert.equal(accepted(result), "cargo test: 2 failed\n");
+  });
+
+  it("非 summary 类不补（pytest 的 +N more failures 不是这个形状）", () => {
+    // 用 listing 类的 filter：题头照样不该被改，这条钉的是「只对 summary 生效」。
+    const result = guardCompressed(opts(TWO_BLOCKS, WRONG_COUNT, "git-status"));
+
+    assert.equal(accepted(result).includes("note:"), false);
   });
 });
 

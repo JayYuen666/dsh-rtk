@@ -3,7 +3,7 @@
 // 拖进 host typecheck）。client-entry 只做 React 渲染与 scope 绑定，取值/判定一律落在这里。
 import type { ConfigForm, ConfigFormSnapshot } from "@deepseek-ai/dsh-client-ui-settings/client";
 
-import type { StatsStatus, StatsSummary } from "./stats-shape.ts";
+import type { StatsStatus } from "./stats-shape.ts";
 
 /** 本条目那张表单：`ConfigForm<Record<string, unknown>>`，六个成员全必选（官方声明）。 */
 export type SettingScope = ConfigForm<Record<string, unknown>>;
@@ -234,45 +234,6 @@ export function hintOf(status: StatsStatus | undefined): CardHint | undefined {
     }
   }
   return hint;
-}
-
-/**
- * 图表里的一根柱子。
- *
- * `ratio` 是**相对最长那根**的填充比例（0~1），不是「占总量百分之几」——用后者画图时，
- * 只要没有一条 filter 占到半数以上，所有柱子都会矮到看不出差别。占比那个数照原样随
- * `share` 交给文案，两个数各司其职：柱长给人一眼看出谁最大，百分比给人算得清。
- */
-export interface ChartBar {
-  readonly filter: string;
-  /** 填充比例（0~1），以本组最大值归一。 */
-  readonly ratio: number;
-  /** 这张 filter 省下的 token。 */
-  readonly savedTokens: number;
-  /** 在全部节省 token 里占百分之几（两位小数）。 */
-  readonly share: number;
-}
-
-/**
- * 统计投影 → 图表柱子（按 `savedTokens` 降序，已由 `summarize` 排好）。
- *
- * 全零时给空数组而不是一排 0 长柱子：0 长的柱子与「没有数据」在视觉上一样，但文案不同
- * ——前者该说「这几条过滤器还没省下东西」，后者该说「还没有记录」。
- */
-export function chartBarsOf(summary: StatsSummary | undefined): readonly ChartBar[] {
-  const rows = summary?.topFilters ?? [];
-  let peak = 0;
-  for (const row of rows) {
-    peak = row.savedTokens > peak ? row.savedTokens : peak;
-  }
-  return rows
-    .filter((row) => row.savedTokens > 0 && peak > 0)
-    .map((row) => ({
-      filter: row.filter,
-      ratio: row.savedTokens / peak,
-      savedTokens: row.savedTokens,
-      share: row.sharePct,
-    }));
 }
 
 /**

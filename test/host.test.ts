@@ -15,7 +15,8 @@ import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 // 导入时改名：schema 的值名是 `Config`（首字母大写），直接在用例里 `Config({...})` 调用
 // 会被 `eslint(new-cap)` 判成「大写开头只能当构造函数」。真源仍是同一个导出的值。
-import plugin, { Config as configSchema } from "../host.ts";
+import type { HostContext } from "../host.ts";
+import plugin, { Config as configSchema, sandboxModeOf } from "../host.ts";
 
 /** spec 的十四项终表（九个 volatile + 五个部署级）。 */
 const DEFAULTS = {
@@ -135,11 +136,78 @@ describe("config 默认值", () => {
   });
 });
 
+/**
+ * 只关心 `get` 的宿主替身。
+ *
+ * `HostContext` 的其余四个成员在这个函数里一次都不会被读到，但类型要求它们在位——
+ * 补一组「调用就说明走错了路」的桩，比把整个接口放宽成可选更安全。
+ */
+/** 一旦被调到就说明 `sandboxModeOf` 越界读了别的服务面。 */
+function wrongWay(): never {
+  throw new Error("sandboxModeOf 不该碰 tools / subprocess / workingDirectory / on");
+}
+
+function ctxWith(getter: (name: string) => unknown): HostContext {
+  return {
+    tools: { get: wrongWay },
+    subprocess: { spawn: wrongWay },
+    workingDirectory: { ensure: wrongWay },
+    on: wrongWay,
+    get: getter,
+  };
+}
+
+/** 「服务不在」：带注释的空体，而不是 `() => undefined`（后者会撞 no-useless-undefined）。 */
+const NO_SERVICE = (): undefined => {
+  /* 这个上下文里没有 sandboxPolicy 服务 */
+};
+
+/** 没有 `get` 的那种替身（`HostContext.get` 本身是可选的）。 */
+const noGetter: HostContext = {
+  tools: { get: NO_SERVICE },
+  subprocess: {
+    spawn: () => {
+      throw new Error("不该 spawn");
+    },
+  },
+  workingDirectory: {
+    ensure: () => {
+      throw new Error("不该取工作目录");
+    },
+  },
+  on: () => {
+    /* 这条路径不订阅事件 */
+  },
+};
+
+describe("sandboxModeOf：只读部署模式的读取", () => {
+  it("读到 defaultMode 的字符串", () => {
+    assert.equal(sandboxModeOf(ctxWith(() => ({ defaultMode: "read-only" }))), "read-only");
+  });
+
+  it("上下文没有 get（单测与老宿主）时返回 undefined", () => {
+    // 这一支不是「防御性冗余」：`HostContext.get` 本来就是可选的，不给它的替身
+    // （integration 夹具里有一半是这种）也会走到这里。
+    assert.equal(sandboxModeOf(noGetter), undefined);
+  });
+
+  it("服务缺席、是 null、defaultMode 不是字符串，一律按「不知道」处理", () => {
+    // 三种不给答案的形状统一返回 undefined —— 调用方据此照常去读账本，
+    // 而不是把「不知道」当成「只读」（那会让 prefix 整块显示不可用）。
+    assert.equal(sandboxModeOf(ctxWith(NO_SERVICE)), undefined);
+    assert.equal(sandboxModeOf(ctxWith(() => null)), undefined);
+    assert.equal(sandboxModeOf(ctxWith(() => ({ defaultMode: 5 }))), undefined);
+    assert.equal(sandboxModeOf(ctxWith(() => ({}))), undefined);
+  });
+});
+
 describe("默认导出", () => {
   it("inject 覆盖本插件全部宿主服务依赖", () => {
     assert.deepEqual(
       plugin.inject.toSorted(),
-      ["settings", "storageDomain", "subprocess", "tools", "workingDirectory"].toSorted(),
+      // `storageDomain` 不在其中：Insights 之后统计落在两本自有账本上，宿主的 storage domain
+      // 只用来读一次旧累计账本做迁移，读不到就跳过——它缺席不该让整层装不起来。
+      ["settings", "subprocess", "tools", "workingDirectory"].toSorted(),
     );
   });
 

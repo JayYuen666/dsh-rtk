@@ -98,6 +98,52 @@ function hashSet(text: string): ReadonlySet<string> {
   return new Set(text.match(HASH_RE) ?? EMPTY_HASHES);
 }
 
+/**
+ * rtk 的 `FAILURES (N):` 题头，N 是**输出行数**而不是失败测试数。
+ *
+ * 依据在 rtk 自己的解析器（`src/cmds/rust/cargo_cmd.rs` 的 `parse_cargo_failures`）：进入
+ * `failures:` 段之后，每遇到 `---- xxx stdout ----` 就开一个新条目，**后续每个非空行又各自
+ * 算一个条目**，只有空行才收尾。于是一个失败块（头部 + `panicked at` + 断言 + left/right）
+ * 被切成 2~3 条，题头数字因此大于失败数。
+ *
+ * 实测（本仓 15 失败夹具）：原文 15 个 `---- ` 块，`rtk pipe -f cargo-test` 打出
+ * `FAILURES (31):`；40 失败夹具打出 `(81)`。模型把 31 读成「31 个测试失败」是这行唯一
+ * 有害的读法，所以在它后面补一句对账——**改数字不行**：我们并不知道 rtk 那条解析路径
+ * 每一步的意图，改了就变成「插件编了一个它没验证过的数」。
+ */
+const FAILURES_HEADER = /^FAILURES \((?<count>\d+)\):$/mu;
+
+/** cargo 的失败块头：`---- <测试名> stdout ----`。它的条数就是失败测试数。 */
+const CARGO_FAILURE_BLOCK = /^---- .+ stdout ----$/gmu;
+
+/** rtk 折叠掉后续失败块时留的标记。 */
+const MORE_FAILURES = /^\s*… \+\d+ more failures$/mu;
+
+/**
+ * 在 `FAILURES (N):` 后面补一句对账，说清 N 是什么、以及真正的失败测试数。
+ *
+ * 只在**能对上账**的情况下补：输入里数出了失败块、且块数与 N 不等。数不出来（不是 cargo 的
+ * 形状、或输入被别的工具改过）就原样放行——补一句「我不知道」比不补更吵。
+ * @param input - 压缩前的原文（唯一可靠的事实来源）
+ * @param output - 压缩后的正文
+ * @returns 可能在题头后多一行说明的输出
+ */
+function clarifyFailureCount(input: string, output: string): string {
+  const header = FAILURES_HEADER.exec(output);
+  if (header === null) {
+    return output;
+  }
+  const tests = input.match(CARGO_FAILURE_BLOCK)?.length ?? 0;
+  if (tests === 0 || String(tests) === header.groups?.["count"]) {
+    return output;
+  }
+  const truncated = MORE_FAILURES.test(output)
+    ? ", and not every failing block is expanded below"
+    : "";
+  const note = `note: the count above counts output lines, not failing tests — this run has ${String(tests)} failing tests${truncated}.`;
+  return output.replace(FAILURES_HEADER, `$&\n${note}`);
+}
+
 /** 只折**相邻**重复行：非相邻的 `a b a` 是有信息量的（顺序本身说明问题）。 */
 function collapseAdjacentDuplicates(text: string): string {
   const kept: string[] = [];
@@ -185,7 +231,12 @@ function firstViolation(now: GuardInput, filterClass: FilterClass): string | und
   return GUARD_RULES.find((rule) => rule.violated(now, filterClass))?.reason;
 }
 
-/** 六道判据，任一不通过即拒绝；全通过时按类别决定是否折叠相邻重复行。 */
+/**
+ * 六道判据，任一不通过即拒绝；全通过时按类别决定收尾处理。
+ *
+ * summary 类的收尾有两步：先折相邻重复行（rtk 会把 `test result:` 重复打），再给
+ * `FAILURES (N):` 补一句对账（那个 N 是输出行数，不是失败测试数，见 `clarifyFailureCount`）。
+ */
 export function guardCompressed(options: {
   readonly filter: string;
   readonly input: string;
@@ -195,6 +246,8 @@ export function guardCompressed(options: {
   const filterClass = classOf(options.filter);
   const reason = filterClass === undefined ? "unclassified" : firstViolation(options, filterClass);
   const keep =
-    filterClass === "summary" ? collapseAdjacentDuplicates(options.output) : options.output;
+    filterClass === "summary"
+      ? clarifyFailureCount(options.input, collapseAdjacentDuplicates(options.output))
+      : options.output;
   return reason === undefined ? { ok: true, output: keep } : { ok: false, reason };
 }

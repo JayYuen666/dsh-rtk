@@ -6,7 +6,7 @@
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { buildClient } from "../build-client.mjs";
+import { buildClient, buildClientFiles } from "../build-client.mjs";
 import { declareClientFreshness } from "./client-freshness.ts";
 import { declareSchemaCoverage } from "./schema-coverage.ts";
 
@@ -59,6 +59,40 @@ describe("client 产物", () => {
     assert.match(patch, /^\s*-\s+id:\s*dsh-plugin-shared\s*$/mu);
     assert.match(patch, /^\s+name:\s*"@jayyuen66\/dsh-plugin-shared"\s*$/mu);
     assert.match(patch, /必须保持开启/u);
+  });
+
+  it("平台模块 primitives 被外置（内联会给同一页面装第二份 Modal）", async () => {
+    // `@deepseek-ai/dsh-client-ui-primitives` 是宿主 PLATFORM_MODULES 里的平台模块。它一旦被
+    // 内联进本卡，页面上就有两份 primitives：`Modal` 的 `useModalLayer` 各自维护自己的层级栈，
+    // Escape 只关得掉自己那份，而焦点回归会跳到另一个栈里记的元素上。这条门禁钉的是产物面。
+    const body = await buildClient();
+    assert.match(
+      body,
+      /require\([`"']@deepseek-ai\/dsh-client-ui-primitives[`"']\)/u,
+      "primitives 没被外置：产物里找不到对它的 require",
+    );
+    // 反向：整份组件库不该出现在产物里。
+    assert.ok(!body.includes("acknowledgement"), "primitives 的实现被内联进产物了");
+  });
+
+  it("包内 chunk：ECharts 单独一件产物，入口用字面量 require.async 引用它", async () => {
+    // 这一条盯的是「ECharts 真的不在入口里」。判据分三段，缺任一段都会让某个失败形态静默：
+    // ① 两件产物都在，且 chunk 那件确实带着 Apache 许可头（ECharts 自己 dist 顶部是普通块注释，
+    //    `comments:{legal:true}` 只保 `/*!`，所以这段横幅是我们手写进 chunk 源里的）；
+    // ② 入口里 `require.async` 的实参是**字面量**：宿主按这个串算 chunkId，模板串在构建期
+    //    就被 shared 的 assertChunksReferenced 拦下了，但拦下的时机在打包后，所以这里再钉一次；
+    // ③ 入口产物里不能出现 ECharts 的痕迹，否则「点开才下载」是一句空话。
+    const artifacts = await buildClientFiles();
+    const byName = new Map(artifacts.map((artifact) => [artifact.fileName, artifact.text]));
+    const entry = byName.get("client.js");
+    const chunk = byName.get("client.insights-echarts.js");
+    assert.ok(entry !== undefined, "入口产物缺失");
+    assert.ok(chunk !== undefined, "chunk 产物缺失");
+    assert.ok(chunk.includes("Apache ECharts"), "chunk 里找不到 ECharts 的许可横幅");
+    assert.match(entry, /require\.async\(\s*[`"']\.\/client\.insights-echarts\.js[`"']\s*\)/u);
+    // chunk 外壳要带 `chunk:` 位：宿主按它把 factory 注册成 `<包名>/<文件名>` 而不是覆盖入口。
+    assert.match(chunk, /^\s*chunk:\s*"client\.insights-echarts\.js",$/mu);
+    assert.ok(!entry.includes("Apache ECharts"), "ECharts 被打进入口产物了");
   });
 });
 

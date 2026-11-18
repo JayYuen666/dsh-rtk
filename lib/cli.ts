@@ -9,6 +9,7 @@
  * 单测用桩、生产用真服务，两边都只要求 `spawn` 一个方法。
  */
 import type { SubprocessSpawnSpec } from "@deepseek-ai/dsh-subprocess";
+import { withoutRtkDbEnv } from "./rtk-paths.ts";
 
 /** 一次 spawn 之后本层真正会用的三样东西。 */
 export interface SubprocessFaceHandle {
@@ -86,7 +87,11 @@ export interface RtkRewriteExec {
   readonly signal: AbortSignal;
   /** 调用方的预算（`rewriteTimeoutMs`）：既决定放弃等待，也作为进程管理器的宽限期。 */
   readonly timeoutMs: number;
-  readonly env: Record<string, string>;
+  /**
+   * 装配层造的 env。**值是 `string | undefined`**：`undefined` 在这里是 tombstone，
+   * 用来抹掉父进程里已有的同名变量（见 `withoutRtkDbEnv`）。
+   */
+  readonly env: Record<string, string | undefined>;
   readonly subprocess?: SubprocessFace;
 }
 
@@ -125,7 +130,10 @@ export async function runRtkPipe(options: RtkPipeOptions): Promise<RtkPipeResult
         stderr: { maxBytes: MAX_STDERR_BYTES },
       },
       graceMs: options.timeoutMs,
-      env: { ...RTK_PIPE_ENV },
+      // 与 rewrite 那一路同一条口径（见 `withoutRtkDbEnv`）：`rtk pipe` 本身不记账，但父进程里
+      // 若有人手动导出过 `RTK_DB_PATH`，那它就该像 rewrite 一样被抹掉——压缩行为不该取决于
+      // 一个本插件解释不了的环境变量。
+      env: withoutRtkDbEnv({ ...RTK_PIPE_ENV }),
       signal: controller.signal,
     });
     const outcome = await handle.done;
@@ -164,7 +172,7 @@ export async function runRtkRewrite(exec: RtkRewriteExec): Promise<RtkRewriteRes
           stderr: { maxBytes: MAX_STDERR_BYTES },
         },
         graceMs: exec.timeoutMs,
-        env: { ...exec.env },
+        env: withoutRtkDbEnv(exec.env),
         signal: exec.signal,
       });
       const outcome = await handle.done;

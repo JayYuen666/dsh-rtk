@@ -4,6 +4,8 @@
     "src/**/*.ts",
     "src/**/*.tsx",
     "lib/stats-shape.ts",
+    "lib/insights-view.ts",
+    "lib/insights-shape.ts",
     "lib/card-logic.ts",
     "lib/rtk-version.ts"
   ]

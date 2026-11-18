@@ -124,6 +124,11 @@ describe("runRtkPipe", () => {
     assert.equal(env["RTK_TEE"], "0");
     assert.equal(env["RTK_NO_TOML"], "1");
     assert.equal(env["RTK_TELEMETRY_DISABLED"], "1");
+    // 与 rewrite 同一条口径：父进程里有人导出过 `RTK_DB_PATH` 也抹掉（tombstone 为 undefined）。
+    assert.equal(Object.hasOwn(env, "RTK_DB_PATH"), true);
+    assert.equal(env["RTK_DB_PATH"], undefined);
+    assert.equal(Object.hasOwn(env, "DSH_RTK_DB_PATH"), true);
+    assert.equal(env["DSH_RTK_DB_PATH"], undefined);
     assert.deepEqual(spec.stdio.stdin, { data: "x" });
     // pipe 的宽限期一直是调用方预算（`pipeOpts` 传 3000）。
     assert.equal(spec.graceMs, 3000);
@@ -182,7 +187,14 @@ describe("runRtkRewrite", () => {
     const [spec] = fake.calls;
     assert.ok(spec !== undefined);
     assert.deepEqual(spec.argv, ["rtk", "rewrite", CARGO_TEST]);
-    assert.deepEqual(spec.env, { RTK_REWRITE_HOST: "openclaw" });
+    // 两个 DB 变量是**显式 tombstone**（值是 undefined，不是缺键）：宿主 env 与父进程合并，
+    // 只删键抹不掉 shell 里已存在的 `RTK_DB_PATH`。`deepEqual` 把 undefined 值也算一项，
+    // 所以这三个键必须写全；只写 RTK_REWRITE_HOST 会红。
+    assert.deepEqual(spec.env, {
+      RTK_REWRITE_HOST: "openclaw",
+      RTK_DB_PATH: undefined,
+      DSH_RTK_DB_PATH: undefined,
+    });
   });
 
   it("rewrite 的宽限期等于调用方预算（不写死常量）", async () => {

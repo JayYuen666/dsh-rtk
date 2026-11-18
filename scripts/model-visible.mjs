@@ -282,26 +282,12 @@ async function startListener(options) {
     rewrittenCalls: createRewrittenCalls(8),
     // 定价口径见上面的 `tokenCount`（真装配走 `ctx.tokenMeter`）。
     tokensOf: tokenCount,
-    stats: {
-      load: () => undefined,
-      accumulate: () => undefined,
-      summary: () => ({
-        commands: 0,
-        originalBytes: 0,
-        compressedBytes: 0,
-        savedBytes: 0,
-        originalTokens: 0,
-        compressedTokens: 0,
-        savedTokens: 0,
-        savingsPct: 0,
-        byFilter: {},
-        byForm: { prefix: 0, pipe: 0 },
-        topFilters: [],
-      }),
-      reset: () => Promise.resolve(),
-      flush: () => Promise.resolve(),
-    },
+    // 旧累计账本已退成「只读一次的迁移输入」，组装里不再有写面收件箱；埋点走 `insights`。
     fs: { readFile: () => Promise.resolve("") },
+    // 统计埋点的收件箱：本探针只验「压不压」，一笔账都不落。这一位同样是**必填**
+    // （`PipeDeps` 里没有可选形态），缺席的表现与上面 `log` 那次同形——`safeRecordPipe`
+    // 把异常吞进 catch，压缩照常成功，于是探针会绿着说谎。所以这里靠类型钉住而不是靠跑。
+    insights: { recordPipe: () => undefined },
     // 具名 logger 的两位：本探针不看日志，但**这一位是必填**（`finishCompressed` 在原文没落成
     // 库时会调 `deps.log.warn`）——缺席的后果与 `supported` 那次同形，见上面的注释。
     log: { info: () => undefined, warn: () => undefined },

@@ -1,6 +1,6 @@
-// lib/stats-shape.ts 单测：三份 schema 的字段集与接受/拒绝面，以及命名空间常量的跨产物同源。
+// lib/stats-shape.ts 单测：运行时状态 schema 的字段集与接受/拒绝面，以及命名空间常量的跨产物同源。
 //
-// 为什么单独有这份（而不是只经由 stats-store / stats-reader 间接覆盖）：
+// 为什么单独有这份（而不是只经由 stats-reader 间接覆盖）：
 //
 //   1. `statsStatusSchema` 是宿主与客户端**各自打包**的两份产物之间唯一的形状契约。宿主多交
 //      一位、客户端不认识，线上只表现为卡片少一句话——`supported` 就是这么漏掉过一次（那时
@@ -10,17 +10,13 @@
 //   2. `RTK_STATS_NAMESPACE` 在 `lib/stats-shape.ts` 与 `src/stats-reader.ts` 各有一份字面量
 //      （两份产物独立打包，无法跨产物 import），计划里把「改这里必须同步那边」写成人工纪律。
 //      人工纪律没有门禁——所以这里拿 descriptor 的名称去比常量，改漏一边当场红。
+//
+// 旧累计账本的落盘形状搬去了 `lib/legacy-stats.ts`（Insights 之后它只剩迁移输入这一种用途），
+// 它的形状断言连同「只读一次」的语义一起在 `test/stats-store.test.ts` 里。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 
-import {
-  EMPTY_ACCUMULATOR,
-  RTK_STATS_NAMESPACE,
-  statsAccumulatorSchema,
-  statsStatusSchema,
-  statsSummarySchema,
-  summarize,
-} from "../lib/stats-shape.ts";
+import { RTK_STATS_NAMESPACE, statsStatusSchema } from "../lib/stats-shape.ts";
 import type { StatsStatus } from "../lib/stats-shape.ts";
 import { STATS_DESCRIPTORS } from "../src/stats-reader.ts";
 
@@ -121,91 +117,8 @@ describe("命名空间在宿主与客户端两侧同源", () => {
   });
 });
 
-describe("落盘形状与投影形状的分工", () => {
-  it("派生值只在投影里：落盘 schema 的多余键被剥掉", () => {
-    const parsed = statsAccumulatorSchema.parse({
-      ...EMPTY_ACCUMULATOR,
-      savedBytes: 10,
-      savingsPct: 50,
-    });
-    assert.equal(Object.hasOwn(parsed, "savedBytes"), false);
-    assert.equal(Object.hasOwn(parsed, "savingsPct"), false);
-  });
-
-  it("负数统计被拒（bytes 与 commands 都不可能是负的）", () => {
-    for (const field of ["commands", "originalBytes", "compressedBytes"] as const) {
-      const parsed = statsAccumulatorSchema.safeParse({ ...EMPTY_ACCUMULATOR, [field]: -1 });
-      assert.equal(parsed.success, false, `${field} 收下了 -1`);
-    }
-  });
-
-  it("存量账本没有 token 两列时，topFilters 的占比是 0 而不是 NaN", () => {
-    // 域版本 ≤2 的记录里每条 filter 的 savedTokens 都是 0、总 originalTokens 也是 0。
-    // 除下去是 NaN，而 NaN 会被卡片原样打进 style 宽度（`width: NaN%`）——浏览器静默忽略，
-    // 症状是柱子一根都看不见，且没有任何东西会报错。所以这一格必须单独钉。
-    const summary = summarize({
-      ...EMPTY_ACCUMULATOR,
-      commands: 1,
-      originalBytes: 200,
-      compressedBytes: 100,
-      byFilter: { "cargo-test": { commands: 1, savedBytes: 100, savedTokens: 0 } },
-    });
-    assert.deepEqual(
-      summary.topFilters.map((row) => row.sharePct),
-      [0],
-    );
-    assert.equal(summary.topFilters.length, 1);
-  });
-
-  it("topFilters 的占比是各 filter 在总节省 token 中的份额，合计 100%", () => {
-    // 分母必须是「总节省 token」（originalTokens - compressedTokens），不是总原文 token。
-    // 后者会让所有 filter 的占比之和等于整体节省率，读起来像分布但实际是贡献率。
-    const summary = summarize({
-      ...EMPTY_ACCUMULATOR,
-      originalTokens: 1000,
-      compressedTokens: 600,
-      byFilter: {
-        "cargo-test": { commands: 1, savedBytes: 10, savedTokens: 300 },
-        grep: { commands: 1, savedBytes: 10, savedTokens: 100 },
-      },
-    });
-    assert.deepEqual(
-      summary.topFilters.map((row) => [row.filter, row.sharePct]),
-      [
-        ["cargo-test", 75],
-        ["grep", 25],
-      ],
-    );
-  });
-
-  it("topFilters 按 savedTokens 降序，且最多 6 条", () => {
-    // 只验排序与截断这两件事：卡片拿它直接画柱子，顺序错就是「第二大的柱子更长」。
-    const byFilter = Object.fromEntries(
-      ["f1", "f2", "f3", "f4", "f5", "f6", "f7"].map((filter, index) => [
-        filter,
-        { commands: 1, savedBytes: 10, savedTokens: index * 10 },
-      ]),
-    );
-    const summary = summarize({
-      ...EMPTY_ACCUMULATOR,
-      originalTokens: 1000,
-      compressedTokens: 500,
-      byFilter,
-    });
-    assert.deepEqual(
-      summary.topFilters.map((row) => row.filter),
-      ["f7", "f6", "f5", "f4", "f3", "f2"],
-    );
-  });
-
-  it("summarize 的输出能过投影 schema（两处口径不会分叉）", () => {
-    const summary = summarize({
-      ...EMPTY_ACCUMULATOR,
-      commands: 1,
-      originalBytes: 200,
-      compressedBytes: 100,
-    });
-    const parsed = statsSummarySchema.parse(summary);
-    assert.deepEqual(parsed, summary);
+describe("命名空间常量本身", () => {
+  it("是 camelCase 的 rtkStats：线上路径 /api/rtkStats/<method> 就是它拼出来的", () => {
+    assert.equal(RTK_STATS_NAMESPACE, "rtkStats");
   });
 });

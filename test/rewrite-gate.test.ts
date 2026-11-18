@@ -308,7 +308,25 @@ describe("resolveWorkdir", () => {
 
   it("模型传相对 workdir 时拼在会话 cwd 之后", async () => {
     const fromModel = await resolveWorkdir(headerExec(HEADER_CWD), fromEnsure, "sub/dir");
+    // 只有**中间那一个**分隔符是插件补的：`sub/dir` 里的 `/` 是模型写的原文，原样带走。
+    // 这条断言在 POSIX 上与「两个分隔符都被替换」同形（`/` 恰好等于 sep），所以它自己证明不了
+    // 这一位；下一条用例用双斜杠把两个实现分开，那条在哪个平台都咬得住。
     assert.equal(fromModel, `/from/ensure${path.sep}sub/dir`);
+  });
+
+  it("相对 workdir 是原样追加，不做分隔符归一化", async () => {
+    // 判据：宿主 `resolveWorkdir` 只有一句 `${sessionCwd}${sep}${modelWorkdir}`（`tool-bash`
+    // `src/index.ts:177-183`），插件算出的 cwd 必须与宿主真拿去起进程的那个字符串**逐字节**相同，
+    // 否则 `rtk rewrite` 与 `detectVitestMajor` 会按另一个目录判。`path.join` / `path.resolve`
+    // 会把 `sub//dir` 折成 `sub/dir`，于是「看起来等价、实际换了目录」。
+    //
+    // 双斜杠与尾分隔符在**任何平台**上都把「原样追加」与「归一化」分开，所以这条用例不需要
+    // 依靠 Windows 的 `path.sep === "\\"` 才红——而 `test/prefix-integration.test.ts` 那一处
+    // 断言两次写错都没被本地发现，原因正是它只在 Windows 上红。
+    const withDouble = await resolveWorkdir(headerExec(HEADER_CWD), fromEnsure, "sub//dir");
+    assert.equal(withDouble, `/from/ensure${path.sep}sub//dir`);
+    const withTrailing = await resolveWorkdir(headerExec(HEADER_CWD), fromEnsure, "sub/");
+    assert.equal(withTrailing, `/from/ensure${path.sep}sub/`);
   });
 
   it("模型没传或传了脏值时回会话 cwd（不在 cwd 上猜）", async () => {

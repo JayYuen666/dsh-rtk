@@ -2,7 +2,10 @@ node_modules/
 .toolchain/
 coverage/
 # 构建产物只在包根（build-*.mjs 写到磁盘的位置）：不锚定会把任意子目录里的同名源码和夹具一并忽略。
+# `/client.*.js` 是包内按需 chunk（当前只有 ECharts 那一份）：名字跟着宿主的 chunk 规则走，
+# 将来再加 chunk 不必回来改这一行。
 /client.js
+/client.*.js
 /host.js
 # 误提交高发项：本机凭据/日志与本地构建目录，一律不进库。
 .env

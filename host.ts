@@ -5,6 +5,7 @@
 // 串起来的 Config 与 `apply`。两个 installer 收**取值函数**（`prefixReadersOf` / `pipeReadersOf`
 // 造出来的那一份），不接收已经读好的值——volatile 字段必须在消费点现读，见那两个工厂的注释。
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 import Schema from "@deepseek-ai/schemastery";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -37,10 +38,14 @@ import { hasMethods, isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { claimInstance } from "@jayyuen66/dsh-plugin-shared/lib/instance-lock";
 
 import { RTK_REWRITE_ENV, runRtkPipe, runRtkRewrite } from "./lib/cli.ts";
-import { DEFAULT_ENABLED_FILTERS, filterOf } from "./lib/command-filter.ts";
+import { commandFamilyOf, rewrittenFamilies } from "./lib/command-family.ts";
+import { ALL_FILTERS, DEFAULT_ENABLED_FILTERS, filterOf } from "./lib/command-filter.ts";
 import type { RewrittenCalls } from "./lib/dedup.ts";
 import { createRewrittenCalls, shouldSkipPipe } from "./lib/dedup.ts";
 import { guardCompressed } from "./lib/guard.ts";
+import type { PipeRecord, PipeSkipReason, PrefixRecord } from "./lib/insights-shape.ts";
+import { createInsightsService } from "./lib/insights-service.ts";
+import { createDeferredInsights } from "./lib/insights-sink.ts";
 import { MESSAGES } from "./lib/messages.ts";
 import type { Messages } from "./lib/messages.ts";
 import { findOnPath, pipeStructuralReject } from "./lib/prefix-safety.ts";
@@ -49,11 +54,12 @@ import type { RewriteCache } from "./lib/rewrite-cache.ts";
 import { createRewriteCache } from "./lib/rewrite-cache.ts";
 import { resolveWorkdir, shouldSkipRewrite } from "./lib/rewrite-gate.ts";
 import { verifyRewrite } from "./lib/rewrite-verify.ts";
+import { createRtkLedger, ensureRtkDir, registerRtkWritableRoot } from "./lib/rtk-ledger.ts";
+import { resolveLedgerPaths, withRtkDbPath, withoutRtkDbEnv } from "./lib/rtk-paths.ts";
 import { shapeMatches } from "./lib/shape-precheck.ts";
 import type { StatsStatus } from "./lib/stats-remote.ts";
 import { installStatsRemote } from "./lib/stats-remote.ts";
-import { createDeferredStatsStore } from "./lib/stats-store.ts";
-import type { StatsDomainFacility, StatsStore } from "./lib/stats-store.ts";
+import { loadLegacyAccumulator } from "./lib/stats-store.ts";
 import { capCompressed, spillOriginal } from "./lib/spill.ts";
 import type { SpilledOriginal } from "./lib/spill.ts";
 import { readSpillFullText } from "./lib/spill-read.ts";
@@ -62,6 +68,7 @@ import { extractBody, reassemble } from "./lib/stdout-extract.ts";
 import { tokenPricerOf } from "./lib/tokens.ts";
 import type { TokenPricer } from "./lib/tokens.ts";
 import { MIN_RTK_VERSION, probeRtkVersion } from "./lib/rtk-version.ts";
+import { localDayKey } from "./lib/time-buckets.ts";
 import { detectVitestMajor } from "./lib/vitest-major.ts";
 import { appendWarnHint, isCargoTest } from "./lib/warn-hint.ts";
 
@@ -221,6 +228,15 @@ export interface PrefixOptions {
   /** 诊断日志：非 `undefined` 时每次改写记一行（`logFilterMode` 装配，默认关）。 */
   readonly log: ((line: string) => void) | undefined;
   /**
+   * 故障播报口：**与 `log` 分开**，因为它不该跟着 `logFilterMode` 关掉。
+   *
+   * `log` 是「想不想看每一步决策」的诊断开关（默认关）；这里说的是「这次装配的记账已经
+   * 不可能成功」——目录建不出来、沙箱不给写权限。两者混用一个口时，默认配置下这类故障
+   * 一个字都不留，而它们的症状是「Insights 页永远空白」，从页面侧看不出是没采到还是没数据。
+   * 宿主 logger 在 web 与 headless 下都可读，走它。
+   */
+  readonly warn?: ((line: string) => void) | undefined;
+  /**
    * 探到的 rtk 是否达下限（`undefined` = 还没探完 / 探不到）。
    *
    * **每次调用现读**，不在装配期判一次：探测是异步的，装配那一刻它通常还没回来——按那一刻
@@ -228,6 +244,18 @@ export interface PrefixOptions {
    * `probeVersion` 注释：版本过低 = 压缩不启用，与 spec §7.1、README 的承诺一致）。
    */
   readonly supported: () => boolean | undefined;
+  /**
+   * 本插件的账本路径（`$DSH_HOME/rtk/history.db`，默认 `~/.dsh/rtk/history.db`）。
+   *
+   * 三处用它：① 改写出来的每段 `rtk …` 前面注入 `RTK_DB_PATH` 指到它（rtk 因此只往这里记账）；
+   * ② 自己那几张 `dsh_*` 表写进同一个文件；③ 清零时把两侧一起清。
+   *
+   * **为什么不指向 rtk 的全局账本**：那张 `commands` 表里是用户自己终端跑的全部命令，混进本页
+   * 就会与「只统计 dsh 会话」的计数自相矛盾（用户裁决原话：「数据都只统计 dsh 宿主中的」）。
+   * 空串 = 用户显式关掉了记账：不注入、统计面报不可用。**目录不可建不算空串**——那时照样注入，
+   * 因为拿不到变量 rtk 会写进全局账本（见 `prepareLedgerDir` 的 `LedgerPlan`）。
+   */
+  readonly trackingDbPath: string;
 }
 
 /** 跨调用共享的三份依赖，都在 `apply` 顶部造一次。 */
@@ -236,13 +264,14 @@ export interface PrefixDeps {
   readonly rewriteCache: RewriteCache;
   readonly rewrittenCalls: RewrittenCalls;
   /**
-   * 记一次「改写了一回」（spec §6 的按形态分账：prefix 只记命令数）。
+   * 统计埋点（spec §6 的按形态分账，prefix 侧）。
    *
-   * 从 `PrefixDeps` 而不是 `PrefixOptions` 进来：Options 装的是**配置值**，而这是副作用，
-   * 两者装配时机与测试替身都不一样（Options 在 `installPrefixShadow` 的参数里，deps 在
-   * 遮蔽层的闭包里）。
+   * 收的是**整条 `PrefixRecord`**而不是几个数字：记录形状（含 `ts`）由 `lib/insights-shape.ts`
+   * 定义，装配层只负责在对的时候交出去；把它拆成参数会让「哪几个字段在哪个时刻已知」
+   * 散落在两个文件里。从 `PrefixDeps` 而不是 `PrefixOptions` 进来：Options 装的是**配置值**，
+   * 而这是副作用，两者的装配时机与测试替身都不一样。
    */
-  readonly countRewrite: () => void;
+  readonly insights: { readonly recordPrefix: (input: PrefixRecord) => void };
 }
 
 /**
@@ -280,10 +309,16 @@ function readInvocation(
  *
  * 用 `RTK_REWRITE_ENV` 而不是 pipe 那一套——后者带 `RTK_NO_TOML=1`，会让 TOML-only 的
  * 命令整类失去改写。
+ *
+ * **最后过一遍 `withoutRtkDbEnv`**：用户 shell 里可能有 `RTK_DB_PATH`（有人手动指过全局库），
+ * 而 `rtk rewrite` 只求改写、不记账——把那个变量带进它的子进程等于让行为取决于本插件解释
+ * 不了的环境。剔除用 tombstone 而不是删键：宿主的 env 会与父进程合并（见该函数注释）。
  */
-function rewriteEnv(options: PrefixOptions): Record<string, string> {
+function rewriteEnv(options: PrefixOptions): Record<string, string | undefined> {
   const host = options.rewriteHostEnv();
-  return host === "" ? { ...RTK_REWRITE_ENV } : { ...RTK_REWRITE_ENV, RTK_REWRITE_HOST: host };
+  const base =
+    host === "" ? { ...RTK_REWRITE_ENV } : { ...RTK_REWRITE_ENV, RTK_REWRITE_HOST: host };
+  return withoutRtkDbEnv(base);
 }
 
 /**
@@ -447,6 +482,300 @@ function readLiveAgents(ctx: HostContext): readonly Agent[] {
 }
 
 /**
+ * 账本的两个事实：**往哪注入**，以及**目录核没核过**。
+ *
+ * 这两件事以前合成一个返回值（空串 = 都不做），后果是「目录建不出来」时连注入都不做——而
+ * rtk 拿不到 `RTK_DB_PATH` 就退回它自己 `get_db_path()` 的默认，把 dsh 会话的每一行写进
+ * **用户终端那份全局账本**。实测：`HOME=<空目录> rtk git status` 会在
+ * `~/Library/Application Support/rtk/history.db` 建库并写 1 行。
+ *
+ * 拆开之后各归各的：
+ * - `inject` 只表达「这个库是我们的」，**配了就注入**，哪怕目录还没建出来；
+ * - `writableDir` 表达「目录真能写」，沙箱写根登记与「统计可用」以它为准。
+ *
+ * 为什么注入一个建不出来的目录是对的：rtk 写不进去时**静默丢弃那一行**（实测 exit 0、
+ * stdout 正常、stderr 零字节），命令照跑、账本不脏。少记一行是「统计不可用」，
+ * 记进全局账本则是**污染用户的数据**——两者严重性不在一个量级。
+ */
+interface LedgerPlan {
+  /** 注入 `RTK_DB_PATH` 用的路径；空串 = 用户把 `trackingDbPath` 配空了，本次不碰账本。 */
+  readonly inject: string;
+  /** 核过的目录；undefined = 建不出来，统计会报不可用，也不登记沙箱写根。 */
+  readonly writableDir: string | undefined;
+}
+
+/**
+ * 备好 rtk 账本目录，并交出上面那两个事实。
+ *
+ * 抽成函数只为让 `installPrefixShadow` 的门禁区三行读得懂：平台门 → rtk 门 → 账本门。
+ *
+ * 建目录是**两个写者共同的前提**：rtk 要往 `$DSH_HOME/rtk/history.db` 记账，我们自己的
+ * `dsh_*` 表也落进同一个文件。目录建不出来（只读 home、权限不对）时仍然注入，见 `LedgerPlan`。
+ */
+function prepareLedgerDir(options: PrefixOptions): LedgerPlan {
+  const dbPath = options.trackingDbPath;
+  if (dbPath === "") {
+    return { inject: "", writableDir: undefined };
+  }
+  const dir = path.dirname(dbPath);
+  if (ensureRtkDir(dir)) {
+    return { inject: dbPath, writableDir: dir };
+  }
+  // 两个口都留：`log` 是开了诊断才看的逐步流水，`warn` 是默认就能看到的故障播报。
+  const line = `[rtk] prefix: cannot prepare ${dir}; statistics will report themselves unavailable`;
+  options.log?.(line);
+  options.warn?.(line);
+  return { inject: dbPath, writableDir: undefined };
+}
+
+/**
+ * 记一条统计，**绝不把异常漏进工具执行路径**。
+ *
+ * `InsightsSink` 内部已经包了一层 try/catch，这里再包一层不是重复防御：`deps.insights` 是注入
+ * 进来的（测试会换成随手写的假 sink），而统计是纯派生数据——它写坏了只该少一行数字，
+ * 不该让一条 `cargo test` 失败。两层各自守自己的边界：sink 守存储，这里守装配。
+ */
+function safeRecord(record: () => void, log: ((line: string) => void) | undefined): void {
+  try {
+    record();
+  } catch (error) {
+    log?.(`[rtk] insights: record failed (${String(error)})`);
+  }
+}
+
+/**
+ * `RewriteAttempt` 的失败原因翻成统计口径的四种结局。
+ *
+ * 只有 `timeout` 与 `no-rewrite` 有专名：前者是「太慢」，后者是「rtk 不认识这条命令」，两者的
+ * 用户动作完全不同（调超时 vs 什么都不用做）。其余（`denied` / `exit-N` / `empty-stdout` /
+ * `spawn-failed`）都归 `rewrite-error`——原始原因仍随 `reason` 落库，面板上不丢证据。
+ */
+function outcomeOf(reason: string): "no-rewrite" | "rewrite-error" | "timeout" {
+  if (reason === "timeout") {
+    return "timeout";
+  }
+  return reason === "no-rewrite" ? "no-rewrite" : "rewrite-error";
+}
+
+/**
+ * 改写决策的两种结局。`rewritten` 支把落地所需的全部东西一次带出去：改写后的命令、原始命令、
+ * 转调时要原样回填的其余参数、耗时、被改的家族、以及工作目录（记账要用）。
+ */
+type PrefixPlan =
+  | { readonly kind: "pass-through" }
+  | {
+      readonly kind: "rewritten";
+      readonly command: string;
+      readonly raw: string;
+      readonly forwarded: Record<string, unknown>;
+      readonly latencyMs: number;
+      readonly families: readonly string[];
+      readonly workdir: string;
+    };
+
+/**
+ * `pass-through` 只有一个形状，而且它不可变：共用一份比四处各写一个对象字面量更省，
+ * 也让「哪些出口是直通」在文件里一眼数得出来。
+ */
+const PASS_THROUGH: PrefixPlan = { kind: "pass-through" };
+
+/**
+ * 一次遮蔽调用的判断段：读命令串 → 算工作目录 → 过闸门 → 跑改写 → 校验形状。
+ *
+ * 抽成模块级函数是被 `max-lines-per-function`（120 行）逼出来的，但这条上限在这里不是形式主义：
+ * 下面每一段都是一道独立判据（能不能读、该不该改、改完像不像），挤在一个函数里时最容易
+ * 顺手改错顺序。返回 `pass-through` 的四种结局（读不到命令串、闸门命中、rtk 没给出等价改写、
+ * 校验不过）都已经把统计记完，调用方只需要把控制权交回原实现。
+ */
+async function planPrefixRewrite(
+  ctx: PrefixContext,
+  options: PrefixOptions,
+  deps: PrefixDeps,
+  args: unknown,
+  exec: ToolRunContext,
+): Promise<PrefixPlan> {
+  const invocation = readInvocation(args);
+  const raw = invocation?.command;
+  const commandFamily = raw === undefined ? "unknown" : commandFamilyOf(raw);
+  // 统计口径的**分母**：走到这里的每一次 bash 调用都算一次（enabled/forms/supported 三关
+  // 之前早退的不算——那不是「统计问题」而是「这一层根本没开」）。
+  //
+  // 读不到命令串的调用仍要计（family 落 `unknown`），否则「覆盖率」会把「模型发来的形状
+  // 不对」这一整类悄悄从分母里划掉。`workdir` 在 `prefix-bash-call` 上不参与任何聚合
+  // （`lib/insights-store.ts` 的 `applyPrefix` 对它只跑一条 `SQL_PREFIX_BASH_CALL`），
+  // 所以这里给空串，不为了凑字段去 await 一次工作目录解析。
+  safeRecord(() => {
+    deps.insights.recordPrefix({
+      kind: "prefix-bash-call",
+      ts: Date.now(),
+      commandFamily,
+      workdir: "",
+    });
+  }, options.log);
+  if (raw === undefined || invocation === undefined) {
+    // 没有可读的命令串：不是本插件认得的调用形状，原样交回去。
+    return PASS_THROUGH;
+  }
+  // 第三位是模型这次调用传的 `workdir`：遮蔽层转调原 execute 时 `args` 原样带下去，
+  // 原实现按它跑；插件算 cwd 时不读它就会与「命令实际跑在哪个目录」分叉。
+  const cwd = await resolveWorkdir(
+    exec,
+    async (target) =>
+      isAgent(target) ? ctx.workingDirectory.ensure(target, exec.signal) : undefined,
+    invocation.forwarded["workdir"],
+  );
+  const skip = shouldSkipRewrite(raw, {
+    denyCommands: options.denyCommands(),
+    cwd,
+    vitestMaxMajor: options.vitestMaxMajor,
+  });
+  if (skip !== undefined) {
+    safeRecord(() => {
+      deps.insights.recordPrefix({
+        kind: "prefix-gate-skip",
+        ts: Date.now(),
+        reason: skip,
+        commandFamily,
+        workdir: cwd,
+      });
+    }, options.log);
+    return PASS_THROUGH;
+  }
+  // 改写器按调用造：cache 跨调用共享，而 cwd 每次不同——它既是 spawn 的工作目录，
+  // 也是缓存 key 的一半（rtk rewrite 的退出码取决于从 cwd 向上找到的 .claude/settings*）。
+  const rewriter = createRewriter({
+    cwd,
+    runRewrite: (cmd, signal) =>
+      runRtkRewrite({
+        command: cmd,
+        cwd,
+        signal,
+        timeoutMs: options.rewriteTimeoutMs,
+        env: rewriteEnv(options),
+        subprocess: ctx.subprocess,
+      }),
+    cache: deps.rewriteCache,
+  });
+  // 改写预算 = 调用方 signal 与部署超时「先到的那个」。超时按原样执行（瞬时失败不进缓存），
+  // 绝不让一条慢 rewrite 拖住工具调用。
+  const budget = AbortSignal.any([exec.signal, AbortSignal.timeout(options.rewriteTimeoutMs)]);
+  // 一次改写尝试的计时起点。**只在这一处取**，差值随下面两条结局各记一次——attempt 本身
+  // 不带耗时，否则 store 会把同一次改写的时间加两遍（latency_count 会翻倍）。
+  const startedAt = performance.now();
+  safeRecord(() => {
+    deps.insights.recordPrefix({ kind: "prefix-attempt", ts: Date.now() });
+  }, options.log);
+  const attempt = await rewriter(raw, budget);
+  const latencyMs = Math.max(0, Math.round(performance.now() - startedAt));
+  if (attempt.kind === "original") {
+    safeRecord(() => {
+      deps.insights.recordPrefix({
+        kind: "prefix-outcome",
+        ts: Date.now(),
+        outcome: outcomeOf(attempt.reason),
+        reason: attempt.reason,
+        commandFamily,
+        workdir: cwd,
+        latencyMs,
+      });
+    }, options.log);
+    return PASS_THROUGH;
+  }
+  // P1~P4：改写结果必须只是「在原命令前面加 rtk」那一种形状，其余一律丢弃、原样执行。
+  const rejected = verifyRewrite(raw, attempt.command);
+  if (rejected !== undefined) {
+    safeRecord(() => {
+      deps.insights.recordPrefix({
+        kind: "prefix-outcome",
+        ts: Date.now(),
+        outcome: "verify-rejected",
+        reason: rejected,
+        commandFamily,
+        workdir: cwd,
+        latencyMs,
+      });
+    }, options.log);
+    return PASS_THROUGH;
+  }
+  return {
+    kind: "rewritten",
+    command: attempt.command,
+    raw,
+    forwarded: invocation.forwarded,
+    latencyMs,
+    families: rewrittenFamilies(raw, attempt.command),
+    workdir: cwd,
+  };
+}
+
+/**
+ * 落地段：记账 → 注入账本路径 → 转调原实现 → 补 warn hint。
+ *
+ * 与 `planPrefixRewrite` 的分界是**有没有副作用**：上面那半只做判断与统计，这一半才动记账钩子
+ * 与工具调用。分界的实际收益是下面这几步的顺序要求（mark → 记账 → 转调）集中在一屏里看得见，
+ * 而它们正是最容易写错的地方。
+ */
+async function runShadowedBash(input: {
+  readonly ctx: PrefixContext;
+  readonly options: PrefixOptions;
+  readonly deps: PrefixDeps;
+  readonly orig: ToolDefinition;
+  readonly args: unknown;
+  readonly exec: ToolRunContext;
+  /**
+   * 装配期定下的注入路径（`prepareLedgerDir` 的 `inject`，空串 = 用户把路径配空了）。
+   *
+   * 走装配期那一份、而不是每次现读 `options.trackingDbPath` 原文，是为了让「配了」与「不碰」
+   * 这两个事实在整层里只算一次：原文是「打算用的路径」，而这一位是「本次装配接受的那条」。
+   * 目录建不出来时**它照样有值**（照样注入，理由是 rtk 拿不到变量会写进用户的全局账本），
+   * 那时统计面报不可用、沙箱登记跳过——这三件事各自独立，别把「目录没核过」读成「不注入」。
+   */
+  readonly trackingDbPath: string;
+}): Promise<unknown> {
+  const plan = await planPrefixRewrite(
+    input.ctx,
+    input.options,
+    input.deps,
+    input.args,
+    input.exec,
+  );
+  if (plan.kind === "pass-through") {
+    return input.orig.execute(input.args, input.exec);
+  }
+  const { options, deps, exec } = input;
+  // 记账必须在转调之前：background bash 立即返回，post-execute 可能随后几条语句内就跑；
+  // 写在后面就有「B 先压了、C 的账还没记上」的窗口。
+  deps.rewrittenCalls.mark(exec.callId);
+  // 记账紧跟着 mark：这两个都在「命令真的被改写了」这一支上，而 mark 之后
+  // post-execute 可能立刻拿 callId 去查表，所以顺序只能是 mark → 记账 → count → 转调。
+  safeRecord(() => {
+    deps.insights.recordPrefix({
+      kind: "prefix-rewritten",
+      ts: Date.now(),
+      latencyMs: plan.latencyMs,
+      families: plan.families,
+      workdir: plan.workdir,
+    });
+  }, options.log);
+  options.log?.(`[rtk] rewrite: ${plan.raw} -> ${plan.command}`);
+  // 注入账本路径之后再转发：每段 `rtk …` 前面挂一个 `RTK_DB_PATH='<dsh 库>'`。
+  //
+  // **这是「只统计 dsh 会话」的机制本体**：rtk 按 `get_db_path()` 的第一优先读这个变量，于是
+  // 它把行写进 `$DSH_HOME/rtk/history.db`，而用户自己终端里的 `rtk` 仍写全局那份——两条流从此
+  // 不相交，本页每个数字都只关于 dsh。空串（用户把路径配空了）时不注入，那是显式选择；
+  // **目录建不出来时照样注入**：rtk 写不进去会静默丢掉那一行，而拿不到这个变量它会写进
+  // 用户的全局账本——污染别人的数据比少记一行严重得多。
+  //
+  // 其余参数原样带回，只替换命令这一位（被遮蔽工具的 schema 里可能还有别的字段）。
+  const command = withRtkDbPath(plan.command, input.trackingDbPath);
+  const result = await input.orig.execute({ ...plan.forwarded, command }, exec);
+  if (options.warnHint() && isCargoTest(plan.raw)) {
+    return appendWarnHint(result, deps.messages().cargoTestWarnHint);
+  }
+  return result;
+}
+
+/**
  * C 形态装配：给每个新 agent 在它自己的作用域里注册一个同名的 bash，内部先求改写再转调。
  *
  * 装配期门禁两条，缺一不装：
@@ -483,6 +812,29 @@ export function installPrefixShadow(
   if (findOnPath("rtk") === undefined) {
     return;
   }
+  // 账本目录在这里建：走到这一行才说明「这次装配真的要记账」。
+  //
+  // 建不出来（只读、权限不足、`$DSH_HOME/rtk` 是符号链接）时**注入路径照样保留**——这一点
+  // 与直觉相反，但实测两条路都不好受、只是程度不同：拿不到 `RTK_DB_PATH` 时 rtk 退回自己的
+  // `get_db_path()`，把这一行写进**用户终端用的那份全局账本**（污染别人的数据）；给了变量而
+  // 目录写不进去时它 exit 0、stderr 零字节、**静默丢掉那一行**（最坏少记一次）。所以这里
+  // 保留注入，只把「目录没核过」这件事记在 `writableDir` 上：统计面报不可用、沙箱登记跳过。
+  // 建目录失败**不该**让整层失效：那等于让一个附加功能否决主功能。
+  const ledger = prepareLedgerDir(options);
+  const trackingDbPath = ledger.inject;
+
+  /**
+   * 故障播报：两个口都走一遍。
+   *
+   * `options.log` 只在开了 `logFilterMode` 时存在（诊断开关，默认关），而这里说的是
+   * 「记账这条链已经断了」——默认配置下它必须留下痕迹，否则症状只剩「Insights 页永远空白」。
+   * 混用同一个口的后果是：默认配置里故障与噪音一起消失，用户分不出「没采到」与「没数据」。
+   * @param line - 要留的一句
+   */
+  const report = (line: string): void => {
+    options.log?.(line);
+    options.warn?.(line);
+  };
 
   /**
    * 给一个 agent 装上遮蔽层。
@@ -550,73 +902,7 @@ export function installPrefixShadow(
         ) {
           return orig.execute(args, exec);
         }
-        const invocation = readInvocation(args);
-        if (invocation === undefined) {
-          // 没有可读的命令串：不是本插件认得的调用形状，原样交回去。
-          return orig.execute(args, exec);
-        }
-        const { command } = invocation;
-        // 第三位是模型这次调用传的 `workdir`：遮蔽层转调原 execute 时 `args` 原样带下去，
-        // 原实现按它跑；插件算 cwd 时不读它就会与「命令实际跑在哪个目录」分叉。
-        const cwd = await resolveWorkdir(
-          exec,
-          async (target) =>
-            isAgent(target) ? ctx.workingDirectory.ensure(target, exec.signal) : undefined,
-          invocation.forwarded["workdir"],
-        );
-        const skip = shouldSkipRewrite(command, {
-          denyCommands: options.denyCommands(),
-          cwd,
-          vitestMaxMajor: options.vitestMaxMajor,
-        });
-        if (skip !== undefined) {
-          return orig.execute(args, exec);
-        }
-        // 改写器按调用造：cache 跨调用共享，而 cwd 每次不同——它既是 spawn 的工作目录，
-        // 也是缓存 key 的一半（rtk rewrite 的退出码取决于从 cwd 向上找到的 .claude/settings*）。
-        const rewriter = createRewriter({
-          cwd,
-          runRewrite: (cmd, signal) =>
-            runRtkRewrite({
-              command: cmd,
-              cwd,
-              signal,
-              timeoutMs: options.rewriteTimeoutMs,
-              env: rewriteEnv(options),
-              subprocess: ctx.subprocess,
-            }),
-          cache: deps.rewriteCache,
-        });
-        // 改写预算 = 调用方 signal 与部署超时「先到的那个」。超时按原样执行（瞬时失败不进缓存），
-        // 绝不让一条慢 rewrite 拖住工具调用。
-        const budget = AbortSignal.any([
-          exec.signal,
-          AbortSignal.timeout(options.rewriteTimeoutMs),
-        ]);
-        const attempt = await rewriter(command, budget);
-        if (attempt.kind === "original") {
-          return orig.execute(args, exec);
-        }
-        // P1~P4：改写结果必须只是「在原命令前面加 rtk」那一种形状，其余一律丢弃、原样执行。
-        if (verifyRewrite(command, attempt.command) !== undefined) {
-          return orig.execute(args, exec);
-        }
-        // 记账必须在转调之前：background bash 立即返回，post-execute 可能随后几条语句内就跑；
-        // 写在后面就有「B 先压了、C 的账还没记上」的窗口。
-        deps.rewrittenCalls.mark(exec.callId);
-        // 记账紧跟着 mark：这两个都在「命令真的被改写了」这一支上，而 mark 之后
-        // post-execute 可能立刻拿 callId 去查表，所以顺序只能是 mark → count → 转调。
-        deps.countRewrite();
-        options.log?.(`[rtk] rewrite: ${command} -> ${attempt.command}`);
-        // 其余参数原样带回，只替换命令这一位（被遮蔽工具的 schema 里可能还有别的字段）。
-        const result = await orig.execute(
-          { ...invocation.forwarded, command: attempt.command },
-          exec,
-        );
-        if (options.warnHint() && isCargoTest(command)) {
-          return appendWarnHint(result, deps.messages().cargoTestWarnHint);
-        }
-        return result;
+        return runShadowedBash({ ctx, options, deps, orig, args, exec, trackingDbPath });
       },
     };
     markAsShadow(shadow);
@@ -627,6 +913,14 @@ export function installPrefixShadow(
     // 作用域 fiber，插件卸载时它不会被触发，遮蔽体就留在那里（`probe-scope5` 的 A 行：卸载后
     // `agent` 视图里仍是 `true`）。下一次装配 `installed` 是新的空 Set，于是又去注册，撞
     // `already registered in this scope`。经插件 fiber 转手之后，卸载即回收（同一探针的 B 行）。
+    // 沙箱写许可：账本在 `$DSH_HOME/rtk/`（默认 `~/.dsh/rtk/`），通常在会话工作目录之外，
+    // 而 workspace-write 沙箱只允许写工作目录——不登记的话 rtk 记账会 EACCES 静默失败，用户看到的
+    // Insights 页永远是空的，且没有任何报错。登记的是**目录**（`registerWritableRoot` 拒文件与符号链接）。
+    // 登记是 session 级、runtime-only 的（resume/fork 之后由新一轮装配重新登记）；
+    // read-only 下它照样生效不了，此时前缀节省不可用、pipe 统计照常（spec §3.1）。
+    if (ledger.writableDir !== undefined) {
+      registerRtkWritableRoot(ctx, agent, ledger.writableDir, report);
+    }
     ctx.effect(() => agent.ctx.tools.register(shadow), "rtk: prefix shadow");
   };
 
@@ -701,7 +995,6 @@ export interface PipeOptions {
 export interface PipeDeps {
   readonly messages: () => Messages;
   readonly rewrittenCalls: RewrittenCalls;
-  readonly stats: StatsStore;
   /**
    * 文本 → token 的定价函数（`lib/tokens.ts` 造）。
    *
@@ -713,6 +1006,11 @@ export interface PipeDeps {
   readonly fs: { readonly readFile: (path: string) => Promise<string> };
   /** 具名 logger：原文没落成库时要 warn（那意味着压缩后模型手里没有取回通道）。 */
   readonly log: Log;
+  /**
+   * 统计写面。收整条 `PipeRecord` 而不是几个数字：记录形状由 `lib/insights-shape.ts` 定义，
+   * 这一层不该知道那些字段怎么落库（与 C 形态的 `PrefixDeps.insights` 同款分工）。
+   */
+  readonly insights: { readonly recordPipe: (input: PipeRecord) => void };
 }
 
 /** B 形态单条输入上限：超过它说明用户要的不是这段输出，读进内存只会白占。 */
@@ -804,6 +1102,45 @@ interface PipePlan {
   readonly cwd: string;
   readonly extracted: Extracted;
   readonly input: string;
+  /** 命令家族：面板按它聚合，与 C 形态用的是同一个 `commandFamilyOf`。 */
+  readonly commandFamily: string;
+  /** 模型本来会看到的 token 数（定价函数给的，不是字节数）。 */
+  readonly originalTokens: number;
+  /** 同一个可见面的字节数：可复算的物理量，与 token 各记一次。 */
+  readonly originalBytes: number;
+}
+
+/**
+ * 一条回执的 pipe 判定结果。
+ *
+ * 原先这里返回的是 `PipePlan | undefined`，而 `undefined` 分不出**为什么**不压。面板要按原因
+ * 分账（spec §6.2），诊断日志里那句 `skipped (reason)` 只是给人看的、读不回来。改成分支类型
+ * 之后，「不压」的每一处都必须给一个具名原因：加分支时漏掉原因就编译不过。
+ */
+type PipeDecision =
+  | { readonly kind: "plan"; readonly plan: PipePlan }
+  | {
+      readonly kind: "skip";
+      readonly reason: PipeSkipReason;
+      readonly filter?: string;
+      readonly commandFamily: string;
+      readonly workdir: string;
+      readonly originalTokens?: number;
+      readonly originalBytes?: number;
+    };
+
+/**
+ * 一次判定里与「目录」无关的那部分入参。
+ *
+ * 工作目录要 `await` 才拿得到（`workingDirectory.ensure`），而记录分母那一步（`pipe-bash-call`）
+ * 在它之前就该落——所以监听器入口先拿一份 `BaseContext`，解析出 cwd 之后再升成 `PlanContext`。
+ */
+interface BaseContext {
+  readonly ctx: HostContext;
+  readonly options: PipeOptions;
+  readonly deps: PipeDeps;
+  readonly exec: ToolExecution;
+  readonly result: Readonly<ToolExecutionResult>;
 }
 
 /** `planPipe` 一圈判定的共同入参（参数过五个会被 lint 判红，而这几样本就属于同一次判定）。 */
@@ -813,6 +1150,8 @@ interface PlanContext {
   readonly deps: PipeDeps;
   readonly exec: ToolExecution;
   readonly result: Readonly<ToolExecutionResult>;
+  /** 工作目录：`decide` 解析一次，闸门与 vitest 门共用（两边各解一次会分叉）。 */
+  readonly cwd: string;
 }
 
 /**
@@ -862,96 +1201,178 @@ function vitestAllowed(cwd: string, command: string, maxMajor: number): boolean 
 }
 
 /**
- * 「值得压」的两条量：长度落在 `[minBytes, MAX_PIPE_INPUT]`（按 **UTF-8 字节**）、形态预检通过。
+ * 「值得压」的两条量：长度不低于 `minBytes`（按 **UTF-8 字节**）、形态预检通过。
  *
  * 字节而不是字符：模型可见面里混着中文测试名与 emoji，`String.length` 会把 300 个汉字
  * 当成 300 字节，让「看着够长」的输出被当成太短而白丢收益。
+ *
+ * 上界不在这里判：`pipedPlan` 在算可见面与定价**之前**就要拒掉超大输入，否则一条 10MB 的
+ * 输出会先被完整定一次价再被丢掉。
  */
-function worthPiping(candidate: string, filter: string, options: PipeOptions): boolean {
-  const bytes = Buffer.byteLength(candidate, "utf8");
-  return bytes >= options.minBytes() && bytes <= MAX_PIPE_INPUT && shapeMatches(filter, candidate);
+function worthPiping(
+  candidate: string,
+  filter: string,
+  options: PipeOptions,
+): PipeSkipReason | undefined {
+  let reason: PipeSkipReason | undefined;
+  if (Buffer.byteLength(candidate, "utf8") < options.minBytes()) {
+    reason = "too-small";
+  } else if (!shapeMatches(filter, candidate)) {
+    reason = "shape-mismatch";
+  }
+  return reason;
+}
+
+/** 把一次「不压」装成记录（可选字段用条件展开：`exactOptionalPropertyTypes` 下不能塞 `undefined`）。 */
+function skipRecordOf(decision: Extract<PipeDecision, { kind: "skip" }>, ts: number): PipeRecord {
+  return {
+    kind: "pipe-skip",
+    ts,
+    reason: decision.reason,
+    commandFamily: decision.commandFamily,
+    workdir: decision.workdir,
+    ...(decision.filter === undefined ? {} : { filter: decision.filter }),
+    ...(decision.originalTokens === undefined ? {} : { originalTokens: decision.originalTokens }),
+    ...(decision.originalBytes === undefined ? {} : { originalBytes: decision.originalBytes }),
+  };
+}
+
+/** 记一条 pipe 记录，异常绝不漏进工具执行路径（与 C 形态的 `safeRecord` 同一纪律）。 */
+function safeRecordPipe(
+  deps: PipeDeps,
+  record: () => PipeRecord,
+  log: ((line: string) => void) | undefined,
+): void {
+  try {
+    deps.insights.recordPipe(record());
+  } catch (error) {
+    log?.(`[rtk] insights: record failed (${String(error)})`);
+  }
+}
+
+/** 记一条「这里不压」：`skipRecordOf` 负责把可选字段拼齐。 */
+function recordSkip(input: BaseContext, decision: Extract<PipeDecision, { kind: "skip" }>): void {
+  safeRecordPipe(input.deps, () => skipRecordOf(decision, Date.now()), input.options.log);
 }
 
 /** 回执拆解与输入判据那一段。 */
 async function pipedPlan(
-  input: PlanContext & { readonly filter: string; readonly cwd: string },
-): Promise<PipePlan | undefined> {
-  const { options, deps, result, filter, cwd } = input;
+  input: PlanContext & { readonly filter: string; readonly command: string },
+): Promise<PipeDecision> {
+  const { options, deps, result, filter, command, cwd } = input;
+  const commandFamily = commandFamilyOf(command);
+  const base = { filter, commandFamily, workdir: cwd };
   const extracted = extractBody(result.value);
-  let plan: PipePlan | undefined;
+  let decision: PipeDecision = { kind: "skip", reason: "no-output", ...base };
   if (extracted !== undefined) {
     const candidate = await pipedInput(result.value, extracted, deps.fs);
-    if (candidate !== undefined && worthPiping(candidate, filter, options)) {
-      plan = { filter, cwd, extracted, input: candidate };
+    if (candidate === undefined) {
+      decision = { kind: "skip", reason: "no-output", ...base };
+    } else if (Buffer.byteLength(candidate, "utf8") > MAX_PIPE_INPUT) {
+      // 上界先判：不为一条注定被扔掉的大输出做完整定价。
+      decision = { kind: "skip", reason: "too-large", ...base };
+    } else {
+      const visible = visibleSurface(extracted);
+      const originalBytes = Buffer.byteLength(visible, "utf8");
+      const originalTokens = deps.tokensOf(visible);
+      const reason = worthPiping(candidate, filter, options);
+      decision =
+        reason === undefined
+          ? {
+              kind: "plan",
+              plan: {
+                filter,
+                cwd,
+                extracted,
+                input: candidate,
+                commandFamily,
+                originalTokens,
+                originalBytes,
+              },
+            }
+          : { kind: "skip", reason, ...base, originalTokens, originalBytes };
     }
   }
-  return plan;
+  return decision;
 }
 
 /**
- * filter 拿到了之后的判定：工作目录、vitest 版本门、回执形状、输入长度与形态。
+ * filter 拿到了之后的判定：vitest 版本门，然后交给 `pipedPlan`。
  *
- * 全部走单出口（`let plan` + 末尾 `return plan`）：工作区的 `consistent-return` 把
- * `return undefined` 读成「这一支不返回值」，与 `return plan` 混用会判红；而这条链上
- * 「不通过」有七八处，逐处早退写不进这个规则。
+ * `cwd` 由调用方给（`decide` 解析一次）：vitest 版本门要从这个目录向上找
+ * `node_modules/vitest`，拿错起点会判错主版本——该压的不压，或把 5.x 上会吞输出的
+ * filter 放过去。同一份 cwd 还要进 `PipePlan` 当 spawn 的工作目录。
  */
 async function planForFilter(
   input: PlanContext & { readonly filter: string; readonly command: string },
-): Promise<PipePlan | undefined> {
-  const { ctx, exec, command, filter } = input;
-  // 与 C 形态同一真源：模型按调用传的 `workdir` 优先（宿主 `tool-bash` 也按它跑），
-  // 其次是会话 cwd 的两级兜底。vitest 版本门要从这个目录向上找 `node_modules/vitest`，
-  // 拿错起点会判错主版本——该压的不压，或把 5.x 上会吞输出的 filter 放过去。
-  const cwd = await resolveWorkdir(
-    exec,
-    async (target) =>
-      isAgent(target) ? ctx.workingDirectory.ensure(target, exec.signal) : undefined,
-    readInvocation(exec.arguments)?.forwarded["workdir"],
-  );
-  // vitest 不走版本门就会在 5.x 上把输出压成一句「PASS/FAIL 计数」——实测那条 filter
-  // 在 vitest 5 上只剩 57B，会把失败断言原文丢掉。版本判不出来也按不压处理。
-  let plan: PipePlan | undefined;
-  if (filter !== "vitest" || vitestAllowed(cwd, command, input.options.vitestMaxMajor)) {
-    plan = await pipedPlan({ ...input, cwd });
+): Promise<PipeDecision> {
+  const { filter, command, cwd, options } = input;
+  if (filter === "vitest" && !vitestAllowed(cwd, command, options.vitestMaxMajor)) {
+    return {
+      kind: "skip",
+      reason: "vitest-gate",
+      filter,
+      commandFamily: commandFamilyOf(command),
+      workdir: cwd,
+    };
   }
-  return plan;
+  return pipedPlan(input);
+}
+
+/**
+ * 「这条命令本来能压，但对应的 filter 没启用」——记一次 potential。
+ *
+ * 这是面板里 `potential-filter` 建议的唯一来源：用户看到「cargo-test 有 12 次本可以压」
+ * 才会去把它勾上，而没有这一条时「没命中」与「没启用」在读面上完全一样。
+ */
+function recordPotential(input: PlanContext, command: string): void {
+  const potential = filterOf(command, new Set(ALL_FILTERS));
+  if (potential !== undefined) {
+    const ts = Date.now();
+    safeRecordPipe(
+      input.deps,
+      () => ({ kind: "potential", ts, day: localDayKey(ts), filter: potential, matches: 1 }),
+      input.options.log,
+    );
+  }
 }
 
 /** 命令拿到了之后的判定：共用拒绝层、去重、filter 查表，然后交给 `planForFilter`。 */
 async function planForCommand(
   input: PlanContext & { readonly command: string },
-): Promise<PipePlan | undefined> {
-  const { options, deps, exec, command } = input;
+): Promise<PipeDecision> {
+  const { options, deps, exec, command, cwd } = input;
+  const commandFamily = commandFamilyOf(command);
   // spec §4.2 的拒绝层是**两层共用**的，pipe 层只取对它有意义的那两条（见 `pipeStructuralReject`）。
   // `detail-flag` 是**承重**的那一条：`cargo test -- --nocapture` 命中 cargo-test 这一行，
   // 缺了它 stdout 会被压成一句「1 passed」，`--nocapture` 打出来的整段证据消失（实测 189B→37B、
   // 标记出现 0 次）。`already-rtk` 是保险而非主防线——pipe 表每行都锚 `^`，`rtk cargo test`
   // 本来就命中不了；留着它是因为「表将来若加非锚定行」时这条不能跟着失守。
-  let plan: PipePlan | undefined;
-  if (
-    pipeStructuralReject(command) === undefined &&
-    !shouldSkipPipe({ callId: exec.callId }, options.forms(), deps.rewrittenCalls)
-  ) {
-    // 白名单**在这里现读**（不是装配期快照一份 Set）：`enabledFilters` 标了 volatile，
-    // 用户在卡片上勾掉一个 filter 之后，下一次 post-execute 就该按新集合查表。
-    const filter = filterOf(command, new Set(options.enabledFilters()));
-    if (filter !== undefined) {
-      plan = await planForFilter({ ...input, filter });
-    }
+  if (pipeStructuralReject(command) !== undefined) {
+    return { kind: "skip", reason: "structural-reject", commandFamily, workdir: cwd };
   }
-  return plan;
+  // 这条命令已经被 C 形态改写过：rtk 的那份输出不再适合按原 filter 再压一次。
+  if (shouldSkipPipe({ callId: exec.callId }, options.forms(), deps.rewrittenCalls)) {
+    return { kind: "skip", reason: "already-rewritten", commandFamily, workdir: cwd };
+  }
+  // 白名单**在这里现读**（不是装配期快照一份 Set）：`enabledFilters` 标了 volatile，
+  // 用户在卡片上勾掉一个 filter 之后，下一次 post-execute 就该按新集合查表。
+  const filter = filterOf(command, new Set(options.enabledFilters()));
+  if (filter === undefined) {
+    recordPotential(input, command);
+    return { kind: "skip", reason: "no-filter", commandFamily, workdir: cwd };
+  }
+  return planForFilter({ ...input, filter });
 }
 
-/** 把一条回执喂给 pipe 之前要过的全部判据。每一条不通过都返回 `undefined`（= 原样放行）。 */
-async function planPipe(input: PlanContext): Promise<PipePlan | undefined> {
+/** 把一条回执喂给 pipe 之前要过的全部判据。 */
+async function planPipe(input: PlanContext): Promise<PipeDecision> {
   const invocation = readInvocation(input.exec.arguments);
-  // `readInvocation` 已经保证「拿到了就一定有字符串 command」，所以这里判的是它自己有没有值，
-  // 不再对 `invocation.command` 判一次（那一判的另一支从外部永远取不到）。
-  let plan: PipePlan | undefined;
-  if (invocation !== undefined) {
-    plan = await planForCommand({ ...input, command: invocation.command });
+  // `readInvocation` 已经保证「拿到了就一定有字符串 command」，所以这里判的是它有没有值。
+  if (invocation === undefined) {
+    return { kind: "skip", reason: "no-command", commandFamily: "unknown", workdir: input.cwd };
   }
-  return plan;
+  return planForCommand({ ...input, command: invocation.command });
 }
 
 /** `renderCompressed` 的入参：同一次判定的产物 + 谁在调用。 */
@@ -965,9 +1386,13 @@ interface RenderInput {
 
 /** 压成功之后：落 spill、记账、拼回原形状。 */
 async function finishCompressed(
-  input: RenderInput & { readonly visible: string; readonly output: string },
+  input: RenderInput & {
+    readonly visible: string;
+    readonly output: string;
+    readonly latencyMs: number;
+  },
 ): Promise<PostToolDecision | undefined> {
-  const { ctx, options, deps, exec, plan, visible, output } = input;
+  const { ctx, options, deps, exec, plan, visible, output, latencyMs } = input;
   const capped = capCompressed(output, options.stdoutCapBytes());
   // 原文落 spill 用的 owner 是会话 id：`Agent.id` 就是 `SessionId`，不必绕去 header。
   const sessionId = isAgent(exec.agent) ? exec.agent.id : undefined;
@@ -992,16 +1417,28 @@ async function finishCompressed(
   } else if (options.log !== undefined) {
     options.log(`[rtk] spill: saved ${spilled.locator}`);
   }
-  deps.stats.accumulate({
-    form: "pipe",
-    filter: plan.filter,
-    originalBytes: Buffer.byteLength(visible, "utf8"),
-    compressedBytes: Buffer.byteLength(capped, "utf8"),
-    // token 与字节各算一次：宿主扣钱按前者、可复算的物理量是后者。两侧都用同一个定价函数，
-    // 「省下多少」才是同一把尺子量出来的（`savedTokens` 与 `savedBytes` 因此不会互相矛盾）。
-    originalTokens: deps.tokensOf(visible),
-    compressedTokens: deps.tokensOf(capped),
-  });
+  const originalBytes = Buffer.byteLength(visible, "utf8");
+  const compressedBytes = Buffer.byteLength(capped, "utf8");
+  // token 与字节各算一次：宿主扣钱按前者、可复算的物理量是后者。两侧都用同一个定价函数，
+  // 「省下多少」才是同一把尺子量出来的（`savedTokens` 与 `savedBytes` 因此不会互相矛盾）。
+  const compressedTokens = deps.tokensOf(capped);
+  safeRecordPipe(
+    deps,
+    () => ({
+      kind: "pipe-success",
+      ts: Date.now(),
+      filter: plan.filter,
+      commandFamily: plan.commandFamily,
+      workdir: plan.cwd,
+      originalTokens: plan.originalTokens,
+      compressedTokens,
+      savedTokens: plan.originalTokens - compressedTokens,
+      originalBytes,
+      compressedBytes,
+      latencyMs,
+    }),
+    options.log,
+  );
   const rebuilt = reassemble(plan.extracted, capped);
   let accepted: PostToolDecision | undefined;
   /* v8 ignore next —— `reassemble` 只会把 JSON 值原样传回或包一层 `{...value, stdout}`，
@@ -1022,7 +1459,7 @@ async function finishCompressed(
 
 /** pipe 成功了：过护栏，然后交给 `finishCompressed`。 */
 async function acceptCompressed(
-  input: RenderInput & { readonly piped: string },
+  input: RenderInput & { readonly piped: string; readonly latencyMs: number },
 ): Promise<PostToolDecision | undefined> {
   const visible = visibleSurface(input.plan.extracted);
   const guarded = guardCompressed({
@@ -1040,6 +1477,21 @@ async function acceptCompressed(
   } else {
     // 护栏拒是最值得记的一格：用户开诊断日志通常就是为了问「为什么这次没压」。
     input.options.log?.(`[rtk] pipe ${input.plan.filter}: skipped (${guarded.reason})`);
+    safeRecordPipe(
+      input.deps,
+      () => ({
+        kind: "pipe-skip",
+        ts: Date.now(),
+        reason: `guard:${guarded.reason}`,
+        filter: input.plan.filter,
+        commandFamily: input.plan.commandFamily,
+        workdir: input.plan.cwd,
+        originalTokens: input.plan.originalTokens,
+        originalBytes: input.plan.originalBytes,
+        latencyMs: input.latencyMs,
+      }),
+      input.options.log,
+    );
   }
   return accepted;
 }
@@ -1051,6 +1503,9 @@ async function acceptCompressed(
  */
 async function renderCompressed(input: RenderInput): Promise<PostToolDecision | undefined> {
   const { ctx, options, plan } = input;
+  // 计时起点必须在 spawn **之前**：pipe 本身慢是面板里唯一能解释「为什么这条压缩很迟」的量，
+  // 把两行相邻写上量到的永远是 0。
+  const startedAt = performance.now();
   const piped = await runRtkPipe({
     subprocess: ctx.subprocess,
     filter: plan.filter,
@@ -1058,11 +1513,114 @@ async function renderCompressed(input: RenderInput): Promise<PostToolDecision | 
     cwd: plan.cwd,
     timeoutMs: options.pipeTimeoutMs,
   });
+  const latencyMs = Math.max(0, Math.round(performance.now() - startedAt));
   let accepted: PostToolDecision | undefined;
   if (piped.ok) {
-    accepted = await acceptCompressed({ ...input, piped: piped.stdout });
+    accepted = await acceptCompressed({ ...input, piped: piped.stdout, latencyMs });
+  } else {
+    safeRecordPipe(
+      input.deps,
+      () => ({
+        kind: "pipe-skip",
+        ts: Date.now(),
+        reason: "pipe-failed",
+        filter: plan.filter,
+        commandFamily: plan.commandFamily,
+        workdir: plan.cwd,
+        originalTokens: plan.originalTokens,
+        originalBytes: plan.originalBytes,
+        latencyMs,
+      }),
+      options.log,
+    );
   }
   return accepted;
+}
+
+/** B 形态是否该在这一次结果上工作（三枚 volatile 都现读）。 */
+function pipeActiveIn(options: PipeOptions): boolean {
+  return options.enabled() && options.forms().includes("pipe") && options.supported() !== false;
+}
+
+/** 这一次调用是不是承载输出的 shell（只有 bash / pwsh 归 B 形态管）。 */
+function isShellTool(name: string): boolean {
+  return name === "bash" || name === "pwsh";
+}
+
+/**
+ * 记「这次调用发生了什么」并真正动手：分母、跳过原因、压缩三件事都在这里。
+ *
+ * 与 `decide` 拆开是为了让 `decide` 只剩「交给下游、兜异常」这件事——它的 `try/catch` 语义
+ * 与记录顺序是两件互不相干的事，挤在一起时最容易在加分支时改错顺序。
+ */
+async function applyPipeDecision(
+  input: BaseContext,
+  decision: PostToolDecision,
+  fallback: PostToolDecision,
+): Promise<PostToolDecision> {
+  if (!pipeActiveIn(input.options)) {
+    return fallback;
+  }
+  const invocation = readInvocation(input.exec.arguments);
+  const command = invocation?.command ?? "";
+  const commandFamily = commandFamilyOf(command);
+  const { options, deps, exec } = input;
+  if (!isShellTool(exec.name)) {
+    return fallback;
+  }
+  // 工作目录解析一次，闸门（它要拿去跑 `detectVitestMajor`）与 `PipePlan`（spawn 的 cwd）共用。
+  // 与 C 形态同一真源：模型按调用传的 `workdir` 优先，其次是会话 cwd 的两级兜底。
+  const cwd = await resolveWorkdir(
+    exec,
+    async (target) =>
+      isAgent(target) ? input.ctx.workingDirectory.ensure(target, exec.signal) : undefined,
+    invocation?.forwarded["workdir"],
+  );
+  const scoped: PlanContext = { ...input, cwd };
+  safeRecordPipe(
+    deps,
+    () => ({ kind: "pipe-bash-call", ts: Date.now(), commandFamily, workdir: cwd }),
+    options.log,
+  );
+  // **两种「下游接管」分开记**：`block` 是下游拦掉了这次调用，`accept` + `value` 是下游换成了
+  // 另一份输出。对读者是两件事——前者说明有条规则不让它跑，后者说明有人在改这份结果——
+  // 折成同一个 `downstream-value` 之后，跳过原因榜就把「被拦」算进了「被替换」。
+  if (decision.kind !== "accept") {
+    recordSkip(scoped, {
+      kind: "skip",
+      reason: "downstream-block",
+      commandFamily,
+      workdir: cwd,
+    });
+    return fallback;
+  }
+  if (Object.hasOwn(decision, "value")) {
+    // 下游已经换过值：那不是我们能压的那一份，但「有多少结果被下游接管」是读面要的一格。
+    recordSkip(scoped, {
+      kind: "skip",
+      reason: "downstream-value",
+      commandFamily,
+      workdir: cwd,
+    });
+    return fallback;
+  }
+  if (input.result.isError) {
+    recordSkip(scoped, { kind: "skip", reason: "error", commandFamily, workdir: cwd });
+    return fallback;
+  }
+  const pipeDecision = await planPipe(scoped);
+  if (pipeDecision.kind === "skip") {
+    recordSkip(scoped, pipeDecision);
+    return fallback;
+  }
+  const compressed = await renderCompressed({
+    ctx: input.ctx,
+    options,
+    deps,
+    exec,
+    plan: pipeDecision.plan,
+  });
+  return compressed ?? fallback;
 }
 
 /**
@@ -1073,7 +1631,7 @@ async function renderCompressed(input: RenderInput): Promise<PostToolDecision | 
  * 而「换不换」只体现在 `output` 的赋值上（单出口，任何意外都让它保持下游的决定）。
  */
 async function decide(
-  input: PlanContext,
+  input: BaseContext,
   next: () => Promise<PostToolDecision>,
 ): Promise<PostToolDecision> {
   // 改名绕开 `node(callback-return`：那条规则把形参名 `next` 认成 node 风格回调，
@@ -1082,33 +1640,24 @@ async function decide(
   const decision = await upstream();
   let output: PostToolDecision = decision;
   try {
-    // 下游已经换过值：那是它算好的结果，二次改写只会把两边口径搅在一起。
-    //
-    // `enabled` 与 `forms` 都必须在**每次**判定时现读：两者都是 volatile 字段，用户可以在
-    // 卡片上随时开关/切换形态，而这条监听器常驻在栈上。C 形态在 `installPrefixShadow` 的
-    // execute 里也是同一分工。
-    if (
-      input.options.enabled() &&
-      input.options.forms().includes("pipe") &&
-      input.options.supported() !== false &&
-      decision.kind === "accept" &&
-      !Object.hasOwn(decision, "value") &&
-      !input.result.isError &&
-      (input.exec.name === "bash" || input.exec.name === "pwsh")
-    ) {
-      const plan = await planPipe(input);
-      const compressed =
-        plan === undefined ? undefined : await renderCompressed({ ...input, plan });
-      if (compressed !== undefined) {
-        output = compressed;
-      }
-    }
+    output = await applyPipeDecision(input, decision, output);
   } catch (error) {
     // 诊断开关打开时把成因写出来：默认吃掉异常是对的（帮忙不该毁掉这次调用），
     // 但**完全无声**会让「为什么这次没压」变成只能靠猜。
     input.options.log?.(`[rtk] pipe: internal error (${String(error)})`);
     // 监听器抛异常会被 pipeline 收成 isError 结果——那等于「插件想帮忙」反而毁掉这次调用，
     // 所以任何意外都退回下游已经给出的决定。
+    safeRecordPipe(
+      input.deps,
+      () => ({
+        kind: "pipe-skip",
+        ts: Date.now(),
+        reason: "pipe-internal",
+        commandFamily: "unknown",
+        workdir: "",
+      }),
+      input.options.log,
+    );
   }
   return output;
 }
@@ -1241,8 +1790,6 @@ interface InjectedContext {
  */
 export interface HostServices extends HostContext {
   readonly settings: SettingsFace;
-  /** 存储设施本身（不是句柄）：`openStatsTable` 的入参形状就是它的下限。 */
-  readonly storageDomain: StatsDomainFacility;
   readonly get: NonNullable<HostContext["get"]>;
   /**
    * 注入口。回调收到的子上下文**只声明本插件真正用到的那两位**（`settings` 与 `effect`）：
@@ -1278,8 +1825,11 @@ function hasMethod(
 }
 
 /**
- * 六个注入都必须是带相应方法的对象。失败即 `apply` 抛错（fail-fast）：
+ * 五个注入都必须是带相应方法的对象。失败即 `apply` 抛错（fail-fast）：
  * 比「装配成功、某次调用才 undefined」可诊断得多。
+ *
+ * `storageDomain` **不在其中**：Insights 之后统计落在两本自有账本上（SQLite），宿主的
+ * storage domain 只用来读一次旧累计账本，读不到就跳过迁移——它缺席不该让整层装不起来。
  */
 function isRtkHost(value: unknown): value is HostServices {
   if (!isRecord(value)) {
@@ -1290,7 +1840,6 @@ function isRtkHost(value: unknown): value is HostServices {
     hasMethod(value, "tools", ["get"]) &&
     hasMethod(value, "subprocess", ["spawn"]) &&
     hasMethod(value, "workingDirectory", ["ensure"]) &&
-    hasMethod(value, "storageDomain", ["open"]) &&
     typeof value["get"] === "function" &&
     typeof value["on"] === "function" &&
     typeof value["inject"] === "function" &&
@@ -1387,22 +1936,34 @@ export function diagOf(mode: string, log: Log): ((line: string) => void) | undef
 }
 
 /**
- * spec §6 的 prefix 分账：只知道「改写了一次」，字节记不到（原始输出从未流经本插件）。
- * 同样是可测的独立件——把它内联进 `apply` 的 deps 里，就只有真跑改写才走得到。
- */
-export function makeCountRewrite(stats: StatsStore): () => void {
-  return (): void => {
-    stats.accumulate({ form: "prefix" });
-  };
-}
-
-/**
  * 取具名 logger；没有 logger 服务时回退 console。
  *
  * 回退是**兼容路径**而非正常路径：cordis 的 `ctx.logger` 是核心服务，正常装配一定在。
  * 留着它是因为「探测失败要留一条痕迹」这件事不该因为 ctx 异常就整条消失——
  * 那种环境下 console 是唯一还写得到的地方。
  */
+/**
+ * 部署默认的沙箱模式（`read-only` / `workspace-write` / `danger-full-access`）。
+ *
+ * 只读 `defaultMode` 这一位，且**只读不写**：service 用它决定「要不要去读 rtk 账本」，因为
+ * read-only 下 rtk 根本写不进去（spec §9）。会话级 override 有 `registerWritableRoot` 那条
+ * 路承担，这里不重复判——两个来源各说一套时，页面会显示一份没人能复现的口径。
+ *
+ * 结构判定而不是 `as`：这是宿主的可选服务，缺席（单测、老版本）时返回 `undefined`，调用方
+ * 按「不知道」处理，也就是照常去读账本。
+ * @param ctx - 宿主上下文
+ * @returns 模式名，或不知道
+ */
+export function sandboxModeOf(ctx: HostContext): string | undefined {
+  const policy = typeof ctx.get === "function" ? ctx.get("sandboxPolicy") : undefined;
+  // `Reflect.get` 返回 `any`：显式落到 `unknown` 再窄化，否则 `typeof` 之后那条 `undefined`
+  // 会被 `no-unsafe-assignment` 与 `consistent-return` 一起判掉。整段只有一个 return，
+  // 也就避开了「有的分支带值、有的不带」这条判据。
+  const mode: unknown =
+    typeof policy === "object" && policy !== null ? Reflect.get(policy, "defaultMode") : undefined;
+  return typeof mode === "string" ? mode : undefined;
+}
+
 export function loggerOf(ctx: HostContext): Log {
   const facade = typeof ctx.logger === "function" ? ctx.logger("rtk") : undefined;
   const log: Log = facade ?? {
@@ -1414,6 +1975,22 @@ export function loggerOf(ctx: HostContext): Log {
     },
   };
   return log;
+}
+
+/**
+ * 故障播报口：诊断日志之外那一条必须默认可见的通道。
+ *
+ * 三处装配（sink、prefix、service）要的是同一个东西——「记账/读面断了」这句话得进宿主 logger，
+ * 而不是跟着 `logFilterMode` 走。抽成一处不是为了少写几行：三份各自的内联闭包在覆盖率门里是
+ * 三条彼此独立的路径，写成一个函数之后，任何一条走到就证明这一条对，重复的那两条不再各自
+ * 挂着一块测不到的分支。
+ * @param ctx - 宿主上下文
+ * @returns 收一行文本的播报函数
+ */
+function warnSinkOf(ctx: HostContext): (line: string) => void {
+  return (line) => {
+    loggerOf(ctx).warn(line);
+  };
 }
 
 /**
@@ -1466,9 +2043,7 @@ const INSTANCE_LOCK_KEY = "@jayyuen66/dsh-rtk/instance";
  */
 function apply(ctx: unknown, config: Config): void {
   if (!isRtkHost(ctx)) {
-    throw new Error(
-      "[rtk] required services (settings/tools/subprocess/workingDirectory/storageDomain) missing",
-    );
+    throw new Error("[rtk] required services (settings/tools/subprocess/workingDirectory) missing");
   }
   const host = ctx;
 
@@ -1497,15 +2072,44 @@ function apply(ctx: unknown, config: Config): void {
   // 2. 文案 thunk（每次现读 locale 偏好）。
   const messages = createLocaleMessages(host);
 
+  // 2b. 账本位置：`$DSH_HOME/rtk/history.db`，**在装配期解析一次**——`DSH_HOME` 是进程级输入，
+  //     解析它不该出现在每次工具调用的热路径上。这里只算路径、**不建目录**：建目录是这一层
+  //     真的要装（rtk 在、平台支持）之后才该做的事，见 `installPrefixShadow`。
+  //
+  //     落在 dsh 自己家里（而不是 rtk 的全局目录）是**口径决定**：本页只统计 dsh 会话，
+  //     而全局 `commands` 表里还有用户终端自己跑的命令。注入 `RTK_DB_PATH` 把 rtk 的记账引到
+  //     这里，两条流因此不相交。
+  const ledgerPaths = resolveLedgerPaths();
+  const trackingDbPath = ledgerPaths.historyDb;
+
   // 3. 结论缓存与去重账本：跨调用共享，所以必须建在 apply 层而不是 execute 里。
   //    `rewriteCacheSize` 是普通值（部署级）；`rewrittenCalls` 的 512 只是防泄漏兜底，
   //    正确性靠「读后即删」而不是容量。
   const rewriteCache = createRewriteCache(config.rewriteCacheSize);
   const rewrittenCalls = createRewrittenCalls(512);
 
-  // 4. 自记账存储：先落内存，`load()` 后台换到持久化账本。
-  const stats = createDeferredStatsStore(host);
-  void stats.load();
+  // 4b. 分形态统计账本：插件的 `dsh_*` 表写进**同一个 dsh 账本**（`$DSH_HOME/rtk/history.db`），
+  //     因此改写行与压缩计数在同一份文件里、两个进程各写自己的表；用户的全局账本一行不动。
+  //     为何不借 `engine_attribution`：那张表被 rtk 的 `reset_all()` 无条件全清，我们的行会被
+  //     用户的 `rtk gain --reset` 顺手抹掉；自建表 rtk 从不 DROP（实测跑过 reset 与强制重跑
+  //     迁移，`dsh_*` 表原样存活）。
+  //     同样先空转、`load()` 后台开库：开库要真的 `import("node:sqlite")` 并跑建表 SQL，
+  //     而 `apply` 是同步的。开失败只 warn，两个 installer 照常工作（统计面报 unavailable）。
+  //     `legacy` 留到迁移那一步接（Task 11）：这里给 undefined = 本次不迁移旧累计账本，
+  //     避免在还没写「读旧账本」的代码之前先把它读坏。
+  //     `legacy` 是**一次性的迁移输入**：把旧累计账本（宿主 storage domain 里那份
+  //     `rtk_stats`）读出来交给开库那一步，由它写进 `meta.legacy` 快照。读不到就跳过——
+  //     服务缺席是「这个部署本来没有存储面」，不是故障，所以只是 null；打不开则由 sink 的
+  //     回调 warn 一句（那里已经有一层 try/catch）。
+  const insights = createDeferredInsights({
+    dbPath: ledgerPaths.historyDb,
+    legacy: () => loadLegacyAccumulator(host),
+    effect: (run, label) => {
+      host.effect(run, label);
+    },
+    warn: warnSinkOf(host),
+  });
+  void insights.load();
 
   // 5. 运行时状态（卡片顶部那行）。`probed` 是探测回来的整份结果（原始串 + 是否达下限），
   //    探测是异步且可失败的，所以它是 apply 闭包里的可变位、status 每次现读——卡片轮询到的
@@ -1552,14 +2156,16 @@ function apply(ctx: unknown, config: Config): void {
       vitestMaxMajor: config.vitestMaxMajor,
       rewriteTimeoutMs: config.rewriteTimeoutMs,
       log: diag,
+      // 故障播报不走 `diag`：后者默认是 `undefined`，而「记账链断了」必须在默认配置下可见。
+      warn: warnSinkOf(host),
       supported,
+      trackingDbPath,
     },
     {
       messages,
       rewriteCache,
       rewrittenCalls,
-      // spec §6 按形态分账：prefix 只知道「改写了一次」，字节记不到（原始输出没过本插件）。
-      countRewrite: makeCountRewrite(stats),
+      insights: insights.sink,
     },
   );
 
@@ -1577,21 +2183,36 @@ function apply(ctx: unknown, config: Config): void {
     {
       messages,
       rewrittenCalls,
-      stats,
       // 定价口径的唯一入口：服务在就用宿主的 tokenMeter，不在就按同密度字节估算。
       tokensOf: tokenPricerOf(host),
       fs: { readFile: (target) => readFile(target, "utf8") },
       log: loggerOf(host),
+      insights: insights.sink,
     },
   );
 
   // 8. 统计读面。可选：注册失败只让卡片少一栏统计。
   //    不传断言：`installStatsRemote` 收 `unknown`，凭 `reflect.provide` 可调用自己收窄。
-  installStatsRemote(host, { store: stats, status });
+  //
+  //    服务层要的三样全是**取值函数**：库是异步打开的（这里只能给读取口）、沙箱模式与
+  //    启用名单都是卡片上能改的活值。给快照会让页面在装配那一刻冻住。
+  //    `sandboxMode` 只读 `defaultMode`：会话级 override 不在部署汇总面反映（spec §9 的
+  //    未验证项之一），所以页面文案按部署默认模式说明。
+  const service = createInsightsService({
+    store: () => insights.store(),
+    ledger: createRtkLedger(trackingDbPath),
+    status,
+    sandboxMode: () => sandboxModeOf(host),
+    enabledFilters: () => [...withDefault(config.enabledFilters.get(), DEFAULT_ENABLED_FILTERS)],
+    // 读面读不出来时留一行：那是「窗口里没有数据」与「库读不到」的唯一区别，
+    // 而这个区别在界面上只体现为一句空窗口。
+    warn: warnSinkOf(host),
+  });
+  installStatsRemote(host, { service });
 }
 
 export default {
-  inject: ["settings", "storageDomain", "subprocess", "tools", "workingDirectory"],
+  inject: ["settings", "subprocess", "tools", "workingDirectory"],
   Config: configSchema,
   apply,
 };

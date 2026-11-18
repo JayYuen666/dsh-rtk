@@ -3,8 +3,12 @@
 // 只搭「遮蔽层真正拿得到的那几样」：工具注册表、工作目录服务、子进程面、以及一条假 rtk
 // （写进临时目录、注入 PATH）。**不 mock 本包的 runRtkRewrite / createRewriter**——那样测
 // 的是桩，而不是装配序；这里的判据是「spawn 了几次」与「最终转调的是哪条命令」。
+//
+// 子进程面同样是桩（见 `installFakeRtk` 的注释）：`spawn` 的 **argv 形状**由本文件的断言与
+// `test/cli.test.ts` 钉着，真启动由装了真 rtk 的机器上那条人工回路覆盖。这样整套 C 形态用例
+// 在三个平台上跑的是同一份行为，不再依赖「runner 上恰好有 rtk」或「Windows 怎样解析 PATHEXT」。
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -12,6 +16,7 @@ import path from "node:path";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 
 import type { Messages } from "../../lib/messages.ts";
+import type { PipeRecord, PrefixRecord } from "../../lib/insights-shape.ts";
 import type {
   HostContext,
   PipeDeps,
@@ -24,8 +29,6 @@ import { installPostExecuteListener, installPrefixShadow } from "../../host.ts";
 import type { RewrittenCalls } from "../../lib/dedup.ts";
 import { createRewrittenCalls } from "../../lib/dedup.ts";
 import { createRewriteCache } from "../../lib/rewrite-cache.ts";
-import type { StatsStore } from "../../lib/stats-store.ts";
-import type { StatsSummary } from "../../lib/stats-shape.ts";
 
 /** 假 rtk 的一条回执：退出码 + stdout，可选的人为延迟（用来测改写超时）。 */
 export interface FakeReply {
@@ -68,26 +71,49 @@ export function makeFakeBash(
   return { definition, received };
 }
 
-/** 假 rtk 的可观测面。`spawned()` 读的是它自己写在 plan.json 里的计数器。 */
+/** 假 rtk 的可观测面。`spawned()` 读的是它自己的计数器。 */
 export interface FakeRtk {
   readonly dir: string;
   readonly spawned: () => number;
   readonly restore: () => void;
+  /** 这份假 rtk 的子进程面：`startPrefixHost` 不给 `subprocess` 时就用它。 */
+  readonly subprocess: SubprocessFace;
 }
 
+/** 当前装着的那份假 rtk（同一条用例内是唯一一份）；`startPrefixHost` 的缺省子进程面从这里取。 */
+let activeFakeRtk: FakeRtk | undefined;
+
 /**
- * 在临时目录里造一个 `rtk` 可执行文件并把它加进 PATH。
+ * 在临时目录里造一个 `rtk` 并把它加进 PATH，**同时**给出它的子进程面。
  *
- * 它只认 `rtk rewrite <command>`：按调用顺序消费 `replies`（最后一条可重复），
- * 并把计数写回 plan.json——「计数器动了」就是「真的 spawn 过」的判据。
+ * 两件事分开做，理由各一条：
+ *
+ * **① PATH 上的那个文件**只为过装配期门禁 `findOnPath("rtk")`。三个平台都写裸名 `rtk`：
+ * win32 那一档的候选是 `.exe` / `.cmd` / 裸名，而 `accessSync(path, X_OK)` 在 Windows 上
+ * 就退化成「存在且可读」，所以裸名足够（`?.cmd` 只是留给人在 Windows 上手跑，本套件不依赖它）。
+ * 早先这里只有 POSIX 的 0755 脚本，于是整片 C 形态用例在 windows CI 上根本没进得去。
+ *
+ * **② 子进程面是内存桩，不起真进程。** 这一条是被 Windows 逼出来的：`lib/cli.ts` 用
+ * `spawn({ argv: ["rtk", …] })` 起进程，而 Windows 的 `CreateProcess` **不做 PATHEXT 解析**
+ * ——裸名只找 `.exe`，`.cmd`/`.bat` 必须经 `shell: true` 或 `cmd.exe /c` 才跑得起来。我们
+ * 不能为了测试去改产品的 spawn 形状（那会让 Windows 上的真实行为与这里测的东西分叉），
+ * 也造不出一个跨平台可执行的假 rtk（`.exe` 需要真的编译）。
+ *
+ * 代价写清楚：这一层不再验「argv[0] 在目标平台上真的能被启动」。它从来就没验到过——
+ * CI runner 上没有装 rtk，起真进程这件事在 CI 里本来就只有 macOS 开发机碰巧成立。
+ * argv 的形状由 `test/cli.test.ts` 用同一类桩逐条钉着，真机启动由 `test/e2e-insights.md`
+ * 那条回路（人工、装了真 rtk 的机器）覆盖。
+ *
+ * 保留的语义：按调用顺序消费 `replies`（最后一条可重复）、`delayMs`、`exitCode`/`stdout`、
+ * 以及 **abort 语义**（`spec.signal` 一响就结算成 `signal: "SIGTERM"`，`terminate()` 同效）。
+ * 改写超时那条用例的判据「不把命令拖满整个超时」因此仍然成立，而且不再依赖真进程的冷启动。
  */
 export function installFakeRtk(cleanups: string[], replies: readonly FakeReply[]): FakeRtk {
   const dir = mkdtempSync(path.join(tmpdir(), "rtk-bin-"));
   cleanups.push(dir);
-  const planPath = path.join(dir, "plan.json");
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
-const planPath = ${JSON.stringify(planPath)};
+const planPath = require("node:path").join(__dirname, "plan.json");
 const plan = JSON.parse(fs.readFileSync(planPath, "utf8"));
 const reply = plan.replies[Math.min(plan.counter, plan.replies.length - 1)];
 plan.counter += 1;
@@ -96,13 +122,76 @@ const emit = () => { process.stdout.write(reply.stdout); process.exit(reply.exit
 if (reply.delayMs) { setTimeout(emit, reply.delayMs); } else { emit(); }
 `;
   writeFileSync(path.join(dir, "rtk"), script, { mode: 0o755 });
-  writeFileSync(planPath, JSON.stringify({ replies, counter: 0 }));
+  writeFileSync(path.join(dir, "plan.json"), JSON.stringify({ replies, counter: 0 }));
+  if (process.platform === "win32") {
+    writeFileSync(path.join(dir, "rtk.cmd"), '@echo off\r\nnode "%~dp0rtk" %*\r\n');
+  }
   const saved = process.env["PATH"];
   process.env["PATH"] = `${dir}${path.delimiter}${saved ?? ""}`;
-  return {
+
+  let counter = 0;
+  const subprocess: SubprocessFace = {
+    spawn(spec) {
+      const fallback: FakeReply = { exitCode: 0, stdout: "" };
+      const reply = replies[Math.min(counter, replies.length - 1)] ?? fallback;
+      counter += 1;
+      const { promise, resolve } = Promise.withResolvers<{
+        readonly exitCode: number | null;
+        readonly signal: string | null;
+      }>();
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      const finish = (exitCode: number | null, signal: string | null): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+        resolve({ exitCode, signal });
+      };
+      const emit = (): void => {
+        finish(reply.exitCode, null);
+      };
+      if (reply.delayMs === undefined || reply.delayMs <= 0) {
+        emit();
+      } else {
+        timer = setTimeout(emit, reply.delayMs);
+      }
+      // 已经 aborted 的 signal 不会再派发事件，得先看一眼——`cli.ts` 那条
+      // 「调用方 signal 已 abort 就不 spawn」的用法依赖它。
+      if (spec.signal?.aborted === true) {
+        finish(null, "SIGTERM");
+      } else {
+        spec.signal?.addEventListener(
+          "abort",
+          () => {
+            finish(null, "SIGTERM");
+          },
+          { once: true },
+        );
+      }
+      // `as never` 与同文件另外三处子进程桩一致：`SubprocessHandle` 的完整面（stdin/stderr/
+      // pid/exitCode…）由宿主的真实现给出，这里只交 `lib/cli.ts` 真正读的那三位。
+      return {
+        done: promise,
+        collected: { stdout: { readFrom: () => ({ text: reply.stdout }) } },
+        terminate: (): void => {
+          finish(null, "SIGTERM");
+        },
+      } as never;
+    },
+  };
+
+  const fake: FakeRtk = {
     dir,
-    spawned: () => (JSON.parse(readFileSync(planPath, "utf8")) as { counter: number }).counter,
+    spawned: () => counter,
+    subprocess,
     restore: () => {
+      if (activeFakeRtk === fake) {
+        activeFakeRtk = undefined;
+      }
       if (saved === undefined) {
         delete process.env["PATH"];
         return;
@@ -110,6 +199,8 @@ if (reply.delayMs) { setTimeout(emit, reply.delayMs); } else { emit(); }
       process.env["PATH"] = saved;
     },
   };
+  activeFakeRtk = fake;
+  return fake;
 }
 
 /**
@@ -174,8 +265,14 @@ export interface PrefixHost {
   /** 每次真正注册出去的遮蔽体，按注册顺序；`agentId` 是注册到哪个 agent 上。 */
   readonly registrations: readonly { readonly agentId: string; readonly definition: ShadedTool }[];
   readonly withAgent: (id?: string) => ShadedTool;
-  /** 每次「命令真的被改写了」记一次（spec §6 的 prefix 分账就是用这个钩子记账的）。 */
-  readonly rewrites: readonly string[];
+  /**
+   * 统计埋点的收件箱：`recordPrefix` 收到的记录，按到达顺序。
+   *
+   * 判据用点：Task 5 的每条用例都在问「哪几条记录、什么顺序、字段对不对」，所以它必须是
+   * 可见的数组而不是一个计数——`bash-call → gate-skip` 与 `bash-call → attempt → outcome`
+   * 的区别只有顺序读得出来。
+   */
+  readonly prefixRecords: readonly PrefixRecord[];
   /**
    * 模拟**插件 fiber 卸载**：按逆序跑 `ctx.effect` 收下的全部 disposer。
    *
@@ -205,10 +302,18 @@ export async function startPrefixHost(
     /**
      * 注入平台值（默认跟随运行平台）。win32 的装配期降级在 POSIX 测试机上走不到，
      * 而那条分支正是「按平台关掉一层」的唯一判据，必须可测。
+     *
+     * 反过来也成立：这条机器是 win32 时，整套 C 形态用例要**显式传 `"linux"`/`"darwin"`**
+     * 才进得去（产品侧的 `prefixSupportedOn` 对 win32 判否）。两条方向各有一处用它。
      */
     readonly platform?: NodeJS.Platform;
     /** 诊断日志接收口（对应部署开关 `logFilterMode: 'on'`）；不给 = 关。 */
     readonly log?: (line: string) => void;
+    /**
+     * 故障播报接收口（对应生产里的宿主 logger）。与 `log` 分开：它不受 `logFilterMode`
+     * 影响，默认装配就该有——账本目录建不出来、沙箱不给写权限这两件事必须留下痕迹。
+     */
+    readonly warn?: (line: string) => void;
     /**
      * 装配瞬间**已经存在**的 agent id。半栈会按这些 id 造出带 `ctx.tools.register` 的
      * agent，交成 `agents.list()` 的回答——晚装载那条分支只有从这里进得来。
@@ -232,6 +337,16 @@ export async function startPrefixHost(
      * 于是每个 agent 都「看不到」bash、整层静默不装，而所有单测（替身不看 scope）全绿。
      */
     readonly bashNeedsScope?: boolean;
+    /**
+     * `ctx.get("sandboxPolicy")` 的回答：`undefined` = 服务不在（只读沙箱、老宿主）。
+     * 给一个真策略才能验「账本目录被登记成可写根」这条路径。
+     */
+    readonly sandboxPolicy?: unknown;
+    /**
+     * 换掉统计记账号（缺省是堆进 `prefixRecords` 的真收件箱）。给一个会抛的实现，
+     * 才能验「统计写坏了不让工具调用失败」那条边界。
+     */
+    readonly insights?: PrefixDeps["insights"];
   } = {},
 ): Promise<PrefixHost> {
   const fake = makeFakeBash(
@@ -241,7 +356,12 @@ export async function startPrefixHost(
   const scoped: ShadedTool[] = [];
   const registrations: { readonly agentId: string; readonly definition: ShadedTool }[] = [];
   const handlers = new Map<string, (payload: { agent: unknown }) => void>();
-  const subprocess = (overrides.subprocess ?? fakeSubprocess()) as SubprocessFace;
+  // 缺省子进程面跟着「当前装着的那份假 rtk」走：`installFakeRtk` 既铺 PATH（过装配期门禁）
+  // 又给出回执（`rtk rewrite` 交回什么）。不给假 rtk 时退回真 spawn 的那一份——那些用例
+  // 自己断言 spawn 形状，不关心回执内容。
+  const subprocess = (overrides.subprocess ??
+    activeFakeRtk?.subprocess ??
+    fakeSubprocess()) as SubprocessFace;
   /**
    * `get("bash")` 该回什么。两个解构点都要用，所以先算出来——`overrides.bash ?? fake.definition`
    * 那种写法在 `get` 内部重复一次就是两份口径。
@@ -334,10 +454,26 @@ export async function startPrefixHost(
     },
     // `agents` 服务面：晚装载时补装已存在的 agent 唯一入口。默认**不给**（= 服务不在），
     // 因为绝大多数用例走的是 `agent/created`，凭空给一个空表只会让「到底走没走晚装载那条路」更难读。
-    get: (name: string): unknown => (name === "agents" ? { list: () => liveAgents } : undefined),
+    get: (name: string): unknown => {
+      if (name === "agents") {
+        return { list: () => liveAgents };
+      }
+      return name === "sandboxPolicy" ? overrides.sandboxPolicy : undefined;
+    },
   };
-  /** 每次改写记账的钩子（`PrefixHost` 把它暴露给用例，验「记账与 mark 同序」）。 */
-  const rewrites: string[] = [];
+  /**
+   * 统计埋点的收件箱：`recordPrefix` 的记录按到达顺序堆在这里。
+   *
+   * 用**真收件箱**而不是空实现：Task 5 的判据就是「哪几条记录、以什么顺序到达」，
+   * 而空实现会让「一条都没记」与「记错了」看起来一模一样。默认值可在 overrides 里换掉
+   * （验「记账号抛错时不影响工具执行」那条用例需要一个会炸的 sink）。
+   */
+  const prefixRecords: PrefixRecord[] = [];
+  const insights: PrefixDeps["insights"] = overrides.insights ?? {
+    recordPrefix: (input) => {
+      prefixRecords.push(input);
+    },
+  };
   const deps: PrefixDeps = {
     messages: () => ({
       cargoTestWarnHint: "cargo build / cargo check",
@@ -346,9 +482,7 @@ export async function startPrefixHost(
     }),
     rewriteCache: createRewriteCache(16),
     rewrittenCalls: createRewrittenCalls(16),
-    countRewrite: () => {
-      rewrites.push("rewrite");
-    },
+    insights,
   };
   installPrefixShadow(
     ctx as unknown as PrefixContext,
@@ -357,6 +491,9 @@ export async function startPrefixHost(
       forms: () => ["prefix"],
       // 诊断日志：默认关（只有专门验它的用例显式打开），否则每条用例都会往控制台写一行。
       log: overrides.log,
+      // 故障播报：默认也关（用例里显式收），但它**不跟 logFilterMode 走**——生产装配里
+      // 这一口接的是宿主 logger，默认就该能看见。
+      warn: overrides.warn,
       supported: overrides.options?.supported ?? (() => true),
       // 五处 volatile 都给取值函数：与生产装配同一口径，用例才能验「改了值下一次调用就生效」。
       denyCommands: () => [],
@@ -366,6 +503,10 @@ export async function startPrefixHost(
       rewriteTimeoutMs: 5000,
       warnHint: () => true,
       rewriteHostEnv: () => "",
+      // 半栈不落真账本：空串 = 不注入 `RTK_DB_PATH`，转调命令因此保持 `rtk cargo test` 原形，
+      // 那 20 多条形状断言才不用为路径前缀写一遍。真注入的行为由 `test/rtk-paths.test.ts`
+      // 的 `withRtkDbPath` 段单独验。
+      trackingDbPath: "",
       ...overrides.options,
     },
     deps,
@@ -388,7 +529,7 @@ export async function startPrefixHost(
     subprocess,
     registrations,
     withAgent,
-    rewrites,
+    prefixRecords,
     disposeFiber,
     visibleShadows: () => [...scoped],
   };
@@ -450,46 +591,6 @@ export function makeCleanups(): {
   };
 }
 
-/**
- * 最小 `StatsStore` 桩。
- *
- * 两个职责都不能省：
- * · `boom=true` 时在 `accumulate` 里抛——用来验监听器整体的 try/catch；
- * · **把每一笔记账原样收进 `recorded`**——早先这里的 `accumulate` 是个空函数、`summary()`
- *   回一份写死的零值，于是「字节数传错、filter 传错、prefix 记成了 pipe」这类错在门禁里
- *   一格都测不出来（实测过：把 `originalBytes` 与 `compressedBytes` 对调、把 `form` 改成
- *   `prefix`，全套测试照样绿）。记账是 spec §6 的交付物之一，桩不能替它猜。
- */
-function recordingStats(boom: boolean, recorded: unknown[]): StatsStore {
-  const summary: StatsSummary = {
-    commands: 0,
-    originalBytes: 0,
-    compressedBytes: 0,
-    savedBytes: 0,
-    originalTokens: 0,
-    compressedTokens: 0,
-    savedTokens: 0,
-    savingsPct: 0,
-    byFilter: {},
-    byForm: { prefix: 0, pipe: 0 },
-    topFilters: [],
-  };
-  return {
-    load: (): void => {
-      // 桩没有存量可读。
-    },
-    accumulate: (input): void => {
-      if (boom) {
-        throw new Error("stub-stats-boom");
-      }
-      recorded.push(input);
-    },
-    summary: (): StatsSummary => summary,
-    reset: (): Promise<void> => Promise.resolve(),
-    flush: (): Promise<void> => Promise.resolve(),
-  };
-}
-
 /** `startPipeHost` 的开关。`pipe` 是假 `rtk pipe` 的回执；其余几项分别关掉/打开某一条判据。 */
 export interface PipeHostOptions {
   /** 收插件 warn 的数组（原文落库失败时那一条）。 */
@@ -503,6 +604,13 @@ export interface PipeHostOptions {
   readonly enabled?: () => boolean;
   /** 版本门：默认 `() => true`；给 `() => false` 模拟「探到 rtk 低于下限」。 */
   readonly supported?: () => boolean | undefined;
+  /**
+   * 让监听器在**结果侧**抛一次，用来验 `decide` 的兜底。
+   *
+   * 抛出点选 `stdoutCapBytes()`：它在 `finishCompressed` 里紧接「压成功」那行诊断之后被读，
+   * 所以用例能同时看到「先记压成了、再记它随后抛了」。埋点自身抛错走的是另一条路——
+   * `safeRecordPipe` 会就地吃掉只 warn，不再到达这里。
+   */
   readonly throwInListener?: boolean;
   /** 参与 pipe 的 filter 名单（默认只开 cargo-test / pytest；vitest 那两条用例自己加）。 */
   readonly filters?: readonly string[];
@@ -521,8 +629,8 @@ export interface PipeHostOptions {
   readonly log?: (line: string) => void;
   /** 覆盖消息字典（默认用真字典的那几句）；用来逼「模板缺席」这类降级分支。 */
   readonly messages?: () => Messages;
-  /** 本半栈收到的每一笔记账（`StatsStore.accumulate` 的原样入参）。 */
-  readonly recorded?: unknown[];
+  /** 换掉统计收件箱（默认收进 `PipeHost.pipeRecords`）。 */
+  readonly insights?: PipeDeps["insights"];
 }
 
 /** 假 spill 存储：记下每次落库的原文，回一句固定的取回提示。 */
@@ -566,6 +674,8 @@ export interface PipeHost {
     readonly cwd: string;
   }>;
   readonly rewrittenCalls: RewrittenCalls;
+  /** 本半栈收到的每一条 pipe 记录（`PipeDeps.insights.recordPipe` 的原样入参）。 */
+  readonly pipeRecords: readonly PipeRecord[];
   readonly dispose: () => void;
 }
 
@@ -635,6 +745,12 @@ export function startPipeHost(options: PipeHostOptions = {}): PipeHost {
     },
   } as never;
   const rewrittenCalls = createRewrittenCalls(16);
+  const pipeRecords: PipeRecord[] = [];
+  const pipeInsights: PipeDeps["insights"] = options.insights ?? {
+    recordPipe: (input) => {
+      pipeRecords.push(input);
+    },
+  };
   const defaultMessages: Messages = {
     cargoTestWarnHint: "",
     spillSummary: "压缩前的完整输出已另存为文件",
@@ -644,9 +760,6 @@ export function startPipeHost(options: PipeHostOptions = {}): PipeHost {
   const deps: PipeDeps = {
     messages: options.messages ?? (() => defaultMessages),
     rewrittenCalls,
-    // 抛出点落在 stats 上而不是 guard 上：guard 是纯函数，喂坏形状也未必抛；而 stats.accumulate
-    // 是这条链上必然走到的一步。实现里不为这个开关加任何分支。
-    stats: recordingStats(options.throwInListener === true, options.recorded ?? []),
     // 定价口径在夹具里是确定的：`ceil(字节 / 4)`，与宿主 `CHARS_PER_TOKEN = 4` 同密度。
     // 真装配用的是 `ctx.tokenMeter`（见 lib/tokens.ts），两者只在密度上一致、实现无关。
     tokensOf: (text: string): number => Math.ceil(Buffer.byteLength(text, "utf8") / 4),
@@ -660,6 +773,7 @@ export function startPipeHost(options: PipeHostOptions = {}): PipeHost {
         options.warns?.push(line.map(String).join(" "));
       },
     },
+    insights: pipeInsights,
   };
   installPostExecuteListener(
     ctx,
@@ -672,7 +786,12 @@ export function startPipeHost(options: PipeHostOptions = {}): PipeHost {
       enabledFilters: () => options.filtersOf?.() ?? options.filters ?? ["cargo-test", "pytest"],
       minBytes: () => options.minBytes?.() ?? 16,
       minGainRatio: () => options.minGainRatio?.() ?? 0.95,
-      stdoutCapBytes: () => options.stdoutCapBytes?.() ?? 64_000,
+      stdoutCapBytes: (): number => {
+        if (options.throwInListener === true) {
+          throw new Error("stub-listener-boom");
+        }
+        return options.stdoutCapBytes?.() ?? 64_000;
+      },
       pipeTimeoutMs: 300,
       vitestMaxMajor: 5,
     },
@@ -730,6 +849,7 @@ export function startPipeHost(options: PipeHostOptions = {}): PipeHost {
   return {
     run,
     rewrittenCalls,
+    pipeRecords,
     dispose: (): void => {
       handlers.clear();
     },

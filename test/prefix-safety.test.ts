@@ -11,6 +11,7 @@ import path from "node:path";
 import {
   structuralReject,
   findOnPath,
+  executableOf,
   pipeStructuralReject,
   splitCommand,
 } from "../lib/prefix-safety.ts";
@@ -29,6 +30,14 @@ function makeBinDir(files: { name: string; mode: number }[]): string {
   }
   return dir;
 }
+
+/**
+ * 本文件加载时的宿主平台。
+ *
+ * 必须在任何 `forceShadowPlatform()` 之前取：它记的是「真机是什么」，而那个函数改的是
+ * 「测试假装是什么」。缺省可执行策略钉的正是前者。
+ */
+const LOAD_TIME_PLATFORM: NodeJS.Platform = process.platform;
 
 /** 在临时 PATH 上跑一段断言，跑完（含抛错）把 PATH 还原。 */
 function withPath<Result>(dir: string, run: () => Result): Result {
@@ -207,18 +216,74 @@ describe("findOnPath", () => {
     assert.ok(path.isAbsolute(found));
   });
 
-  // Windows 上这条判据造不出来：NTFS 没有 POSIX 执行位，`chmodSync(file, 0o644)` 之后
-  // `accessSync(file, X_OK)` 仍然通过（Node 在 win32 上只判「文件存在且可读」）。所以
-  // 「不可执行就跳过」这一档在 win32 上恒假——不是实现坏了，是平台没有这个概念。
-  // 这与 `host.ts` 的 `prefixSupportedOn` 拒 win32 是同一个理由的另一面：那条平台上
-  // 执行位语义本身未被验，与其猜一个，不如把判据标成「只在 POSIX 成立」。
-  it.skipIf(process.platform === "win32")("同名文件没有可执行位时跳过、最终 undefined", () => {
+  // 「可执行」的语义**按平台分叉**，所以这里把两条 policy 分别断言，而不是按宿主 OS 跳过：
+  //   · POSIX 看 mode 的执行位（`0o111`）——0o644 的文件不算；
+  //   · win32 的 NTFS 没有执行位这回事（`accessSync(X_OK)` 只判「存在且可读」），
+  //     那条平台的约定是「文件存在 + 扩展名对」。
+  // 早先这条是 `skipIf(process.platform === "win32")`：判据本身在两台机器上都成立，跳过只是
+  // 因为老实现把 `X_OK` 焊死了。改成注入 policy 之后，同一台机器能同时验两条。
+  it("同名文件没有可执行位时跳过（posix 档看 mode 位）", () => {
+    // 第三个参数同样必须显式给：缺省的 `executable` 跟**宿主**走，在 windows runner 上它是
+    // 「存在即算」——那条 policy 会让本用例断言的正相变成 0o644 也被接受，于是同一条判据在
+    // 两台机器上给出相反答案。这里要验的是 POSIX 那条 policy，就把它交进去。
     const dir = makeBinDir([{ name: "fakebin", mode: 0o644 }]);
     try {
       withPath(dir, () => {
-        assert.equal(findOnPath("fakebin"), undefined);
+        assert.equal(findOnPath("fakebin", "linux", executableOf("linux")), undefined);
       });
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("win32 档不看执行位：文件存在即可（NTFS 没有 POSIX 执行位）", () => {
+    // 注意第三个参数必须显式给：`findOnPath` 的 `executable` 缺省跟**宿主**走（这里仍会按
+    // POSIX 的 mode 位判），因为「目标平台怎么命名」与「我脚下这个文件系统怎么算可执行」
+    // 是两个问题。要验 win32 那条 policy，就得把它显式交进去——这也正是它可注入的理由。
+    const dir = makeBinDir([{ name: "fakebin", mode: 0o644 }]);
+    try {
+      withPath(dir, () => {
+        assert.equal(
+          findOnPath("fakebin", "win32", executableOf("win32")),
+          path.join(dir, "fakebin"),
+        );
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("缺省可执行策略钉在模块加载时的宿主上，不跟运行期改的平台值走", () => {
+    // 这一条钉的是真实缺陷（本轮修掉）：缺省值原先是 `executableOf(process.platform)`，
+    // 读的是**调用那一刻**的平台值。而 `process.platform` 是 configurable 的，
+    // `forceShadowPlatform()` 在 Windows runner 上会把它改成 `linux` 好让 C 形态跑起来——
+    // 于是 Windows 上的 rtk 被 POSIX 的 mode 位判成不可执行，装配期门禁 return、整层不装，
+    // 症状只有「卡片说 rtk 没装」（实测复现：伪造 win32 加载模块、再改成 linux，0644 文件返回
+    // `undefined`）。
+    //
+    // 判据不能写成「必须等于 POSIX 那条」：在 win32 runner 上缺省策略本来就该是 win32 那条
+    // （存在即可），写成固定答案会让这条用例在 Windows 上因为错的原因红。所以期望值由
+    // **本文件加载时**的平台算出来——`forceShadowPlatform()` 尚未动手，那一刻的值就是宿主
+    // 真值。运行期再把平台值换掉，缺省策略必须还是加载时那一条。
+    const dir = makeBinDir([{ name: "fakebin", mode: 0o644 }]);
+    const saved = process.platform;
+    // 换成**与加载时不同**的那一档：与加载时同值时，错实现和正实现会给出同一个答案，
+    // 这条用例就变成了空转（win32 模拟下实测过：只改成 win32 时突变体照样绿）。
+    const runtime: NodeJS.Platform = LOAD_TIME_PLATFORM === "win32" ? "linux" : "win32";
+    try {
+      Object.defineProperty(process, "platform", { value: runtime, configurable: true });
+      const expected = executableOf(LOAD_TIME_PLATFORM)(path.join(dir, "fakebin"))
+        ? path.join(dir, "fakebin")
+        : undefined;
+      withPath(dir, () => {
+        assert.equal(
+          findOnPath("fakebin"),
+          expected,
+          "缺省策略跟着运行期的 process.platform 走了：Windows runner 上 rtk 会被判成不可执行",
+        );
+      });
+    } finally {
+      Object.defineProperty(process, "platform", { value: saved, configurable: true });
       rmSync(dir, { recursive: true, force: true });
     }
   });

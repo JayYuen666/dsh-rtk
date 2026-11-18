@@ -72,8 +72,25 @@ describe("设置卡双语字典", () => {
       saveFailed: ["reason"],
       rtkTooOldHint: ["version", "minimum"],
       rtkReadyHint: ["version", "path"],
-      statsChartRow: ["filter", "tokens", "share"],
       filtersHint: ["filters"],
+      // Insights 页的两条：`whyLast` 是「最近一次为什么没压」那一行，四个位缺一个就是一句
+      // 带花括号的原文直接显示在页面上；`loadFailed` 的 `{reason}` 是读面自己给的诊断。
+      whyLast: ["status", "family", "reason", "size"],
+      // 成功那两支的短模板：只到「结局 · 家族 · 输入规模」，没有 `{reason}`。
+      whyLastPlain: ["status", "family", "size"],
+      // 没量到字节时用这两条：改写形态量的是指令，落库恒为 `unknown`。把它们印成
+      // 「输入 unknown」等于拿占位词冒充量到的值——所以整段省掉，位数也跟着少一个。
+      whyLastNoSize: ["status", "family", "reason"],
+      whyLastPlainNoSize: ["status", "family"],
+      loadFailed: ["reason"],
+      // 空窗口那句话：`{days}` 是窗口天数，`{form}` 是页签名。两个位缺一个，页面就会把
+      // 花括号原样印出来——而它出现的时机正是「这一屏什么都没有」，最容易被当成插件坏了。
+      emptyWindow: ["days", "form"],
+      // 四条建议文案：service 只给参数，句子在这里拼。缺一个位，页面上就是花括号原文。
+      suggestLowYieldFilter: ["filter", "days", "attempts", "compressed", "savingsPct"],
+      suggestUnusedFilter: ["filter", "days"],
+      suggestPotentialFilter: ["filter", "days", "matches"],
+      suggestLowYieldCommand: ["family", "days", "attempts", "savingsPct"],
     };
     for (const [key, expected] of Object.entries(EXPECTED) as [
       keyof UiMessages,
@@ -95,18 +112,29 @@ describe("设置卡双语字典", () => {
     }
   });
 
-  it("统计图与形态提示写清占比口径、热更新与越界处理", () => {
-    // 这些是上两轮真机验收暴露的误导点：占比没有分母说明、过滤器范围写错、
+  it("今日摘要与形态提示写清口径、热更新与越界处理", () => {
+    // 这些是历轮真机验收暴露的误导点：数字没有量纲说明、过滤器范围写错、
     // 形态改完要重启。现在形态是运行期现读，文案要承诺下一次调用即生效。
-    assert.match(UI_MESSAGES.zh.statsChartRow, /占全部节省/u);
-    assert.match(UI_MESSAGES.zh.statsChartRow, /个 token/u);
-    assert.match(UI_MESSAGES.zh.statsChartHint, /柱长/u);
+    //
+    // 量纲从标题挪到了每格数字旁边（`todayCommandsUnit` / `todaySavedUnit`）：原来那句
+    // 「今日（命令数 / 节省 token / 节省率）」是给一整行纯文本当前缀用的，改成两格卡片之后
+    // 两格的单位各自不同，写在标题里反而对不上（改写格报的是次数，压缩格报的是次数+token）。
+    // 所以门禁改成钉「单位词还在字典里、且两语各自非空」。
+    assert.ok(UI_MESSAGES.zh.todayCommandsUnit.length > 0);
+    assert.ok(UI_MESSAGES.zh.todaySavedUnit.length > 0);
+    assert.ok(UI_MESSAGES.en.todayCommandsUnit.length > 0);
+    assert.ok(UI_MESSAGES.en.todaySavedUnit.length > 0);
+    // 空态那句话不能退化成空串：它是「今天这条形态没被用过」唯一的表达。
+    assert.ok(UI_MESSAGES.zh.todayIdle.length > 0);
+    assert.ok(UI_MESSAGES.en.todayIdle.length > 0);
+    // 两形态必须是两个标签：合成一行就回到了「把两档算成一个节省率」那版。
+    assert.notEqual(UI_MESSAGES.zh.todayPrefix, UI_MESSAGES.zh.todayPipe);
+    assert.notEqual(UI_MESSAGES.en.todayPrefix, UI_MESSAGES.en.todayPipe);
     assert.match(UI_MESSAGES.zh.filtersHint, /仅结果压缩/u);
     assert.match(UI_MESSAGES.zh.formsHint, /下一次工具调用/u);
     assert.match(UI_MESSAGES.zh.enabledHintPrefix, /检测到受支持的 rtk/u);
     assert.notEqual(UI_MESSAGES.zh.enabledHintPrefix, UI_MESSAGES.zh.enabledHintWithPipe);
     assert.match(UI_MESSAGES.zh.invalidFields, /超出范围|修正/u);
-    assert.match(UI_MESSAGES.en.statsChartRow, /of total saved/u);
     assert.match(UI_MESSAGES.en.formsHint, /next tool call/u);
     assert.match(UI_MESSAGES.en.enabledHintPrefix, /follows rtk readiness/u);
   });

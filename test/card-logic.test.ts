@@ -1,5 +1,8 @@
 // 卡片纯逻辑的单测：快照投影、草稿读数、九字段投影。
 //
+// Task 11 删掉了 `chartBarsOf` / `ChartBar`（图表改由 Insights 页的 ECharts 组合图承担，
+// 卡片只剩一行今日摘要与两柱图），对应的那段用例随之移除。
+//
 // 替身只实现本卡用到的那几位（`getSnapshot` / `subscribe`），**不抄官方的完整 ConfigForm**：
 // 官方接口六个成员全必选，而卡片只用两个，抄全等于给自己加一处会漂的重复声明。
 import { describe, it } from "vitest";
@@ -7,7 +10,6 @@ import assert from "node:assert/strict";
 import {
   FORM_MODES,
   cardStore,
-  chartBarsOf,
   draftFields,
   draftOf,
   enabledHintKeyOf,
@@ -19,7 +21,6 @@ import {
   stringListOf,
 } from "../lib/card-logic.ts";
 import type { CardSnapshot, SettingScope } from "../lib/card-logic.ts";
-import type { StatsSummary } from "../lib/stats-shape.ts";
 
 // 这两个字面量在断言里出现十几次：提成常量后，改动只需动一处（也让
 // `sonarjs(no-duplicate-string)` 不再把它们当「散落的同一个魔法值」）。
@@ -274,77 +275,6 @@ describe("hintOf（卡片顶部引导行）", () => {
       version: "?",
       path: healthy.rtkPath,
     });
-  });
-});
-
-/** 两个 filter 名在断言里反复出现，提成常量（`sonarjs(no-duplicate-string)` 的阈值是 3 次）。 */
-const CARGO_FILTER = "cargo-test";
-const PYTEST_FILTER = "pytest";
-
-/** 排行榜的一行（其余字段对图表无影响，只给最小面）。 */
-function rankRow(
-  filter: string,
-  savedTokens: number,
-  sharePct: number,
-): { filter: string; commands: number; savedTokens: number; sharePct: number } {
-  return { filter, commands: 1, savedTokens, sharePct };
-}
-
-/** 造一份带 topFilters 的投影：其余字段与本条判据无关，给零值即可。 */
-function summaryWith(
-  topFilters: { filter: string; commands: number; savedTokens: number; sharePct: number }[],
-): StatsSummary {
-  return {
-    commands: 0,
-    originalBytes: 0,
-    compressedBytes: 0,
-    savedBytes: 0,
-    originalTokens: 0,
-    compressedTokens: 0,
-    savedTokens: 0,
-    savingsPct: 0,
-    byFilter: {},
-    byForm: { prefix: 0, pipe: 0 },
-    topFilters,
-  };
-}
-
-describe("chartBarsOf", () => {
-  it("ratio 以本组最大值为分母，不是以总量为分母", () => {
-    // 用「占总量」当分母时（假设总量 1000），600 与 300 画出来只有 60% 与 30% 高，
-    // 看起来像是都只发挥了一半；以最大值为分母才是「谁最大、差多少」的正常读法。
-    const bars = chartBarsOf(
-      summaryWith([rankRow(CARGO_FILTER, 600, 60), rankRow(PYTEST_FILTER, 300, 30)]),
-    );
-    assert.deepEqual(
-      bars.map((bar) => bar.ratio),
-      [1, 0.5],
-    );
-    // 占比那个数原样透传（它是宿主侧算的，客户端不重算口径）。
-    assert.deepEqual(
-      bars.map((bar) => bar.share),
-      [60, 30],
-    );
-  });
-
-  it("没有记录时给空数组（不是一排零长柱子）", () => {
-    assert.deepEqual(chartBarsOf(undefined), []);
-    assert.deepEqual(chartBarsOf(summaryWith([])), []);
-  });
-
-  it("省下 0 token 的行被剔掉：零长柱子与没有数据在视觉上一样，但文案不同", () => {
-    const bars = chartBarsOf(summaryWith([rankRow(CARGO_FILTER, 500, 50), rankRow("ctest", 0, 0)]));
-    assert.deepEqual(
-      bars.map((bar) => bar.filter),
-      ["cargo-test"],
-    );
-  });
-
-  it("全是 0 时也是空数组（分母 0 不产生 NaN 宽度）", () => {
-    const bars = chartBarsOf(
-      summaryWith([rankRow(CARGO_FILTER, 0, 0), rankRow(PYTEST_FILTER, 0, 0)]),
-    );
-    assert.deepEqual(bars, []);
   });
 });
 

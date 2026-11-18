@@ -75,6 +75,21 @@ function shippedFiles(): Set<string> {
 }
 
 describe("发布形态", () => {
+  it("包内 chunk 必须随包发出（漏了它入口那句 require.async 就是 404）", () => {
+    // 入口里那句 `require.async("./client.<name>.js")` 是运行期才发生的请求：漏在 `files`
+    // 外面时，装得上、打开页面也正常，只有点开图表那一刻静默退化成「没有图表」——
+    // 而 `files` 写没写全在别的门禁里没有症状。
+    const shipped = shippedFiles();
+    const chunks = readdirSync(pkgDir).filter(
+      (file) => file.startsWith("client.") && file !== "client.js" && file.endsWith(".js"),
+    );
+    // 防空转：走查目录而不是写死文件名，本仓现在恰好一件 chunk。
+    assert.ok(chunks.length > 0, "包根没有 client.<name>.js 产物：先跑 node build-client.mjs");
+    for (const chunk of chunks) {
+      assert.ok(shipped.has(chunk), `${chunk} 没进发布面：写进 package.json 的 files`);
+    }
+  });
+
   it("files 覆盖全部入口目标（换发布器也不会发出悬空入口）", () => {
     // 两个入口是这道门的前提：少一个就不存在「覆盖」这件事，而空数组断言恒成立。
     assert.ok(ENTRY_TARGETS.length >= 2, `入口面不该少于两个，实际 ${ENTRY_TARGETS.length}`);

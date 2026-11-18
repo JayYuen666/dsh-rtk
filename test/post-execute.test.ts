@@ -110,21 +110,21 @@ describe("b 形态监听器", () => {
   });
 
   it("压成功时按 pipe 形态记一笔账（字节数是压缩前后，filter 是命中的那个）", async () => {
-    // 这一条钉的是 spec §6 的记账口径。半栈的 stats 桩会原样收下 accumulate 的入参，
+    // 这一条钉的是 spec §6 的记账口径。半栈默认把每一笔 `pipe-success` 收进 `pipeRecords`，
     // 判据因此是「收下的那一笔对不对」，不是「有没有人调过」——后者用一个空函数也能绿。
-    const recorded: unknown[] = [];
-    const host = startPipeHost({ pipe: { exitCode: 0, stdout: PIPED }, recorded });
+    const host = startPipeHost({ pipe: { exitCode: 0, stdout: PIPED } });
     const out = await host.run(RAW);
     const text = stdoutText(out.decision);
-    assert.equal(recorded.length, 1);
-    const [entry] = recorded as {
-      readonly form?: unknown;
-      readonly filter?: unknown;
-      readonly originalBytes?: unknown;
-      readonly compressedBytes?: unknown;
-    }[];
-    assert.ok(entry !== undefined);
-    assert.equal(entry.form, "pipe");
+    // 两条：分母（`pipe-bash-call`）在前，压成功那一笔在后——顺序本身也是口径的一部分。
+    assert.deepEqual(
+      host.pipeRecords.map((record) => record.kind),
+      ["pipe-bash-call", "pipe-success"],
+    );
+    const [, entry] = host.pipeRecords;
+    assert.ok(entry !== undefined, "压成功那一笔没落到收件箱");
+    // 用 `assert.ok` 而不是 `assert.equal` 收窄：`equal` 在这份类型里也带断言签名，
+    // 后面的分支会被推成 never（本轮实测过），于是「字段读错」这件事在类型层就先红了。
+    assert.ok(entry.kind === "pipe-success", `第二笔应是 pipe-success，实际 ${entry.kind}`);
     assert.equal(entry.filter, "cargo-test");
     // 原始字节取**可见面**：正文 +（有则）stderr 段 +（有则）marker —— 也就是模型压缩前
     // 实际会读到的那些字节，`RAW` 本身就是这个形状。压缩侧取拼回 marker 之前的正文。
@@ -137,13 +137,19 @@ describe("b 形态监听器", () => {
     host.dispose();
   });
 
-  it("压在护栏上被拒时不记账（没压缩就没有节省可记）", async () => {
-    const recorded: unknown[] = [];
+  it("压在护栏上被拒时不记成功账（没压缩就没有节省可记）", async () => {
     // 收益不足：pipe 回来的东西比原文还长，low-gain 会拒。
-    const host = startPipeHost({ pipe: { exitCode: 0, stdout: RAW + RAW }, recorded });
+    const host = startPipeHost({ pipe: { exitCode: 0, stdout: RAW + RAW } });
     const out = await host.run(RAW);
     assert.deepEqual(out.decision, { kind: "accept" });
-    assert.equal(recorded.length, 0);
+    // 分母与「被护栏拒」各一条，但**没有**成功那一笔——这正是「没压缩就没有节省」的读法。
+    assert.deepEqual(
+      host.pipeRecords.map((record) => record.kind),
+      ["pipe-bash-call", "pipe-skip"],
+    );
+    const [, skip] = host.pipeRecords;
+    assert.ok(skip?.kind === "pipe-skip");
+    assert.match(skip.reason, /^guard:/u);
     assert.equal(out.piped, 1);
     host.dispose();
   });
@@ -271,7 +277,9 @@ describe("b 形态监听器", () => {
   });
 
   it("监听器内部抛异常不毁调用：退回下游决定", async () => {
-    // 抛出点在桩的 `stats.accumulate` 上（这条链上必然走到的一步）；实现里不为它加分支。
+    // 抛出点在桩的 `stdoutCapBytes()` 上：它在 `finishCompressed` 里紧接「压成功」那行诊断
+    // 之后被读，于是用例能同时看到「压成了」与「随后抛了」。埋点自己抛错走的是另一条路
+    // （`safeRecordPipe` 就地吃掉只 warn），到不了这里。
     const lines: string[] = [];
     const host = startPipeHost({
       pipe: { exitCode: 0, stdout: PIPED },

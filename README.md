@@ -40,6 +40,7 @@
 - [ Enabling it in dsh](#-enabling-it-in-dsh)
 - [ The two shapes](#-the-two-shapes)
 - [ Settings](#-settings)
+- [ Insights](#-insights)
 - [ Support surface](#-support-surface)
 - [ External dependency](#-external-dependency)
 - [ Data and privacy](#-data-and-privacy)
@@ -53,9 +54,10 @@
 - **Two compression shapes; the master switch follows rtk readiness.** `prefix` shadows `bash` per agent and routes the command through `rtk rewrite` first; `pipe` feeds a finished shell result through `rtk pipe -f <filter>` and replaces only the model-facing text. Until you set `enabled` explicitly, it is on only when a supported rtk is detected; `prefix` is the default form and `pipe` is opt-in.
 - **Nothing is compressed that is not worth it.** Outputs under `minBytes` (256) and rewrites that save less than `minGainRatio` (0.95) pass through unchanged. The plugin never claims a saving it did not make.
 - **Failures keep their text.** The guard rejects any compression that loses the failing assertion, the file:line, or the exit marker — a compressed failure that hides why it failed is worse than no compression.
+- **The failure count is labelled.** rtk's `FAILURES (31):` counts **output lines**, not failing tests — a 15-failure run prints 31. Rather than rewrite a number it has not verified, the plugin adds one line under the header: what the count means, how many failing blocks the input really has, and whether any were folded away.
 - **Fail-open everywhere.** rtk missing, rtk too old, a rewrite that rewrites destructively, a command that is not safe to rewrite: the original command runs, the original output is delivered, and nothing is lost.
 - **Compound commands are rewritten segment by segment.** `cd <repo> && cargo test` — the shape multi-repo work produces constantly — is split into segments and only the one carrying the output is rewritten (`cd <repo> && rtk cargo test`). Constructs that cannot be split (command substitution, redirection, background `&`, unbalanced quotes) still run unchanged as a whole.
-- **A settings card.** Command counts, tokens saved, the savings rate, and a per-filter bar chart of token savings — read from a host storage domain through the official Typert Remote namespace.
+- **A settings card and an insights page.** The card keeps the configuration and adds one line of today's summary (per shape) plus a two-bar chart; the full readout lives on an rtk page in the left sidebar — browsable by shape, time window, command and working directory. The data plane is the official Typert Remote namespace; no new HTTP route.
 
 ## <img src="https://api.iconify.design/lucide/package.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Install
 
@@ -69,7 +71,7 @@ Remove with `dsh plugin --profile web remove @jayyuen66/dsh-rtk`. The package is
 - **Host `dsh` at `0.2.2-rc.2` or later on the `0.2.x` line.** The host reads `engines.dsh` (`^0.2.2-rc.2`) and it **decides alone** — with that field present, compatibility is judged before `peerDependencies` is ever consulted, prereleases included. Any `0.2.x` at or above `0.2.2-rc.2` passes the host gate; `0.2.2-rc.1` and anything older does not. Strict npm peer resolution likewise accepts nothing below `0.2.2-rc.2`, and on the prerelease side only the `0.2.2` tuple (`0.2.2-rc.2` onward) — a later minor's prerelease such as `0.2.3-rc.1` waits for its stable release. `0.3.0` and later need the risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: at publish time this package is checked against every released host version inside the window — the judgement is the host's `--dump-config` layer line for this package, while the settings card and its namespace calls are verified once in full on the release's development baseline — and re-verified once the window moves, so the version number in this bullet is not a standing promise.
 - **No `@deepseek-ai/*` under `dependencies`, by contract** (`test/publish-manifest.test.ts`). Profiles install with `nodeLinker: hoisted` and `autoInstallPeers: false`, so a host package there becomes a real second copy; `@deepseek-ai/dsh-tools` keys its scheduler with a plain `Symbol`, so **every native tool call throws** in that profile while build, typecheck and coverage stay green. The `@deepseek-ai/dsh*` peers carry the same support-window range (`^0.2.2-rc.2`), while the exact pins in `devDependencies` are the compile-time discipline against a second host type surface — not a claim the host consults.
 - **`rtk >= 1.0.0` on `PATH`.** This is the one runtime dependency outside npm: `brew install rtk` on macOS/Linux, `winget install rtk-ai.rtk` on Windows. Without it the plugin still loads and every compression path fails open.
-- **What ships**: `host.js`, `client.js`, `cordis.patch.yml`, `icon.svg`, both READMEs, `CHANGELOG.md`, `THIRD_PARTY_NOTICES.md`, `locale/zh.json` + `locale/en.json`, and `docs/` (both DETAIL files). Artifacts are rebuilt by `prepack`, never committed.
+- **What ships**: `host.js`, `client.js`, the package-local on-demand chunk `client.insights-echarts.js`, `cordis.patch.yml`, `icon.svg`, both READMEs, `CHANGELOG.md`, `THIRD_PARTY_NOTICES.md`, `locale/zh.json` + `locale/en.json`, and `docs/` (both DETAIL files). Artifacts are rebuilt by `prepack`, never committed.
 
 ## <img src="https://api.iconify.design/lucide/circle-check.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Verify it is live
 
@@ -84,7 +86,7 @@ Remove with `dsh plugin --profile web remove @jayyuen66/dsh-rtk`. The package is
 - **No CLI subcommand.** `dsh rtk …` does not exist.
 - **No rtk code bundled.** The plugin invokes the `rtk` command as a subprocess and consumes its stdout. rtk's Apache-2.0 surface is what it uses; nothing from the BUSL engine is linked or redistributed.
 - **No rewriting of input arguments.** dsh deliberately forbids `tools/pre-execute` from rewriting a tool call's arguments (they are already logged and rendered). The `prefix` shape therefore works by shadowing `bash` per agent, not by mutating an existing call.
-- Required surfaces: `settings` / `tools` / `subprocess` (all in `inject`). `spillStore` and `storageDomain` are read through `ctx.get()` and degrade gracefully when absent.
+- Required surfaces: `settings` / `tools` / `subprocess` / `workingDirectory` (all in `inject`). `spillStore`, `sandboxPolicy` and `storageDomain` are read through `ctx.get()` and degrade gracefully when absent — `storageDomain` is only consulted once to migrate the old accumulator, so its absence merely costs a slice of historical counters.
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Enabling it in dsh
 
@@ -125,7 +127,22 @@ Compound handling under `prefix` deserves its own paragraph: rtk already rewrite
 | `vitestMaxMajor` | `5` | restart-only; vitest at or above this major is not compressed |
 | `logFilterMode` | `'off'` | restart-only |
 
-The config schema has 14 fields; 13 of them carry built-in defaults, while `enabled` follows rtk readiness until you set it explicitly. 9 of them volatile — the settings card writes those and they take effect on the next tool call, `enabledForms` included. The remaining **non-volatile deployment values**, 5 of them, are read once at assembly, so changing them needs a restart. The prefix form also writes to rtk's own `history.db`, because the rewritten command is what actually runs.
+The config schema has 14 fields; 13 of them carry built-in defaults, while `enabled` follows rtk readiness until you set it explicitly. 9 of them volatile — the settings card writes those and they take effect on the next tool call, `enabledForms` included. The remaining **non-volatile deployment values**, 5 of them, are read once at assembly, so changing them needs a restart.
+
+## <img src="https://api.iconify.design/lucide/chart-column.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Insights
+
+The left sidebar gains an rtk page. **The two shapes are reported separately and never merged**: prefix reports how many commands were rewritten and how many tokens that saved; pipe reports how many outputs were compressed and how many tokens that saved. They are not the same quantity, and one blended savings rate would explain neither.
+
+- **Tabs**: rewrite (prefix) / compression (pipe).
+- **Window and granularity**: 7 / 30 / 90 days, day / week / month. Empty buckets inside the window are zero-filled, so the x-axis is a stable time axis rather than "the days that happened to have data".
+- **KPI row**: calls, attempts, successes, coverage (pipe) or success rate (prefix), tokens saved, savings rate.
+- **Combination chart**: bars are tokens saved per bucket, the line is the savings or coverage rate on a second axis. **Under three days it falls back to bars** — a line through two points is not a trend, it is a misreading.
+- **Why this one was not compressed**: the latest event plus the top reasons in the window.
+- **Detail tables**: prefix by command family and working directory, pipe by filter, command family and working directory.
+- **Suggestions**: low-yield filters, enabled-but-never-hit filters, disabled-but-clearly-compressible filters, low-yield command families.
+- **Data note**: the start date, and the concrete reason when a ledger cannot be read (read-only sandbox, missing database, unreadable file, unexpected shape).
+
+Charts use [Apache ECharts](https://echarts.apache.org/) 6.1, **loaded on demand**: it is not in the entry bundle at all, and only opening this page downloads the half-megabyte charting code as a package-local chunk (`client.insights-echarts.js`, pulled by the host through `require.async`; switching tabs does not download it twice). The two-bar chart on the settings card shares the same chunk. License and copyright notices are in `THIRD_PARTY_NOTICES.md`.
 
 ## <img src="https://api.iconify.design/lucide/monitor.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Support surface
 
@@ -138,8 +155,11 @@ rtk 1.2.0 was the version every claim in this repository was measured against. T
 ## <img src="https://api.iconify.design/lucide/lock.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Data and privacy
 
 - **Command text leaves the host process only as an argv to your own `rtk` binary.** No network call is made by this plugin.
-- **Counters live in the host's storage domain** (`<DSH_HOME>/storages/`), one record per filter plus a summary; the records carry command counts, bytes before/after, and tokens before/after. Nothing else is persisted.
-- **Tokens are estimated by the host's `tokenMeter`** (falling back to `bytes / 4` when the service is absent — the same density as rtk's own `estimate_tokens_from_len`). The rewrite form cannot see the original output, so what it saves is only visible through `rtk gain`; every number on the card comes from the output-compression form.
+- **One dataset, and only dsh sessions land in it.** The ledger lives in dsh's own directory: `$DSH_HOME/rtk/history.db` (default `~/.dsh/rtk/history.db`, with `$DSH_HOME` resolved the same way the host resolves it). The plugin prefixes every rewritten `rtk` segment with `RTK_DB_PATH` pointing at that file, so rtk books its rows there and nowhere else — **the rtk you run in your own terminal, and `rtk gain`, are neither affected nor counted here**. Pipe compression counters and the per-event detail of both shapes live in `dsh_*` tables in the same database (SQLite via `node:sqlite`; if it cannot be opened only the statistics are lost, compression is unaffected). rtk never reads those tables and never drops them; kept for 90 days, no lifetime total.
+- **The plugin's own tables and the page never store full commands, arguments or output.** Only the command family (a template-level name like `cargo test` or `git status`), the working directory, the filter name, the reason and the counters. rtk's tables in that ledger do hold `original_cmd`; the plugin only reads it, and only ever shows its command family — the raw text never reaches the page or the statistics.
+- **Tokens are estimated by the host's `tokenMeter`** (falling back to `bytes / 4` when the service is absent — the same density as rtk's own `estimate_tokens_from_len`). The pipe form measures both ends, so its saving is measured; what prefix saves is the book rtk keeps for "original vs rewritten command", which the plugin only reads rather than estimates itself.
+- **The three sandbox modes differ.** Under `read-only` the prefix savings cannot be read (the ledger is not writable, so the page says so plainly while the rewrite counters stay visible) and pipe statistics keep working; under `workspace-write` the plugin registers `$DSH_HOME/rtk/` as a session-scoped writable root (through its physical path, so a symlinked `/tmp` still lands) and both faces work normally; `danger-full-access` adds no further restriction.
+- **"Clear" sits behind a confirmation and empties both sides of dsh's ledger**: rtk's five tables (`commands` and its siblings, deleted the same way `rtk gain --reset` deletes them) plus the plugin's own `dsh_*` tables. Only `$DSH_HOME/rtk/history.db` is touched — **your global `rtk gain` history stays put**, which is exactly what the checkbox in the dialog says. The old single accumulator (the `rtk_stats` storage domain) is migrated once into a snapshot the first time it is opened, and never accumulates again.
 - **Compressed originals can be spilled** into the host's spill area when they exceed the inline budget — the same mechanism every other host tool uses, with the same per-session partition.
 
 ## <img src="https://api.iconify.design/lucide/triangle-alert.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Known boundaries

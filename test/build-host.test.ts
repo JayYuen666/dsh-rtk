@@ -19,6 +19,8 @@ import { hostFreshnessEvidence } from "./host-freshness.ts";
 
 /** 值导入的宿主包：每一个都必须以裸说明符留在产物里（外部化），不得内联。 */
 const HOST_SPECIFIERS = [
+  // 账本位置解析走官方 `resolveDshHome`：它也必须是裸说明符，内联会冻死宿主换家目录的能力。
+  "@deepseek-ai/dsh-home-paths",
   "@deepseek-ai/dsh-llm",
   "@deepseek-ai/dsh-output-retention",
   "@deepseek-ai/dsh-storage-domain",
@@ -65,8 +67,16 @@ describe("buildHost()", () => {
         `shared/${subpath} 必须外部化（裸说明符形式留在产物里）`,
       );
     }
+    // `node:sqlite` 只以**说明符**出现：实现由 Node 自带，内联会把 `DatabaseSync` 的类体
+    // 塞进产物（那是几百 KB，且把 Node 版本差异冻死在发布物里）。
+    assert.ok(
+      out.includes('import("node:sqlite")'),
+      "node:sqlite 必须以动态 import 的裸说明符留在产物里（宿主构建不内联内建模块）",
+    );
+    assert.equal(out.includes("DatabaseSync = class"), false, "node:sqlite 的实现被内联了");
     // 自有 lib 的记号必须「在产物内」（内联成功）而不是留成相对说明符。
-    assert.ok(out.includes("rtk: stats domain"), "lib/stats-store.ts 的域标签须已并入单文件产物");
+    // 旧累计账本的域标签跟着迁移读取那一层一起进产物；`rtk: insights store` 是新的那本账的。
+    assert.ok(out.includes("rtk_stats"), "旧域名须已并入单文件产物（迁移要按名字找落盘文件）");
     assert.ok(!/from\s*["']\.\/lib\//u.test(out), "自有 lib 不得留成相对说明符");
   });
 

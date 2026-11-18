@@ -40,6 +40,7 @@
 - [在 dsh 里启用](#-在-dsh-里启用)
 - [两种形态](#-两种形态)
 - [设置项](#-设置项)
+- [洞察页](#-洞察页)
 - [支持面](#-支持面)
 - [外部依赖](#-外部依赖)
 - [数据与隐私](#-数据与隐私)
@@ -54,8 +55,9 @@
 - **复合命令逐段改写。** `cd <仓库> && cargo test` 这种多仓开发时最常见的形状会被拆成独立段，只换掉承载输出的那一段（`cd <仓库> && rtk cargo test`）；拆不开的构造（命令替换、重定向、后台 `&`、引号不配对）仍然整条原样执行。
 - **不值得压的一律不压。** 小于 `minBytes`（256）的输出、压缩率不足 `minGainRatio`（0.95）的改写，全部原样放行。插件不报它没做到的节省。
 - **失败用例保住原文。** 护栏会拒绝任何丢掉失败断言、file:line 或退出码 marker 的压缩——一条看不出为什么挂的失败比不压缩更糟。
+- **失败数的题头会被点明。** rtk 的 `FAILURES (31):` 里那个 31 是**输出行数**，不是 31 个失败测试（15 个失败就会印成 31）。插件不去改它的数字，只在题头下补一句对账：说明这个数怎么算的、这次真的有几次失败、以及下面有没有折叠没展开。
 - **处处 fail-open。** rtk 没装、rtk 太旧、改写会破坏语义、命令不适合改写：原命令照跑、原文照样送达、什么都不丢。
-- **一张设置卡。** 命令数、省下的 token 与节省率，外加一张按 filter 的 token 收益条形图，经官方 Typert Remote 命名空间从宿主 storage domain 读出。
+- **一张设置卡加一个洞察页。** 卡片留配置，顶部给一行今日摘要（按形态分开）与两柱图；完整的读数在左侧栏的 rtk 页——按形态、时间窗口、命令与工作目录查。数据走官方 Typert Remote 命名空间，不新建 HTTP 路由。
 
 ## <img src="https://api.iconify.design/lucide/package.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 安装
 
@@ -69,7 +71,7 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 - **宿主 `dsh` 在 `0.2.x` 这条线上、且不低于 `0.2.2-rc.2`。** 宿主读 `engines.dsh`（`^0.2.2-rc.2`）且**单独决定**——该字段在场时兼容性先于 `peerDependencies` 判定，prerelease 参与比较。`0.2.x` 里凡不低于 `0.2.2-rc.2` 的都通过宿主装载门；`0.2.2-rc.1` 及更早的不通过。npm 的严格 peer 解析同样不接受低于 `0.2.2-rc.2` 的版本，且 prerelease 一侧只收 `0.2.2` 这一元组的（`0.2.2-rc.2` 起）——更高小版本的预发布（如 `0.2.3-rc.1`）要等它的正式版。`0.3.0` 及以上需要风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <确切版本> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证（判据是宿主 `--dump-config` 里本包的层行；设置卡与它的命名空间调用另在发布基线上全量取证一次），窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
 - **`dependencies` 里没有 `@deepseek-ai/*`，这是契约**（`test/publish-manifest.test.ts`）。profile 用 `nodeLinker: hoisted` + `autoInstallPeers: false` 安装，放进去的宿主包会变成实打实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，于是那个 profile 里**每次原生工具调用都会抛**，而 build、typecheck、覆盖率全绿。`@deepseek-ai/dsh*` peer 携带同一个支持窗口（`^0.2.2-rc.2`），而 `devDependencies` 里的精确钉版是编译期纪律，不是「宿主会读它」的声明。
 - **`PATH` 上要有 `rtk >= 1.0.0`。** 这是 npm 之外唯一的运行时依赖：macOS/Linux 用 `brew install rtk`，Windows 用 `winget install rtk-ai.rtk`。没有它插件照常装载，所有压缩路径 fail-open。
-- **随包发布的内容**：`host.js`、`client.js`、`cordis.patch.yml`、`icon.svg`、双份 README、`CHANGELOG.md`、`THIRD_PARTY_NOTICES.md`、`locale/zh.json` + `locale/en.json`，以及 `docs/`（两份 DETAIL）。产物由 `prepack` 重建，从不入库。
+- **随包发布的内容**：`host.js`、`client.js`、包内按需 chunk `client.insights-echarts.js`、`cordis.patch.yml`、`icon.svg`、双份 README、`CHANGELOG.md`、`THIRD_PARTY_NOTICES.md`、`locale/zh.json` + `locale/en.json`，以及 `docs/`（两份 DETAIL）。产物由 `prepack` 重建，从不入库。
 
 ## <img src="https://api.iconify.design/lucide/circle-check.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 验证它真的生效了
 
@@ -84,7 +86,7 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 - **没有 CLI 子命令。** `dsh rtk …` 不存在。
 - **不捆绑 rtk 代码。** 插件把 `rtk` 命令当子进程调用、消费它的 stdout。用的是 rtk 的 Apache-2.0 面；BUSL engine 里没有任何东西被链接或再分发。
 - **不改写工具入参。** dsh 刻意禁止 `tools/pre-execute` 改写工具调用的参数（参数已经被记录与渲染）。所以 `prefix` 形态靠按 agent 遮蔽 `bash` 实现，而不是去改一次已发生的调用。
-- 需要的服务面：`settings` / `tools` / `subprocess`（都在 `inject` 里）。`spillStore` 与 `storageDomain` 经 `ctx.get()` 现读，缺席时优雅降级。
+- 需要的服务面：`settings` / `tools` / `subprocess` / `workingDirectory`（都在 `inject` 里）。`spillStore`、`sandboxPolicy` 与 `storageDomain` 经 `ctx.get()` 现读，缺席时优雅降级——`storageDomain` 只用来读一次旧账本做迁移，没有它只是少一份历史计数。
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 在 dsh 里启用
 
@@ -125,7 +127,22 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 | `vitestMaxMajor` | `5` | 重启生效；vitest 达到该主版本就不压 |
 | `logFilterMode` | `'off'` | 重启生效 |
 
-配置 schema 共 14 个字段；其中 13 个带内置默认值，`enabled` 在显式设置前跟随 rtk 就绪状态。其中卡上那 9 枚是 volatile —— 设置卡写它们，下一次工具调用就生效，`enabledForms` 也在其中。剩下的**非 volatile 部署值**，共 5 枚，在装配时读一次，改完要重启。前缀形态会写 rtk 自己的 `history.db`——真正跑的是改写后的那条命令。
+配置 schema 共 14 个字段；其中 13 个带内置默认值，`enabled` 在显式设置前跟随 rtk 就绪状态。其中卡上那 9 枚是 volatile —— 设置卡写它们，下一次工具调用就生效，`enabledForms` 也在其中。剩下的**非 volatile 部署值**，共 5 枚，在装配时读一次，改完要重启。
+
+## <img src="https://api.iconify.design/lucide/chart-column.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 洞察页
+
+左侧栏多一个 rtk 页。**两种形态分开报、不合并**：prefix 报「改写了几条命令、省下多少 token」，pipe 报「压了几次结果、省下多少」——它们不是同一个量，一个混合节省率既说不清改写也说不清压缩。
+
+- **页签**：改写（prefix）/ 压缩（pipe）。
+- **窗口与粒度**：7 / 30 / 90 天，日 / 周 / 月。窗口内的空桶补零，所以横轴是稳定的时间轴，不是「有数据的那些天」。
+- **KPI 行**：调用、尝试、成功、覆盖率（pipe）或成功率（prefix）、节省 token、节省率。
+- **组合图**：柱是每桶省下的 token，折线是节省率或覆盖率，双轴。**不足三天退回柱状图**——两个点连出来的线不是趋势，是误导。
+- **为什么这次没压**：最近一条事件 + 窗口内的原因 Top。
+- **明细表**：prefix 按命令家族与工作目录，pipe 按 filter、命令家族与工作目录。
+- **建议区**：低收益 filter、已启用却从没命中、没启用但明显可压、低收益命令家族。
+- **数据说明**：起始日，以及读不到账本时的具体原因（只读沙箱、库不存在、读坏了、形状不对）。
+
+图表用 [Apache ECharts](https://echarts.apache.org/) 6.1，**按需加载**：它不在入口 bundle 里，只有真的打开这一页才下载那份五十多万字节的图表代码（包内 chunk `client.insights-echarts.js`，宿主按 `require.async` 拉；切换页签不会重复下载）。设置卡那两柱图与它共用同一份。许可与版权声明在 `THIRD_PARTY_NOTICES.md`。
 
 ## <img src="https://api.iconify.design/lucide/monitor.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 支持面
 
@@ -138,8 +155,11 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 ## <img src="https://api.iconify.design/lucide/lock.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 数据与隐私
 
 - **命令文本只以 argv 的形式离开宿主进程，交给你自己那个 `rtk` 二进制。** 本插件不发起任何网络请求。
-- **计数存在宿主的 storage domain 里**（`<DSH_HOME>/storages/`），每个 filter 一条记录加一条汇总；记录里有命令数、前后字节、前后 token。别的什么都不落盘。
-- **token 由宿主的 `tokenMeter` 估算**（服务缺席时按 `bytes / 4`，与 rtk 官方 `estimate_tokens_from_len` 同一口径）。改写形态看不到原始输出，它省下的量只能看 `rtk gain`；统计卡里的数字全部来自结果压缩形态。
+- **一套数据，只记 dsh 会话。** 账本放在 dsh 自己的目录下：`$DSH_HOME/rtk/history.db`（默认 `~/.dsh/rtk/history.db`，`$DSH_HOME` 按宿主同一档解析）。插件给改写后的每段 `rtk` 注入 `RTK_DB_PATH` 指向这个文件，rtk 因此只往这里记账——**你在自己终端里跑的 rtk 与 `rtk gain` 不受影响，也不计入这里**。pipe 的压缩计数与两者的明细记在同一个库的 `dsh_*` 表里（SQLite，`node:sqlite`；打不开只丢统计，压缩照常），rtk 不认这些表、也从不会删它们；保留 90 天、没有 lifetime 累计。
+- **插件自己的表与页面上不存完整命令、参数或输出。** 只留命令家族（`cargo test`、`git status` 这种模板级名字）、工作目录、filter 名、原因与计数。账本里 rtk 那几张表存着 `original_cmd` 原文，插件只读它、且只展示它的命令家族，从不把原文回显到页面或统计里。
+- **token 由宿主的 `tokenMeter` 估算**（服务缺席时按 `bytes / 4`，与 rtk 官方 `estimate_tokens_from_len` 同一口径）。pipe 的两端都量得到，所以它的节省量是实测；prefix 省下的是「原文 vs 改写后命令」在 rtk 那边记的账，插件只读账本、不自己估。
+- **沙箱三档行为不同。** `read-only` 下 prefix 的节省量读不到（账本写不进去，页面如实报「只读」，改写计数照常可见），pipe 统计照常；`workspace-write` 下插件把 `$DSH_HOME/rtk/` 登记成会话级可写根（登记的目录走物理路径，`/tmp` 这类符号链接也能落上），两面都正常；`danger-full-access` 没有额外限制。
+- **「清零」要过一次二次确认，清的是 dsh 账本的两侧**：rtk 的五张表（`commands` 等，删法与 `rtk gain --reset` 同口径）和插件自己的 `dsh_*` 表。清的是 `$DSH_HOME/rtk/history.db` 这一个文件——**你的全局 `rtk gain` 历史不受影响**，弹窗里的勾选框就是把这件事说明白。旧的单份累计账本（宿主 storage domain 里的 `rtk_stats`）在第一次打开时一次性迁成快照，此后不再累加。
 - **被压缩的原文可能落进宿主的 spill 区**——当它超过内联预算时，走的是宿主每个工具都在用的那套机制，同样的按会话分区。
 
 ## <img src="https://api.iconify.design/lucide/triangle-alert.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 已知边界

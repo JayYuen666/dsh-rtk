@@ -1,59 +1,125 @@
 // test/stats-remote.test.ts —— 两侧契约。宿主侧用**标准装饰器**声明端点，客户端
 // `src/stats-reader.ts` **手写**同一枚 descriptor；两处分叉时卡片不报错，只会「读不到」。
 // 所以本文件既钉注册路，也钉宿主真件写下的标记（`remoteMethods()`）。
+//
+// 四个端点的名字与客户端 descriptor 里的 `method` 必须逐字相同：网关按名字查方法，写错一个
+// 字母的症状是「这张卡永远读不到」而不是编译错误。
 import assert from "node:assert/strict";
 
 import { Context } from "@deepseek-ai/cordis";
 import { remoteMethods } from "@deepseek-ai/dsh-typert-protocol";
 import { describe, it } from "vitest";
 
+import type { InsightsService } from "../lib/insights-service.ts";
+import type { InsightsRequest, InsightsResponse, StatsOverview } from "../lib/insights-shape.ts";
 import { RTK_STATS_SERVICE_KEY, installStatsRemote } from "../lib/stats-remote.ts";
-import { createStatsStore } from "../lib/stats-store.ts";
-import type { StatsAccumulator } from "../lib/stats-shape.ts";
-import type { StatsStore, StatsTable } from "../lib/stats-store.ts";
+import type { StatsStatus } from "../lib/stats-shape.ts";
 
-const table = (): StatsTable => {
-  let stored: StatsAccumulator | undefined;
-  return {
-    get: () => stored,
-    put: async (_key, value) => {
-      stored = value;
-    },
-  };
+/** 客户端 descriptor 里写死的四个方法名（这里独立写一遍，不从实现派生）。 */
+const METHODS = ["overview", "insights", "status", "reset"] as const;
+
+/** 今日摘要的空值（六个字段全 0）。 */
+const EMPTY_TODAY = {
+  commands: 0,
+  savedTokens: 0,
+  savingsPct: 0,
+  compressed: 0,
+  attempts: 0,
+  coveragePct: 0,
 };
 
-interface Deps {
-  readonly store: StatsStore;
-  readonly status: () => {
-    rtkPath: string;
-    rtkVersion: string;
-    supported: boolean;
-    enabled: boolean;
-    forms: string[];
-  };
+/** 两个形态都正常。 */
+const CLEAN: InsightsResponse["availability"] = { prefix: "ok", pipe: "ok", reasons: [] };
+
+/** 运行时状态（四个端点里只有 `status` 用它）。 */
+const STATUS: StatsStatus = {
+  rtkPath: "/opt/homebrew/bin/rtk",
+  rtkVersion: "1.2.3",
+  supported: true,
+  enabled: true,
+  forms: ["prefix"],
+};
+
+/** 概览回执（只有三样：设置卡那一行要的就是这些）。 */
+const overviewOf = (commands: number): StatsOverview => ({
+  today: { prefix: { ...EMPTY_TODAY, commands }, pipe: EMPTY_TODAY },
+  availability: CLEAN,
+  legacy: null,
+});
+
+/** 页面回执的最小合法形状。 */
+const insightsOf = (request: InsightsRequest): InsightsResponse => ({
+  form: request.form,
+  rangeDays: request.rangeDays,
+  granularity: request.granularity,
+  availability: CLEAN,
+  today: { prefix: EMPTY_TODAY, pipe: EMPTY_TODAY },
+  totals: {
+    bashCalls: 0,
+    attempts: 0,
+    compressed: 0,
+    originalTokens: 0,
+    compressedTokens: 0,
+    savedTokens: 0,
+    savingsPct: 0,
+    coveragePct: 0,
+    successPct: 0,
+    latencyAvgMs: 0,
+    latencyMaxMs: 0,
+  },
+  series: [],
+  filters: [],
+  commands: [],
+  workdirs: [],
+  skipReasons: [],
+  lastEvent: null,
+  suggestions: [],
+  legacy: null,
+  dataStart: null,
+});
+
+/** 假读面记下的调用轨迹。 */
+interface Seen {
+  overviewCalls: number;
+  resets: number;
+  requests: InsightsRequest[];
 }
 
-const deps = (): Deps => {
-  const store = createStatsStore(table());
-  store.accumulate({
-    form: "pipe",
-    filter: "cargo-test",
-    originalBytes: 1000,
-    compressedBytes: 100,
-    originalTokens: 500,
-    compressedTokens: 50,
-  });
-  return {
-    store,
-    status: () => ({
-      rtkPath: "/opt/homebrew/bin/rtk",
-      rtkVersion: "1.2.3",
-      supported: true,
-      enabled: true,
-      forms: ["prefix"],
-    }),
-  };
-};
+/**
+ * 假读面。
+ *
+ * 计数写进调用方持有的 `seen` 而不是挂在返回值上：本文件验的是「端点把调用转给了服务」，
+ * 所以要看的是**服务收到了什么**。
+ */
+const serviceOf = (seen: Seen, commands = 1): InsightsService => ({
+  overview: () => {
+    seen.overviewCalls += 1;
+    return Promise.resolve(overviewOf(commands));
+  },
+  insights: (request) => {
+    seen.requests.push(request);
+    return Promise.resolve(insightsOf(request));
+  },
+  reset: () => {
+    seen.resets += 1;
+    return Promise.resolve(overviewOf(0));
+  },
+  status: () => STATUS,
+});
+
+const seenOf = (): Seen => ({ overviewCalls: 0, resets: 0, requests: [] });
+
+const depsOf = (seen: Seen, commands?: number): { readonly service: InsightsService } => ({
+  service: serviceOf(seen, commands),
+});
+
+/**
+ * 一份「刚装配好、一次都没调过」的依赖。
+ *
+ * 单独包一层是为了过 `unicorn(max-nested-calls)`：`installStatsRemote(ctx, depsOf(seenOf()))`
+ * 是三层调用，而三层正是上限，`assert.equal(...)` 再包一层就超了。
+ */
+const freshDeps = (): { readonly service: InsightsService } => depsOf(seenOf());
 
 const captureWarnings = (run: () => boolean): boolean[] => {
   const warnings: boolean[] = [];
@@ -69,75 +135,68 @@ const captureWarnings = (run: () => boolean): boolean[] => {
   return warnings;
 };
 
+/** 从真 Context 里取出服务实例（端点要在外面调，就必须绕过 cordis 的包装）。 */
+const serviceIn = (ctx: Context): InsightsService =>
+  ctx.get(RTK_STATS_SERVICE_KEY, false) as InsightsService;
+
 describe("真 Context：注册与标记", () => {
-  it("服务键注册上，三个方法都被 @Remote 标记", () => {
+  it("服务键注册上，四个方法都被 @Remote 标记", () => {
     const ctx = new Context();
-    assert.equal(installStatsRemote(ctx, deps()), true);
+    assert.equal(installStatsRemote(ctx, freshDeps()), true);
     const raw: unknown = ctx.get(RTK_STATS_SERVICE_KEY, false);
     assert.ok(typeof raw === "object" && raw !== null, "服务没注册到 RTK_STATS_SERVICE_KEY 上");
     // 标记的方法名集合写死，不从实现派生：漏标一个端点的症状是那张卡片永久「读不到」。
     assert.deepEqual(
       remoteMethods(raw).map((marker) => marker.method),
-      ["summary", "status", "reset"],
+      [...METHODS],
     );
   });
 
-  it("status() 与 summary() 读活值，不是构造时的快照", () => {
+  it("status() 现读服务，不是构造时的快照", () => {
     const ctx = new Context();
-    const subject = deps();
-    installStatsRemote(ctx, subject);
-    const service = ctx.get(RTK_STATS_SERVICE_KEY, false) as {
-      summary: () => { commands: number };
-      status: () => { rtkVersion: string | null };
-    };
-    assert.equal(service.summary().commands, 1);
-    subject.store.accumulate({
-      form: "pipe",
-      filter: "pytest",
-      originalBytes: 500,
-      compressedBytes: 50,
-      originalTokens: 250,
-      compressedTokens: 25,
+    let version = "1.2.3";
+    installStatsRemote(ctx, {
+      service: { ...serviceOf(seenOf()), status: () => ({ ...STATUS, rtkVersion: version }) },
     });
-    assert.equal(service.summary().commands, 2, "summary 必须现读 store，不能在构造时固定");
+    assert.equal(serviceIn(ctx).status().rtkVersion, "1.2.3");
+    version = "1.3.0";
+    assert.equal(serviceIn(ctx).status().rtkVersion, "1.3.0", "status 必须现读，不能缓存");
   });
 });
 
-describe("三个端点", () => {
-  it("status 读的是 status() 回调的当下回执，不是构造时快照", () => {
+describe("四个端点", () => {
+  it("overview 转给服务的 overview()", async () => {
     const ctx = new Context();
-    let version = "1.2.3";
-    const subject = deps();
-    installStatsRemote(ctx, {
-      store: subject.store,
-      status: () => ({
-        rtkPath: "/opt/homebrew/bin/rtk",
-        rtkVersion: version,
-        supported: true,
-        enabled: true,
-        forms: ["prefix"],
-      }),
-    });
-    const service = ctx.get(RTK_STATS_SERVICE_KEY, false) as {
-      status: () => { rtkVersion: string | null };
-    };
-    assert.equal(service.status().rtkVersion, "1.2.3");
-    version = "1.3.0";
-    assert.equal(service.status().rtkVersion, "1.3.0", "status 必须现读回调，不能缓存");
+    const seen = seenOf();
+    installStatsRemote(ctx, depsOf(seen, 7));
+    const overview = await serviceIn(ctx).overview();
+    assert.equal(overview.today.prefix.commands, 7);
+    assert.equal(seen.overviewCalls, 1);
   });
 
-  it("reset 清零并把清零后的快照交回去（省客户端一次往返）", async () => {
+  it("insights 把请求原样交给服务（含形态、窗口、粒度）", async () => {
     const ctx = new Context();
-    const subject = deps();
-    installStatsRemote(ctx, subject);
-    const service = ctx.get(RTK_STATS_SERVICE_KEY, false) as {
-      reset: () => Promise<{ commands: number; savedBytes: number }>;
-    };
-    const after = await service.reset();
-    assert.equal(after.commands, 0);
-    assert.equal(after.savedBytes, 0);
-    // 返回值不是「清零前的账」：它必须是 reset 之后现读的那一份。
-    assert.equal(subject.store.summary().commands, 0);
+    const seen = seenOf();
+    installStatsRemote(ctx, depsOf(seen));
+    const request: InsightsRequest = { form: "pipe", rangeDays: 30, granularity: "week" };
+    const response = await serviceIn(ctx).insights(request);
+    assert.deepEqual(seen.requests, [request]);
+    // 回执的形态/窗口/粒度必须与请求一致：页面按它们决定横轴与标题，错一位就画错图。
+    assert.equal(response.form, "pipe");
+    assert.equal(response.rangeDays, 30);
+    assert.equal(response.granularity, "week");
+  });
+
+  it("reset 转给服务的 reset()，并把清零后的概览交回去", async () => {
+    const ctx = new Context();
+    const seen = seenOf();
+    installStatsRemote(ctx, depsOf(seen, 9));
+    const after = await serviceIn(ctx).reset();
+    assert.equal(seen.resets, 1);
+    assert.equal(after.today.prefix.commands, 0, "reset 的返回值必须是清零之后那一份");
+    // 这一层只负责把调用转过去：清零后读概览是**服务内部**的事（真实现里它自己调 overview），
+    // 所以这里期望 0 而不是 1 —— 写 1 就等于要求端点替服务多读一次。
+    assert.equal(seen.overviewCalls, 0);
   });
 });
 
@@ -164,10 +223,10 @@ describe("注册入口", () => {
       { reflect: { provide: 1 } } as unknown as Context,
     ];
     for (const ctx of malformed) {
-      const warnings = captureWarnings(() => installStatsRemote(ctx, deps()));
+      const warnings = captureWarnings(() => installStatsRemote(ctx, depsOf(seenOf())));
       assert.deepEqual(warnings, [], `畸形上下文 ${JSON.stringify(ctx)} 不该报警`);
     }
-    assert.equal(installStatsRemote({}, deps()), false);
+    assert.equal(installStatsRemote({}, freshDeps()), false);
   });
 
   it("注册口抛错时也只返回 false，不把异常交给调用方", () => {
@@ -178,7 +237,7 @@ describe("注册入口", () => {
         },
       },
     } as unknown as Context;
-    const warnings = captureWarnings(() => installStatsRemote(ctx, deps()));
+    const warnings = captureWarnings(() => installStatsRemote(ctx, depsOf(seenOf())));
     assert.equal(warnings.length, 1, "注册口抛错要报警一次，否则用户看不出统计栏为什么空着");
   });
 
@@ -194,7 +253,7 @@ describe("注册入口", () => {
         },
       },
     } as unknown as Context;
-    assert.equal(installStatsRemote(ctx, deps()), true);
+    assert.equal(installStatsRemote(ctx, freshDeps()), true);
     assert.deepEqual(provided, ["rtkStats"]);
   });
 });

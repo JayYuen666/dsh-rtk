@@ -7,12 +7,12 @@
 // 时钟与网络都用替身：`storageDomain.open` 是可控 Promise，`subprocess.spawn` 恒失败
 // （版本探测探不到就是探不到，装配必须照常）。
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { describe, it, onTestFinished } from "vitest";
+import { beforeAll, describe, it, onTestFinished } from "vitest";
 
 // `Config` 是 schemastery 的 schema 对象，但名字大写开头、直接调用会撞 `eslint(new-cap)`
 // （它以为你在不 new 的情况下调构造函数）。导入时改名是零成本的解法。
@@ -24,15 +24,16 @@ import plugin, {
   formsReaderOf,
   withDefault,
   loggerOf,
-  makeCountRewrite,
   pipeReadersOf,
   prefixReadersOf,
 } from "../host.ts";
 import type { HostServices } from "../host.ts";
 import { DEFAULT_ENABLED_FILTERS } from "../lib/command-filter.ts";
 import { RTK_STATS_SERVICE_KEY } from "../lib/stats-remote.ts";
-import type { StatsDomain } from "../lib/stats-store.ts";
-import type { StatsSummary } from "../lib/stats-shape.ts";
+import type { LegacyStatsDomain } from "../lib/stats-store.ts";
+import type { StatsOverview } from "../lib/insights-shape.ts";
+import { unbuildableDir } from "./unbuildable.ts";
+import { forceShadowPlatform } from "./platform/host-platform.ts";
 
 interface Recorded {
   readonly injects: { readonly deps: readonly string[] }[];
@@ -47,23 +48,47 @@ interface Recorded {
 }
 
 /** `tools/post-execute` 的事件名（本文件多处断言它挂没挂）。 */
+/** 默认启用名单里的那个 filter：三处断言共用这条字面量。 */
+const FILTER_CARGO = "cargo-test";
+
 const POST_EXECUTE = "tools/post-execute";
 
 /** `agent/created` 的事件名（C 形态的判据）。 */
 const AGENT_CREATED = "agent/created";
 
 /**
- * C 形态只在 POSIX 上存在，凡是断言「C 形态装没装」的用例都是 POSIX-only。
+ * C 形态的装配判据在三个平台都要跑。
  *
- * `prefixSupportedOn("win32")` 判否、`installPrefixShadow` 在平台门禁处直接 return —— 这是
- * spec §7.2 的保守档（rtk 的 Windows 分发面与 pwsh 命令形态都没在真机验过，而前缀形态把命令
- * 写坏是「本来能跑的命令不能跑」），不是缺陷。所以同一个 `events` 在 Windows 上**因为平台**
- * 就是空的：不标注的话，这些用例要么整片红（断言「装了」），要么因为错的理由通过（断言「没装」）。
- *
- * 平台判定本身由 `test/platform/platform.test.ts` 显式注入 win32 覆盖，遮蔽层的行为面由
- * `test/prefix-integration.test.ts`（同样 POSIX-only）覆盖。
+ * 产品侧的 `prefixSupportedOn("win32")` 判否不变（rtk 的 Windows 分发面与 pwsh 命令形态都没在
+ * 真机验过，而前缀形态把命令写坏是「本来能跑的命令不能跑」），那条由
+ * `test/platform/platform.test.ts` 显式注入 win32 断言「整层不装」。但本文件问的是另一个问题：
+ * **门禁之后装了什么**。它跟宿主是不是 Windows 无关，所以这里把宿主平台值换成受支持档，
+ * 而不是整片 `skipIf` 掉——跳过等于「Windows 上从来没验过装配序」。
  */
-const POSIX_ONLY = process.platform !== "win32";
+/**
+ * C 形态的装配判据在三个平台都要跑。
+ *
+ * 产品侧的 `prefixSupportedOn("win32")` 判否不变（rtk 的 Windows 分发面与 pwsh 命令形态都没在
+ * 真机验过，而前缀形态把命令写坏是「本来能跑的命令不能跑」），那条由
+ * `test/platform/platform.test.ts` 显式注入 win32 断言「整层不装」。但本文件问的是另一个问题：
+ * **门禁之后装了什么**。它跟宿主是不是 Windows 无关，所以这里把宿主平台值换成受支持档，
+ * 而不是整片 `skipIf` 掉——跳过等于「Windows 上从来没验过装配序」。
+ *
+ * 为什么单独起一个 describe：hook 必须挂在 describe 里（`vitest(require-top-level-describe)`）。
+ * 它排在本文件第一个 describe，`beforeAll` 因此早于后面所有用例；副作用是进程级的，后面的
+ * describe 照样看得见。不还原——vitest 默认按文件隔离进程，这一改只活在本文件的 worker 里。
+ */
+describe("平台值注入", () => {
+  beforeAll(() => {
+    forceShadowPlatform();
+  });
+
+  it("本文件在受支持档上跑：win32 runner 上也不例外", () => {
+    // 判据是「不是 win32」而不是「等于某个具体值」：macOS/Linux runner 上本就不变，
+    // Windows 上被换成 `linux`——两种都该满足，否则下面那些 C 形态用例整片红。
+    assert.notEqual(process.platform, "win32");
+  });
+});
 
 /** 占位实现：只需要「存在且是可调用函数」，不需要任何行为。 */
 function noop(): void {
@@ -72,18 +97,16 @@ function noop(): void {
 
 /**
  * 空表的 `get`：空表就是「没有这条记录」，所以恒回 `undefined`。
- * 不用 `noop`：它的返回类型是 `void`，而 `StatsTable.get` 要的是 `StatsAccumulator | undefined`
- * ——`void` 不等于 `undefined`（`strictNullChecks` 下两者在返回值位置不可互换）。
+ * 不用 `noop`：它的返回类型是 `void`，而 `LegacyStatsTable.get` 要的是
+ * `LegacyAccumulator | undefined`——`void` 不等于 `undefined`（`strictNullChecks` 下两者在
+ * 返回值位置不可互换）。
  */
 const noRecord = (): undefined => void 0;
 
-/** 默认的域：打开即成功、close 幂等——只为不污染跑测输出，不承担任何断言。 */
-async function silentDomain(): Promise<StatsDomain> {
+/** 默认的旧账本域：空表、close 幂等——只为不污染跑测输出，不承担任何断言。 */
+async function silentDomain(): Promise<LegacyStatsDomain> {
   return {
-    table: () => ({
-      get: noRecord,
-      put: () => Promise.resolve(),
-    }),
+    table: () => ({ get: noRecord }),
     close: () => Promise.resolve(),
   };
 }
@@ -95,8 +118,59 @@ interface SpawnSpec {
 }
 
 /** 等一小段：`apply` 里启动的存储动作是异步的，用例得让它落地。 */
-async function settle(): Promise<void> {
-  await sleep(10);
+/**
+ * 按**逆序**把注册的效应逐个跑掉，并等每一个交回的东西落定。
+ *
+ * 为什么删临时目录之前必须先跑它：装配会异步开一个 store，那条连接建出 `history.db-wal`
+ * 与 `-shm`，直接 `rmSync` 与它撞上会抛 `ENOTEMPTY`（目录里恰好又冒出一个文件）。
+ * 逆序是契约（宿主也是逆序撤），这里照同一个次序来，才不会出现「测试比宿主宽松」。
+ *
+ * 用递归而不是 `for … await`：后者撞 `no-await-in-loop`，而 `reduce` 又撞
+ * `unicorn(no-array-reduce)`——两条规则各自都对，只是不许在同一个函数里凑。
+ * @param disposers - 注册顺序的撤销函数
+ */
+async function disposeAll(disposers: readonly (() => unknown)[]): Promise<void> {
+  const last = disposers.at(-1);
+  if (last !== undefined) {
+    await Promise.resolve(last());
+  }
+  const rest = disposers.slice(0, -1);
+  if (rest.length > 0) {
+    await disposeAll(rest);
+  }
+}
+
+/** `eventually` 的递归体：用递归而不是 `for … await`（后者撞 `no-await-in-loop`）。 */
+async function poll(ready: () => boolean, deadline: number): Promise<void> {
+  if (ready() || Date.now() >= deadline) {
+    return;
+  }
+  await sleep(2);
+  await poll(ready, deadline);
+}
+
+/**
+ * 轮询到条件成立为止（默认两秒预算）。
+ *
+ * 为什么不是 `await sleep(10)`：装配里的「读旧账本 → 开统计库 → 探 rtk 版本」都是 fire-and-forget
+ * 的异步链，固定等一小段等于赌它跑得完。门禁并行 52 个 worker 且开覆盖率时，一次开库超过 10ms
+ * 是常态，于是同一条用例在本机绿、在 CI 红（本轮门禁就是这么红的）。
+ * 超时**不抛**：条件不成立时那把差异留给调用点的断言去讲，报错信息才有内容。
+ * @param ready - 条件
+ * @param budgetMs - 预算，默认两秒
+ */
+async function eventually(ready: () => boolean, budgetMs = 2000): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  await poll(ready, deadline);
+}
+
+/**
+ * 把记录下来的 warn 调用摊成一行一条。
+ * @param seen - 装配期记录
+ * @returns 每行一条
+ */
+function warnLines(seen: Recorded): string[] {
+  return seen.warns.map((args) => args.map(String).join(" "));
 }
 
 /**
@@ -108,7 +182,7 @@ async function settle(): Promise<void> {
 function makeHost(
   overrides: {
     readonly locale?: unknown;
-    readonly open?: () => Promise<StatsDomain>;
+    readonly open?: () => Promise<LegacyStatsDomain>;
     /**
      * 子进程面；默认恒抛 ENOENT（= 这台机器上没装 rtk）。
      *
@@ -118,6 +192,18 @@ function makeHost(
     readonly spawn?: (spec: SpawnSpec) => never | Record<string, unknown>;
     /** 去掉 logger 服务，走 `loggerOf` 的 console 回退那条兼容路径。 */
     readonly omitLogger?: boolean;
+    /**
+     * `dshHomePath` 指向的根；缺省造一个临时目录并预建 `rtk/` 子目录。
+     *
+     * 给死路径（例如 `/dev/null/nope`）是「库开不出来」那条路径的入口——那时子目录不被预建，
+     * `openSqlite` 只能失败。
+     */
+    readonly homeDir?: string;
+    /**
+     * `sandboxPolicy` 服务（可选）：给 `{ defaultMode: "read-only" }` 能让
+     * `sandboxModeOf` 读到只读，从而验「只读时不读 rtk 账本」这条走线。
+     */
+    readonly sandboxPolicy?: unknown;
   } = {},
 ): {
   readonly host: HostServices;
@@ -135,6 +221,33 @@ function makeHost(
   // `settings.describe()` 交回的是**命名空间的设置对象**，语言偏好在它的 `preference` 字段里
   // （shared 的 `resolveLocalePreference` 就按这个字段读）——不是裸字符串。
   let preference: unknown = overrides.locale;
+  // 账本位置：插件按 **`$DSH_HOME/rtk/history.db`** 算（家目录走官方 `resolveDshHome`），
+  // 所以替身用 `DSH_HOME` 把它钉到沙箱里。
+  //
+  // **必须钉**，而且必须指到临时目录：不钉的话每次跑门禁都会落到用户真实的
+  // `~/.dsh/rtk/history.db` 上，把 `dsh_*` 表建进用户自己的账本（早期版本踩过一次真实污染）。
+  // 预建 `rtk/` 子目录是为了让「库打得开」成为默认——开不出来那条路径由显式传死路径的用例走。
+  const homeRoot = overrides.homeDir ?? mkdtempSync(path.join(tmpdir(), "rtk-home-"));
+  if (overrides.homeDir === undefined) {
+    mkdirSync(path.join(homeRoot, "rtk"), { recursive: true, mode: 0o700 });
+    // 收摊顺序要**先关库再删目录**：装配会异步开一个 store，它建出 `history.db-wal`
+    // 与 `-shm`；直接 `rmSync` 与那条连接的写入撞上，实测会抛 `ENOTEMPTY`（目录里
+    // 恰好又冒出一个文件）。所以先按注册逆序跑一遍 disposer（`openInsightsStore` 挂的
+    // 那个会 close），再删；`maxRetries` 兜住「关掉这一瞬间还有一次 WAL checkpoint」。
+    onTestFinished(async () => {
+      await disposeAll(seen.disposers);
+      rmSync(homeRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    });
+  }
+  const savedHome = process.env["DSH_HOME"];
+  process.env["DSH_HOME"] = homeRoot;
+  onTestFinished(() => {
+    if (savedHome === undefined) {
+      Reflect.deleteProperty(process.env, "DSH_HOME");
+    } else {
+      process.env["DSH_HOME"] = savedHome;
+    }
+  });
   const settings = {
     describe: (): { readonly ns: string; readonly value: unknown }[] => [
       { ns: "locale", value: { preference } },
@@ -144,13 +257,13 @@ function makeHost(
       return noop;
     },
   };
+  // 旧累计账本的存储设施。它**不再是 `HostServices` 的必需位**（Insights 之后统计落在两本
+  // 自有账本上），只在迁移那一步经 `get("storageDomain")` 取一次。默认给一份空表：
+  // 默认失败会让**每条**用例都往 stderr 打一行 warn，跑测输出里全是噪音。
+  const storageDomain = { open: overrides.open ?? silentDomain };
   const host = {
     settings,
-    storageDomain: {
-      // 默认给一份能打开、能关掉的域：打不开那条路径由专门那条用例显式传 `open` 进来测。
-      // 反过来（默认失败）会让**每条**用例都往 stderr 打一行 warn，跑测输出里全是噪音。
-      open: overrides.open ?? silentDomain,
-    },
+    storageDomain,
     tools: { get: (): undefined => undefined },
     // 版本探测走这里：默认 ENOENT 直接抛，等同「PATH 上没有 rtk」。
     subprocess: {
@@ -172,7 +285,12 @@ function makeHost(
             },
           }),
         }),
-    get: (name: string): unknown => seen.registered.get(name),
+    get: (name: string): unknown => {
+      if (name === "storageDomain") {
+        return storageDomain;
+      }
+      return name === "sandboxPolicy" ? overrides.sandboxPolicy : seen.registered.get(name);
+    },
     on: (): (() => void) => noop,
     // 第二参叫 `attach` 而不是 `callback`：`promise(prefer-await-to-callbacks)` 按形参名判
     // node 风格回调，而这里 `inject` 的契约本来就是同步回调、不是「等它完成」。
@@ -234,7 +352,7 @@ function withRtkOnPath(): void {
 }
 
 describe("apply 的前置校验", () => {
-  it.each(["settings", "storageDomain", "tools", "subprocess", "workingDirectory"] as const)(
+  it.each(["settings", "tools", "subprocess", "workingDirectory"] as const)(
     "缺 %s 就 fail-fast，不装半套",
     (drop) => {
       const { host } = makeHost();
@@ -341,17 +459,6 @@ describe("诊断日志与按形态分账的接线", () => {
     }
     assert.deepEqual(seen, ["fallback"]);
   });
-
-  it("改写的记账走 accumulate({ form: 'prefix' })：只加命令数，不碰字节", () => {
-    const calls: unknown[] = [];
-    const stats = {
-      accumulate: (input: unknown): void => {
-        calls.push(input);
-      },
-    } as unknown as Parameters<typeof makeCountRewrite>[0];
-    makeCountRewrite(stats)();
-    assert.deepEqual(calls, [{ form: "prefix" }]);
-  });
 });
 
 describe("apply 的装配动作", () => {
@@ -390,32 +497,27 @@ describe("apply 的装配动作", () => {
     assert.equal(seen.registered.has(RTK_STATS_SERVICE_KEY), true);
   });
 
-  it("storageDomain 打不开也照样装完，并且 warn 一句说清楚只影响统计", async () => {
-    const warnings: string[] = [];
-    const original = console.warn;
-    console.warn = (...args: unknown[]): void => {
-      warnings.push(args.join(" "));
-    };
-    onTestFinished(() => {
-      console.warn = original;
-    });
-    const { host } = makeHost({ open: () => Promise.reject(new Error("backend offline")) });
+  it("storageDomain 打不开时只 warn 一句、装配照常走完（旧账本读不到不等于统计不可用）", async () => {
+    // 迁移读的是**旧累计账本**，它读不到只意味着「新账本里没有这份快照」——而新账本照常记。
+    // 所以这里的判据是「warn 一句 + 装配没被打断」，与「只留在内存」那种降级说法不同。
+    const { host, seen } = makeHost({ open: () => Promise.reject(new Error("backend offline")) });
     applyTo(host, configSchema({}));
-    await settle();
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0] ?? "", /只留在内存/u);
-    assert.match(warnings[0] ?? "", /backend offline/u);
+    await eventually(() =>
+      warnLines(seen).some((line) => line.includes("cannot read the legacy accumulator")),
+    );
+    const lines = warnLines(seen);
+    const failure = lines.find((line) => line.includes("cannot read the legacy accumulator"));
+    assert.ok(failure !== undefined, `没留下读旧账本失败那句话：${lines.join(" | ")}`);
+    assert.match(failure, /backend offline/u);
+    assert.equal(seen.registered.has(RTK_STATS_SERVICE_KEY), true);
   });
 
-  it("storageDomain 打得开就挂一个 disposer 收域句柄（谁 open 谁 close）", async () => {
+  it("storageDomain 打得开就就地读一次并按 close 归还（读完不占域名）", async () => {
     let closed = 0;
     const { host, seen } = makeHost({
-      open: (): Promise<StatsDomain> =>
+      open: (): Promise<LegacyStatsDomain> =>
         Promise.resolve({
-          table: () => ({
-            get: noRecord,
-            put: () => Promise.resolve(),
-          }),
+          table: () => ({ get: noRecord }),
           close: (): Promise<void> => {
             closed += 1;
             return Promise.resolve();
@@ -423,14 +525,28 @@ describe("apply 的装配动作", () => {
         }),
     });
     applyTo(host, configSchema({}));
-    assert.equal(seen.effects.includes("rtk: stats domain"), false, "disposer 要等 open 落地才挂");
-    await settle();
-    assert.equal(seen.effects.includes("rtk: stats domain"), true);
-    // 卸载时按注册逆序跑的清理函数里就有 close。
-    for (const dispose of seen.disposers) {
-      dispose();
-    }
+    await eventually(() => closed === 1);
+    // 与旧那版不同：迁移**不挂 disposer**——它在开库那一步读完就关，避免同名域一直占着名字
+    // 到进程结束（第二次装配会撞 `already-open`）。
+    assert.equal(seen.effects.includes("rtk: stats domain"), false);
     assert.equal(closed, 1);
+  });
+
+  it("统计表开不出来时经具名 logger 留一行，装配照常走完", async () => {
+    // 这一条走的是 `insights.warn` 那个回调（`host.ts` 里 `loggerOf(host).warn`）：
+    // 账本路径的父级是一个普通文件，`openSqlite` 只能失败。判据是那句话**到了 logger**，
+    // 而不是到了 console——装配层用的是具名 logger，回退到 console 是另一条路径。
+    const { host, seen } = makeHost({ homeDir: unbuildableDir() });
+    applyTo(host, configSchema({}));
+    await eventually(() =>
+      warnLines(seen).some((line) => line.includes("cannot open the stats tables")),
+    );
+    const lines = warnLines(seen);
+    const failure = lines.find((line) => line.includes("cannot open the stats tables"));
+    assert.ok(failure !== undefined, `没留下开库失败那句话：${lines.join(" | ")}`);
+    assert.match(failure, /report it as unavailable/u);
+    // 统计库开不出来不该打掉装配：服务照常注册。
+    assert.equal(seen.registered.has(RTK_STATS_SERVICE_KEY), true);
   });
 
   it("status() 现读：探不到版本时给 null 而不是「没装」的假值", () => {
@@ -475,7 +591,7 @@ describe("apply 的装配动作", () => {
         readonly supported: boolean | null;
       };
     };
-    await settle();
+    await eventually(() => service.status().rtkVersion !== null);
     const status = service.status();
     assert.equal(status.rtkVersion, "rtk 1.2.0");
     assert.equal(status.supported, true);
@@ -499,7 +615,7 @@ describe("apply 的装配动作", () => {
     const service = seen.registered.get(RTK_STATS_SERVICE_KEY) as {
       readonly status: () => { readonly supported: boolean | null };
     };
-    await settle();
+    await eventually(() => service.status().supported !== null);
     assert.equal(service.status().supported, false);
   });
 
@@ -508,7 +624,7 @@ describe("apply 的装配动作", () => {
     // 要求用户能在日志里看到的那一句。
     const { host, seen } = makeHost();
     applyTo(host, configSchema({}));
-    await settle();
+    await eventually(() => seen.warns.length > 0);
     assert.equal(seen.warns.length, 1);
     const [first] = seen.warns;
     assert.ok(first !== undefined);
@@ -526,7 +642,7 @@ describe("apply 的装配动作", () => {
       }),
     });
     applyTo(host, configSchema({}));
-    await settle();
+    await eventually(() => seen.warns.length > 0);
     assert.equal(seen.warns.length, 1);
     const text = String(seen.warns[0]?.[0]);
     assert.ok(text.includes("rtk 0.9.0"), text);
@@ -545,7 +661,15 @@ describe("apply 的装配动作", () => {
       }),
     });
     applyTo(host, configSchema({}));
-    await settle();
+    const service = seen.registered.get(RTK_STATS_SERVICE_KEY) as {
+      readonly status: () => { readonly rtkVersion: string | null };
+    };
+    // 这里要等的是「探测跑完了」，不是「时间过去了」：`probeRtkVersion` 是 fire-and-forget，
+    // 固定等一小段在慢机器上会在探测落地**之前**就断言「一条都没有」——那等于把漏报当通过。
+    await eventually(() => service.status().rtkVersion !== null);
+    // 先确认探测**真的落地了**，再断「一条 warn 都没有」：只断后者的话，探测还没跑完时
+    // 它天然成立，漏报会被当成通过。
+    assert.equal(service.status().rtkVersion, "rtk 1.2.0");
     assert.equal(seen.warns.length, 0);
   });
 
@@ -561,7 +685,7 @@ describe("apply 的装配动作", () => {
     try {
       const { host } = makeHost({ omitLogger: true });
       applyTo(host, configSchema({}));
-      await settle();
+      await eventually(() => calls.length > 0);
     } finally {
       console.warn = original;
     }
@@ -569,15 +693,51 @@ describe("apply 的装配动作", () => {
     assert.ok(String(calls[0]?.[0]).includes("rtk not found on PATH"));
   });
 
-  it("summary() 走的是那份延迟账本（先内存，初始为零）", () => {
+  it("overview() 读的是那份延迟账本（先内存，初始为零）", async () => {
     const { host, seen } = makeHost();
     applyTo(host, configSchema({}));
     const service = seen.registered.get(RTK_STATS_SERVICE_KEY) as {
-      readonly summary: () => StatsSummary;
+      readonly overview: () => Promise<StatsOverview>;
     };
-    const before = service.summary();
-    assert.equal(before.commands, 0);
-    assert.equal(before.savedBytes, 0);
+    const before = await service.overview();
+    // 两类账本都还是空的：prefix 的计数来自插件库（延迟打开，此时为内存空表），
+    // pipe 同源。断两个形态而不是只断一个 —— 只看 prefix 会漏掉「pipe 分支根本没接上」。
+    assert.equal(before.today.prefix.commands, 0);
+    assert.equal(before.today.pipe.commands, 0);
+  });
+
+  it("部署默认模式是只读时，overview() 的 prefix 判 readonly 且不去开 rtk 的库", async () => {
+    // 这条串起了三段：host 的 `get("sandboxPolicy")` → `sandboxModeOf` 读 `defaultMode`
+    // → service 的 `readLedger` 提前返回。只读时账本目录可能根本不存在，真去开还会
+    // 撞「文件不存在」，所以「不读」本身就是正确行为，不能只当成省一次 IO。
+    const { host, seen } = makeHost({ sandboxPolicy: { defaultMode: "read-only" } });
+    applyTo(host, configSchema({}));
+    const service = seen.registered.get(RTK_STATS_SERVICE_KEY) as {
+      readonly overview: () => Promise<StatsOverview>;
+    };
+    const before = await service.overview();
+    assert.equal(before.availability.prefix, "readonly");
+    // 计数不受影响：只读的是沙箱，不是插件的账本。
+    assert.equal(before.today.prefix.commands, 0);
+  });
+
+  it("pipe 页在库打开后会去读现配的 enabledFilters（不是装配时的快照）", async () => {
+    // 这条专门压 apply 里那个 `enabledFilters: () => [...withDefault(...)]` 闭包：
+    // 它是「用户改了 filter 名单，页面建议跟着变」的唯一通路。写成装配期算好的数组
+    // 也能让别的用例全绿，但改配置后建议就冻在旧名单上——所以必须由一次真实读来钉住。
+    const { host, seen } = makeHost();
+    applyTo(host, configSchema({ enabledFilters: [FILTER_CARGO] }));
+    // 等库真的开出来：`insights.load()` 是 fire-and-forget，`store()` 在它落地前恒为 undefined，
+    // 而 undefined 会让 availability.pipe 报 unavailable——固定等一小段就是在赌它跑得完。
+    await eventually(() => seen.effects.includes("rtk: insights store"));
+    const service = seen.registered.get(RTK_STATS_SERVICE_KEY) as {
+      readonly insights: (request: { form: "pipe"; rangeDays: 7; granularity: "day" }) => Promise<{
+        readonly availability: { readonly pipe: string };
+      }>;
+    };
+    const page = await service.insights({ form: "pipe", rangeDays: 7, granularity: "day" });
+    // 库在临时目录里确实打开了，所以这里不是「库缺席所以没读」那条路。
+    assert.equal(page.availability.pipe, "ok");
   });
 });
 
@@ -624,7 +784,7 @@ describe("形态常驻与运行期门禁", () => {
     assert.equal(events.includes(POST_EXECUTE), true);
   });
 
-  it.skipIf(!POSIX_ONLY)("c 形态常驻：enabledForms 只有 pipe 时也注册 agent/created", () => {
+  it("c 形态常驻：enabledForms 只有 pipe 时也注册 agent/created", () => {
     // 先把 rtk 造出来：不造的话这台机器上「找不到 rtk」会先挡掉装配，测出来的
     // 就不是「形态不再决定装不装」这条判据。POSIX-only 同前：Windows 平台门禁先挡。
     withRtkOnPath();
@@ -634,7 +794,7 @@ describe("形态常驻与运行期门禁", () => {
     assert.equal(events.includes(AGENT_CREATED), true);
   });
 
-  it.skipIf(!POSIX_ONLY)("默认配置 enabled 无静态值，两层都常驻", () => {
+  it("默认配置 enabled 无静态值，两层都常驻", () => {
     // 默认开启由版本探测结果兜底，不是 schema 静态默认；两层常驻是热切换的承重结构。
     withRtkOnPath();
     const { host: base } = makeHost();
@@ -687,7 +847,7 @@ function liveConfig(): {
     ["denyCommands", []],
     ["warnHint", true],
     ["rewriteHostEnv", ""],
-    ["enabledFilters", ["cargo-test"]],
+    ["enabledFilters", [FILTER_CARGO]],
     ["minBytes", 256],
     ["minGainRatio", 0.95],
     ["stdoutCapBytes", 64_000],
@@ -708,22 +868,19 @@ function liveConfig(): {
 }
 
 describe("volatile 读到空引用时不崩（宿主的退化态）", () => {
-  it.skipIf(!POSIX_ONLY)(
-    "九个 volatile 全空时装配照常完成：形态退到默认 ['prefix']，两层都常驻",
-    () => {
-      // 同上两条：C 形态的门禁第三条是 PATH 上有 rtk（不造出来这条判据就跟着跑测机器走），
-      // 而平台那一条（win32 整层不装）不在本用例的判据里，见 `POSIX_ONLY`。
-      withRtkOnPath();
-      const { host: base } = makeHost();
-      const { host, events } = recording(base);
-      applyTo(host, emptyVolatileConfig());
-      assert.deepEqual(
-        events,
-        [AGENT_CREATED, POST_EXECUTE],
-        "空引用等于「没配」：形态退默认，两层仍常驻，运行期再判形态与总开关",
-      );
-    },
-  );
+  it("九个 volatile 全空时装配照常完成：形态退到默认 ['prefix']，两层都常驻", () => {
+    // 同上两条：C 形态的门禁第三条是 PATH 上有 rtk（不造出来这条判据就跟着跑测机器走），
+    // 而平台那一条已由本文件顶部的 `forceShadowPlatform()` 换成受支持档。
+    withRtkOnPath();
+    const { host: base } = makeHost();
+    const { host, events } = recording(base);
+    applyTo(host, emptyVolatileConfig());
+    assert.deepEqual(
+      events,
+      [AGENT_CREATED, POST_EXECUTE],
+      "空引用等于「没配」：形态退默认，两层仍常驻，运行期再判形态与总开关",
+    );
+  });
 
   it("status() 在受支持版本探测回来前把空 enabled 读成 false", () => {
     const { host, seen } = makeHost();
@@ -761,7 +918,7 @@ describe("volatile 的取值函数：装配期交出去的是「怎么读」，�
     const { config, set } = liveConfig();
     const readers = pipeReadersOf(config, () => true);
     assert.equal(readers.enabled(), true);
-    assert.deepEqual([...readers.enabledFilters()], ["cargo-test"]);
+    assert.deepEqual([...readers.enabledFilters()], [FILTER_CARGO]);
     assert.equal(readers.minBytes(), 256);
     assert.equal(readers.minGainRatio(), 0.95);
     assert.equal(readers.stdoutCapBytes(), 64_000);

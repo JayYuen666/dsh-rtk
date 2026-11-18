@@ -4,6 +4,223 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.0
+
+Statistics move out of one cumulative card and into a page of their own, split by shape. The old
+single accumulator is demoted to a one-time migration input. Two Remote methods were added, the
+client half gained a package-local on-demand chunk, and `storageDomain` left `inject`.
+
+### Added
+
+- **An Insights page in the left sidebar.** The `main` slot entry (key `rtk`) plus a `sidebar.panellist`
+  entry with the same id expose `lib/insights-service.ts` through four Remote methods —
+  `overview` / `insights` / `status` / `reset`. The page switches shape (rewrite / compression),
+  window (7 / 30 / 90 days) and granularity (day / week / month); it shows a KPI row, a combination
+  chart, "why this one was not compressed", detail tables, suggestions and a data note.
+  `lib/insights-page-logic.ts` holds the DOM-free projection so the whole view model is unit-testable.
+- **One dataset, and only dsh sessions land in it** (`lib/rtk-paths.ts`). The ledger is
+  `$DSH_HOME/rtk/history.db` (default `~/.dsh/rtk/history.db`), with `$DSH_HOME` resolved through the
+  host's own `@deepseek-ai/dsh-home-paths` rather than a second home-directory rule. Every rewritten
+  `rtk` segment is prefixed with `RTK_DB_PATH` pointing at that file, so rtk books its rows there and
+  nowhere else: the rtk a user runs in their own terminal — and `rtk gain` — stay untouched and are not
+  counted. This replaces the intermediate "share rtk's global ledger" step, which on a real host put
+  "0 rewrites succeeded" and "1.7M tokens saved" on the same screen. Pipe counters and the per-event
+  detail of both shapes are written as `dsh_*` tables **inside that same database**
+  (`lib/insights-store.ts`, SQLite via a dynamic `node:sqlite` import; if it cannot be opened only the
+  statistics are lost). rtk never reads or drops those tables.
+- **"Reset stats" now asks first.** The button opens the host's own `RiskConfirmation`
+  (`@deepseek-ai/dsh-client-ui-primitives`, a platform module, externalized in `build-client.mjs`):
+  a warning-tone body plus an acknowledgement checkbox, and the confirm button stays disabled until it
+  is ticked. The dialog names both halves it clears — rtk's five tables in dsh's own ledger (deleted the
+  same way `rtk gain --reset` deletes them) and the plugin's `dsh_*` tables — and says plainly that the
+  user's global `rtk gain` history is not touched.
+- **Apache ECharts 6.1 as a package-local on-demand chunk.** Charts live in
+  `client.insights-echarts.js` (537,725 B), pulled through `require.async` only when the page is
+  opened; the entry bundle never contains ECharts. ECharts is a `devDependencies` pin, so the
+  published package gains no runtime dependency; the chunk carries an Apache-2.0 notice banner and
+  `THIRD_PARTY_NOTICES.md` now embeds the upstream `NOTICE` and `LICENSE` verbatim.
+- **A two-bar chart on the settings card** (today's rewrite savings vs compression savings), sharing
+  the same chunk, plus one line of per-shape today summary. Both read the existing `overview` reply,
+  so the card issues no extra request.
+
+### Changed
+
+- **`storageDomain` is no longer an injected surface.** `isRtkHost` stopped requiring it and `inject`
+  is now `["settings", "subprocess", "tools", "workingDirectory"]`; the old accumulator is read once
+  through `ctx.get("storageDomain")` (`loadLegacyAccumulator`) and its absence simply skips the
+  migration. `lib/stats-store.ts` shrank from a read/write store to that read-only entry, and
+  `lib/stats-shape.ts` keeps only `RTK_STATS_NAMESPACE` and `statsStatusSchema`.
+- **The cumulative accounting path is gone.** `chartBarsOf` / `ChartBar`, `createDeferredStatsStore`,
+  `makeCountRewrite`, `PrefixDeps.countRewrite` and `PipeDeps.stats` were removed; both shapes now
+  record through `lib/insights-sink.ts`, which drops records before the store is open rather than
+  counting half a window.
+- **Read-only deployments degrade instead of failing.** `sandboxModeOf` reads `defaultMode` from
+  `sandboxPolicy`; under `read-only` the prefix savings are reported as unavailable (the rewrite
+  counters stay visible) and pipe statistics keep working.
+- **Availability and suggestions speak keys, not Chinese sentences.** `availability.message` became
+  `reasons: AvailabilityReason[]` (five enum values) and each suggestion became
+  `{kind, key, severity, params}` with the numbers in `params`. The service no longer decides what
+  language the user reads; the page maps keys through `ui-messages.ts`, so an English UI no longer
+  shows Chinese paragraphs in the footnote or the suggestions block.
+- **Rebuilt artifacts**: `host.js` 224,634 B, `client.js` 83,212 B, `client.insights-echarts.js`
+  537,725 B. `test/floors.ts` gained a third entry for the chunk and raised the client budget. Its
+  notes quote the current sizes; the budgets themselves were not raised with them.
+
+### Fixed
+
+Found by two ocr passes over the whole package (87 comments in the second, all re-checked against
+source and a real host with seeded data) plus that host pass; each one is reproduced by a case in the
+suites below.
+
+- **The epoch could go permanently NaN.** `dsh_meta.statsEpoch` was read back with `Number(...)`;
+  one unreadable value made every later flush compare `NaN !== NaN`, so every batch was dropped as
+  "another host reset us", and `reset()` wrote `"NaN"` straight back. `parseEpoch` now falls back to
+  0 and `reset()` only advances the in-memory epoch after `COMMIT` succeeds
+  (`lib/insights-store.ts`).
+- **A held write lock dropped the batch and blocked the caller for five seconds.** The flush now
+  reports failure to its caller, which puts the batch back (bounded by `BUFFER_LIMIT`) and re-arms the
+  timer; the purge side of the same transaction moved under `BEGIN IMMEDIATE` so a reset by another
+  process cannot land between the epoch read and the write.
+- **Recording after `close()` reached a closed handle.** `push` / `schedule` / `reset` / `flushNow`
+  all check `closed` first, and `close()` flushes before setting it, so the last few records are not
+  thrown away.
+- **A pipe-only deployment never created the ledger directory.** `ensureParentDir` now runs inside
+  `openInsightsStore`, so statistics work when the prefix side never installs (Windows, or `rtk` off
+  `PATH`).
+- **Ledger failures were silent.** `readPrefixLedger` / `createRtkLedger` take an optional `warn`
+  sink, and `PrefixOptions.warn` is wired to `ctx.logger().warn` — a broken bookkeeping chain says so
+  even when the diagnostic log is off. A missing `commands` table is not reported: that is "rtk never
+  recorded anything", not a fault.
+- **Chart state races.** A second `spec` change no longer mounts a second instance into the same
+  container; the follower only updates, and the leader owns disposal. A half-constructed handle
+  (chunk version mismatch) is released instead of leaking its canvas and resize listener. Dark mode
+  gets its own `--rtkc-chart-text` / `--rtkc-chart-grid`, re-read when `data-ds-dark-theme` flips.
+- **Window padding invented data before the ledger starts.** `zeroFillSeries` took the whole window
+  and filled it with zeros, so a 30-day view opened with a 0-height bar on a day the ledger has no
+  rows for — "no data yet" read as "saved nothing". It now starts at the bucket that contains
+  `dataStart`.
+- **Suggestions repeated and mis-scaled.** `potentialSuggestions` grouped by filter instead of
+  emitting one row per stored day (the stored table is keyed by day and filter), and the compression
+  hint said "compressed N times" while counting skipped attempts.
+- **Two all-zero readings were shown as real ones.** The card called a day "idle" while rewrite
+  attempts existed, and the KPI row printed "average rewrite latency: 0 ms" when no sample had been
+  measured.
+- **An unbuildable ledger directory made rtk write into the user's own ledger.** When
+  `prepareLedgerDir` could not create `$DSH_HOME/rtk/`, the injection path was cleared — and rtk
+  without `RTK_DB_PATH` falls back to its own `get_db_path()`, i.e. the ledger the user's terminal
+  writes to. `prepareLedgerDir` now returns two facts (`inject` / `writableDir`): the path is
+  injected **even when the directory cannot be created** (rtk then drops the row silently, exit 0,
+  a row missing at worst), while only a verified directory is registered with the sandbox and
+  reported as available. Polluting someone's data and losing one row are not the same severity.
+- **`FAILURES (31)` was read as "31 tests failed".** rtk's count is a *line* count — its parser
+  pushes every non-empty line of a failing block as its own entry, so a 15-failure run prints
+  `(31)` and a 40-failure run prints `(81)`. Rather than rewrite a number we have not verified, the
+  guard appends one line under the header stating what the count is and how many failing blocks the
+  input actually has (and, when `… +N more failures` is present, that not every block is expanded).
+  It stays silent when the block count cannot be established from the input.
+- **A placeholder was printed as if it were a measurement.** Rewrite form has no byte size to
+  measure, so `dsh_last_events.size_bucket` is `unknown` for every prefix row — and the "latest
+  rewrite" line rendered it verbatim as "已改写 · git status · 输入 unknown". The size segment is now
+  dropped entirely when nothing was measured (`whyLastNoSize` / `whyLastPlainNoSize`).
+
+- **A read face that threw took the whole endpoint with it.** `overview` / `insights` read straight
+  through `store?.read*()`, so a store closed under them (or held by another writer) rejected the
+  Remote call and the page could only say "load failed". `guardedStoreOf` now wraps every read: a
+  throw becomes an empty window plus one `warn` line naming which table failed, and the ledger side
+  keeps whatever it read. A failed read is also no longer indistinguishable from an empty one.
+- **`Math.max(...samples)` on an unbounded window.** Spreading every event of a 90-day window can
+  exceed the argument limit and throw `RangeError` exactly on the busiest installs. Replaced with a
+  loop (`lib/insights-service.ts`).
+- **Rewrite rows claimed a 100% success rate.** `prefixCommandRows` set `attempts` and `compressed`
+  to the row's `commands`; the ledger only holds rows rtk actually ran, so the computed `successPct`
+  was always 100. Both now copy `commands` with a comment saying what that means.
+- **"Latest event" could be missing while it existed.** `lastEventOf` scanned the newest 20 rows of
+  both shapes and filtered by form, so a busy compression stream could push the rewrite row out.
+  `readLastEventOf(form)` asks SQL for one row per shape instead.
+- **The data-start day read the whole pipe table.** `pipeDataStart` opened the day table from
+  `0000-00-00` just to take its first row; `readPipeFirstDay()` is `ORDER BY day LIMIT 1`.
+- **A purge failure rolled back a batch of good inserts.** `prune` ran inside the write transaction;
+  one failing `DELETE` discarded the records that had just been written. It now runs after `COMMIT`
+  in its own try/catch and only warns.
+- **A failed flush was silent.** The retry path kept the batch but said nothing; the first failure
+  now logs `cannot write the stats tables (…); keeping up to N records in memory and retrying`.
+- **Resetting left the migration snapshot behind.** `reset()` cleared the nine `dsh_*` tables but not
+  `dsh_meta.legacy`, so the page kept showing the old accumulator after a "clear". It is deleted in
+  the same transaction now.
+- **`readPrefixEvents` had no consumer** and was removed; `readLastEvents` keeps the newest rows.
+- **The read side waited five seconds for a write lock.** `BUSY_TIMEOUT_MS` is right for the writer
+  (rtk's own writer uses 5000) but the reader runs on the host's main thread through a synchronous
+  API. Reads now open with `timeout: 500`.
+- **`TOP_COMMANDS` truncated the wrong rows.** `ORDER BY saved DESC LIMIT 100` cut the low-yield tail
+  — i.e. exactly the families a suggestion is supposed to find — and made per-family totals disagree
+  with the window total. Raised to 2000.
+- **Clearing rtk's tables could follow a symlink and delete someone else's data.** `clearRtkCommands`
+  now refuses a symlinked database file, and does the five `DELETE`s inside one transaction instead
+  of swallowing every per-table error.
+- **Every ledger query wrapped the timestamp column in `date(…, 'localtime')`.** That defeats any
+  index rtk has on `timestamp` and scans the whole table on each poll. The window bound is now
+  compared against a pre-computed RFC3339 UTC string (`toRfc3339Utc`), with the local-day projection
+  kept for grouping only.
+- **Command families were mis-parsed three ways.** Wrapper options were taken as the command
+  (`sudo -u bob cargo test` → `-u`), only `/` was stripped from a path (a Windows path became the
+  family, leaking the user's directory into the ledger), and a two-word family swallowed a file
+  argument (`pytest tests/test_api.py` → `pytest tests/test_api.py`). Wrappers now skip their own
+  value-taking flags, both separators are stripped, and the second word must look like a subcommand.
+- **`rtk pipe` inherited `RTK_DB_PATH` from the host process.** The rewrite path already scrubbed it;
+  the pipe child now does too, so a stray variable cannot redirect rtk's bookkeeping.
+- **Non-shell tools were recorded as pipe skips.** Every non-bash call wrote a `not-shell` row, which
+  polluted "the latest compression" and the skip-reason table with rows that were never candidates.
+  They are not recorded at all; a downstream block and a downstream value rewrite are also two
+  different reasons now (`downstream-block` / `downstream-value`).
+- **`ChartSpec.compact` was declared and never read.** The settings card's 132px chart rendered with
+  the page's grid and five split numbers. `compact` now drives both (`grid`, `splitNumber`), and the
+  card asks for it.
+- **A dead branch said `yAxisIndex` depends on the shape.** `lineSeriesOf` is only reached from the
+  combo path, so the condition was always true; it is now the constant it was.
+- **The two selects had no accessible name.** `Picker` takes a `label` and writes it to
+  `aria-label`; the page passes `rangeLabel` / `granularityLabel`.
+- **Switching shape could land an old reply on the new view.** `reload` had no generation counter;
+  a slow 90-day reply could overwrite a fresh 7-day one. Each request carries a generation and stale
+  replies are dropped.
+- **Negative ratios produced `width: -25%`.** `ratioOf` now floors at 0 and caps at 1.
+- **Counts were formatted as token volumes.** The workdir and skip-reason tables ran `formatTokens`
+  over `commands` / `count`, so "1500 calls" printed `1.5k` while the KPI row printed `1500`.
+- **The sparse-chart note said "days" while counting buckets.** With weekly or monthly granularity
+  the sentence was wrong; it now says "buckets" / 「时间段」.
+- **`sectionKpi` / `sectionChart` / `sectionWhy` were dead keys**, and `data-rtk-panel-icon` was
+  written onto the icon with no CSS consuming it. Both removed.
+- **A failed chunk load was cached forever.** One transient failure left every later open without a
+  chart for the rest of the session. Failures are no longer cached, and both "chunk did not load"
+  and "chunk loaded but exports the wrong thing" log a line.
+- **A chart handle was updated on a node that no longer existed.** `ChartState` did not remember
+  which container the handle was mounted on, so a conditional re-render could push an update into a
+  detached node. It records the node now and re-mounts when it changes.
+- **The Remote endpoint trusted its input.** `insights(request)` is `InsightsRequestSchema.parse`d
+  inside the service too: the gateway codec checks the wire envelope, not the payload.
+- **A close error masked the real one.** `loadLegacyAccumulator` awaited `domain.close()` in
+  `finally`, so a throw from `close()` replaced whatever the read had already failed with.
+- **The sink kept handing out a store it was closing, and never retried a failed open.** The
+  disposer clears its `active` reference first, and `load()` only caches a *successful* open, so a
+  transient failure is retried on the next call.
+- **The generated banner named the wrong file.** Entry and chunk share one header, so
+  `client.insights-echarts.js` told readers to edit `src/client-entry.ts`. It now says "the sources
+  under `src/`".
+- **Nothing checked the chunk at load time.** `declareClientFreshness` only compared `client.js`, so
+  a stale chunk shipped silently; it now compares every declared chunk. `test/build-client.test.ts`
+  asserts the platform module stays external, and `test/publish-manifest.test.ts` asserts every
+  `client.*.js` on disk is in `files`.
+
+### Tests
+
+- 854 cases across 52 files with the four coverage dimensions at 100%. New suites cover the view
+  model (`test/insights-view.test.ts`), the service (`test/insights-service.test.ts`), the store
+  (`test/insights-store.test.ts`), the ledger (`test/rtk-ledger.test.ts`), path resolution
+  (`test/rtk-paths.test.ts`), the SQLite face (`test/sqlite-face.test.ts`), prefix and pipe
+  instrumentation (`test/prefix-insights.test.ts`, `test/pipe-insights.test.ts`), the page
+  projection, and the chunk split in `test/build-client.test.ts`.
+- `test/readme-parity.test.ts` keeps the two READMEs structurally identical, and
+  `test/publish-manifest.test.ts` keeps the new chunk in `files`.
+
 ## 0.1.2
 
 Bumped `@jayyuen66/dsh-plugin-shared` to `^0.2.10`. The settings-card sticky save bar no longer picks up an opaque background from an older fixed-id `CARD_UI_CSS`. The client bundle was rebuilt. No public tool, Remote method, or config surface changed.

@@ -1,4 +1,4 @@
-// 客户端读面的单测：remote 现读、挂载缓存、失败后重试、线上结果拆包。
+// 客户端读面的单测：remote 现读、挂载缓存、失败后重试、线上结果拆包、带参端点的 codec。
 //
 // 替身只实现 `RemoteHost` 的 `get` 一位（官方 `Context["get"]` 的最小投影），
 // 按名字查表——**不用 `??` 兜底**：`{ remote: null }` 要表达的是「remote 在场但形状不对」，
@@ -7,9 +7,18 @@ import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import { PACKAGE_NAME, STATS_DESCRIPTORS, createStatsReader } from "../src/stats-reader.ts";
 import type { RemoteHost } from "../src/stats-reader.ts";
+import type { InsightsRequest } from "../lib/insights-shape.ts";
 
 /** 网关给命名空间注册的服务键（与 src/stats-reader.ts 的 `remote.<namespace>` 同源）。 */
 const SERVICE_KEY = "remote.rtkStats";
+
+/** 复用的字面量。 */
+const NAMESPACE = "rtkStats";
+const METHODS = ["overview", "insights", "status", "reset"] as const;
+const CARGO_FILTER = "cargo-test";
+const CARGO_FAMILY = "cargo test";
+const MISSING_NAMESPACE = /remote namespace remote\.rtkStats is missing/u;
+const REQUEST: InsightsRequest = { form: "pipe", rangeDays: 7, granularity: "day" };
 
 /** 一份形状正确的线上结果。 */
 function ok<Value>(value: Value): { ok: true; value: Value } {
@@ -27,7 +36,6 @@ interface StubOptions {
 function hostOf(options: StubOptions = {}): {
   host: RemoteHost;
   mountCalls: () => number;
-  setRemote: (next: unknown) => void;
   setNamespace: (next: unknown) => void;
 } {
   let remote: unknown = "remote" in options ? options.remote : {};
@@ -58,10 +66,6 @@ function hostOf(options: StubOptions = {}): {
   return {
     host,
     mountCalls: () => mountCalls.length,
-    setRemote: (next) => {
-      remote = next;
-      services.set("remote", next);
-    },
     setNamespace: (next) => {
       namespace = next;
       services.set(SERVICE_KEY, next);
@@ -69,44 +73,92 @@ function hostOf(options: StubOptions = {}): {
   };
 }
 
-/** 一份形状完整的投影（`statsSummarySchema` 十个字段）。**不能只写部分字段**：
- *  读取器对线上回执跑 schema，缺字段会被 `parseOrThrow` 当场点名为 `expected number, received undefined`
- *  ——那正是「读到坏形状就报错、不硬转」这条设计的可见面。 */
-function summaryOf(
-  commands: number,
-  savedBytes: number,
-): {
+/** 今日六个数（`FormTodaySchema`）。 */
+interface Today {
   commands: number;
-  originalBytes: number;
-  compressedBytes: number;
-  savedBytes: number;
-  originalTokens: number;
-  compressedTokens: number;
   savedTokens: number;
   savingsPct: number;
-  byFilter: Record<string, { commands: number; savedBytes: number; savedTokens: number }>;
-  byForm: { prefix: number; pipe: number };
-  topFilters: readonly {
-    filter: string;
-    commands: number;
-    savedTokens: number;
-    sharePct: number;
-  }[];
-} {
+  compressed: number;
+  attempts: number;
+  coveragePct: number;
+}
+
+function todayOf(commands: number): Today {
   return {
     commands,
-    originalBytes: savedBytes + 10,
-    compressedBytes: 10,
-    savedBytes,
-    // token 两列刻意与字节取不同的数：两套账填同一个数时，「按 token 算」与「按字节算」
-    // 在断言里长得一模一样。
-    originalTokens: savedBytes / 2 + 5,
-    compressedTokens: 5,
-    savedTokens: savedBytes / 2,
-    savingsPct: 0,
-    byFilter: {},
-    byForm: { prefix: 0, pipe: 1 },
-    topFilters: [],
+    savedTokens: commands * 10,
+    savingsPct: 50,
+    compressed: commands,
+    attempts: commands,
+    coveragePct: 100,
+  };
+}
+
+/** 一份形状完整的概览（`StatsOverviewSchema` 三个字段）。**不能只写部分字段**：
+ *  读取器对线上回执跑 schema，缺字段会被 `parseOrThrow` 当场点名为
+ *  `expected number, received undefined` ——那正是「读到坏形状就报错、不硬转」的可见面。 */
+interface Overview {
+  today: { prefix: Today; pipe: Today };
+  availability: { prefix: string; pipe: string; reasons: readonly never[] };
+  legacy: null;
+}
+
+function overviewOf(commands: number): Overview {
+  return {
+    today: { prefix: todayOf(commands), pipe: todayOf(commands * 2) },
+    availability: { prefix: "ok", pipe: "ok", reasons: [] },
+    legacy: null,
+  };
+}
+
+/** 一行 filter 明细（十一项 + name）。 */
+function filterOf(name: string, savedTokens: number): Record<string, unknown> {
+  return {
+    name,
+    commands: 3,
+    attempts: 3,
+    compressed: 3,
+    originalTokens: 900,
+    compressedTokens: 300,
+    savedTokens,
+    savingsPct: 66.67,
+    coveragePct: 30,
+    latencyAvgMs: 40,
+    lastUsedAt: 1,
+  };
+}
+
+/** 一份形状完整的 Insights 回执（十四个字段，含两个可空位）。 */
+function insightsOf(request: InsightsRequest): Record<string, unknown> {
+  const today = todayOf(1);
+  return {
+    form: request.form,
+    rangeDays: request.rangeDays,
+    granularity: request.granularity,
+    availability: { prefix: "ok", pipe: "ok", reasons: [] },
+    today: { prefix: today, pipe: today },
+    totals: {
+      bashCalls: 10,
+      attempts: 4,
+      compressed: 2,
+      originalTokens: 1000,
+      compressedTokens: 200,
+      savedTokens: 800,
+      savingsPct: 80,
+      coveragePct: 20,
+      successPct: 50,
+      latencyAvgMs: 30,
+      latencyMaxMs: 90,
+    },
+    series: [],
+    filters: [],
+    commands: [],
+    workdirs: [],
+    skipReasons: [],
+    lastEvent: null,
+    suggestions: [],
+    legacy: null,
+    dataStart: null,
   };
 }
 
@@ -127,40 +179,84 @@ function statusOf(enabled: boolean): {
   };
 }
 
-/** 命名空间替身：三个方法各回一条线上结果。 */
-function namespaceOf(values: {
-  summary?: unknown;
-  status?: unknown;
-  reset?: unknown;
-  summaryFails?: boolean;
-}): Record<string, () => Promise<unknown>> {
+/** 命名空间替身：四个方法各回一条线上结果，`insights` 记下收到的实参个数。 */
+interface NamespaceValues {
+  readonly overview?: unknown;
+  readonly insights?: unknown;
+  readonly status?: unknown;
+  readonly reset?: unknown;
+  readonly overviewFails?: boolean;
+  readonly seen?: unknown[];
+  readonly argCounts?: number[];
+}
+
+function namespaceOf(
+  values: NamespaceValues,
+): Record<string, (...args: readonly unknown[]) => Promise<unknown>> {
   return {
-    summary: () =>
-      Promise.resolve(
-        values.summaryFails === true
+    overview: () => {
+      values.argCounts?.push(0);
+      return Promise.resolve(
+        values.overviewFails === true
           ? { ok: false, error: { code: "boom", message: "网关拒绝" } }
-          : ok(values.summary),
-      ),
+          : ok(values.overview),
+      );
+    },
+    insights: (...args) => {
+      values.seen?.push(args[0]);
+      return Promise.resolve(ok(values.insights));
+    },
     status: () => Promise.resolve(ok(values.status)),
     reset: () => Promise.resolve(ok(values.reset)),
   };
 }
 
 describe("descriptor 与常量", () => {
-  it("三条 descriptor 的 id / service / namespace / method 两两对应，全部无参一元", () => {
-    assert.equal(STATS_DESCRIPTORS.length, 3);
+  it("四条 descriptor 的 id / service / namespace / method 两两对应", () => {
+    assert.equal(STATS_DESCRIPTORS.length, 4);
     for (const descriptor of STATS_DESCRIPTORS) {
-      assert.equal(descriptor.id, `${PACKAGE_NAME}#rtkStats/${descriptor.method}`);
-      assert.equal(descriptor.service, "rtkStats");
-      assert.equal(descriptor.namespace, "rtkStats");
-      assert.equal(descriptor.parameters.length, 0);
+      assert.equal(descriptor.id, `${PACKAGE_NAME}#${NAMESPACE}/${descriptor.method}`);
+      assert.equal(descriptor.service, NAMESPACE);
+      assert.equal(descriptor.namespace, NAMESPACE);
       assert.deepEqual(descriptor.invocation, { kind: "direct" });
       assert.deepEqual(descriptor.result, { mode: "src-json" });
     }
     assert.deepEqual(
       STATS_DESCRIPTORS.map((entry) => entry.method),
-      ["summary", "status", "reset"],
+      [...METHODS],
     );
+  });
+
+  it("只有 insights 带参，且那一枚是 strict codec（网关的硬要求）", () => {
+    const withParams = STATS_DESCRIPTORS.filter((entry) => entry.parameters.length > 0);
+    assert.deepEqual(
+      withParams.map((entry) => entry.method),
+      ["insights"],
+    );
+    const [parameter] = withParams[0]?.parameters ?? [];
+    assert.ok(parameter !== undefined);
+    assert.equal(parameter.name, "request");
+    assert.equal(parameter.wire, "request");
+    assert.equal(parameter.source, "json");
+    assert.equal(parameter.codec.mode, "strict");
+  });
+
+  it("codec 的身份串按 `<包名>#<语义名>` 命名，且 parse 拒绝坏请求", () => {
+    const [parameter] = STATS_DESCRIPTORS[1]?.parameters ?? [];
+    assert.ok(parameter !== undefined);
+    const { codec } = parameter;
+    // 收窄成 strict 那一支才能读 `create`：联合里的 `src-json` 支没有它。
+    if (codec.mode !== "strict") {
+      assert.fail("insights 的入参 codec 必须是 strict");
+    }
+    assert.equal(codec.typeSymbol, `${PACKAGE_NAME}#insights-request`);
+    const parser = codec.create();
+    assert.deepEqual(parser.parse(REQUEST), REQUEST);
+    // 三个字段各错一个：form / rangeDays / granularity，再加一个空对象。
+    assert.throws(() => parser.parse({ ...REQUEST, form: "both" }), /form/u);
+    assert.throws(() => parser.parse({ ...REQUEST, rangeDays: 10 }), /rangeDays/u);
+    assert.throws(() => parser.parse({ ...REQUEST, granularity: "hour" }), /granularity/u);
+    assert.throws(() => parser.parse({}), /form/u);
   });
 });
 
@@ -178,27 +274,29 @@ describe("createStatsReader", () => {
 describe("读取器：remote 现读与挂载缓存", () => {
   it("命名空间晚到时先报错、到场后同一个读取器就能用（读取不钉死在 apply 期）", async () => {
     // 显式给 `undefined` 而不是不给：不给会落进默认值 `{}`，那是个合法记录，
-    // 报出来的就是 `namespace.summary is not a function`，"命名空间缺席"这一支反而不被测。
+    // 报出来的就是 `namespace.overview is not a function`，"命名空间缺席"这一支反而不被测。
     const { host, setNamespace } = hostOf({ namespace: undefined });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
-    await assert.rejects(() => reader.summary(), /remote namespace remote\.rtkStats is missing/u);
-    setNamespace(namespaceOf({ summary: summaryOf(1, 2) }));
-    const summary = await reader.summary();
-    assert.deepEqual(summary, summaryOf(1, 2));
+    await assert.rejects(() => reader.overview(), MISSING_NAMESPACE);
+    setNamespace(namespaceOf({ overview: overviewOf(1) }));
+    const overview = await reader.overview();
+    assert.deepEqual(overview, overviewOf(1));
   });
 
-  it("$mount 只跑一次（成功结论被缓存），三个方法复用同一份挂载", async () => {
+  it("$mount 只跑一次（成功结论被缓存），四个方法复用同一份挂载", async () => {
     const { host, mountCalls } = hostOf({
       namespace: namespaceOf({
-        summary: summaryOf(1, 0),
+        overview: overviewOf(1),
+        insights: insightsOf(REQUEST),
         status: statusOf(true),
-        reset: summaryOf(0, 0),
+        reset: overviewOf(0),
       }),
     });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
-    await reader.summary();
+    await reader.overview();
+    await reader.insights(REQUEST);
     await reader.status();
     await reader.reset();
     assert.equal(mountCalls(), 1);
@@ -206,13 +304,13 @@ describe("读取器：remote 现读与挂载缓存", () => {
 
   it("并发调用只挂载一次（同一个 promise 被两处 await）", async () => {
     const { host, mountCalls } = hostOf({
-      namespace: namespaceOf({ summary: summaryOf(1, 0) }),
+      namespace: namespaceOf({ overview: overviewOf(1) }),
     });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
-    const [first, second] = await Promise.all([reader.summary(), reader.summary()]);
-    assert.deepEqual(first, summaryOf(1, 0));
-    assert.deepEqual(second, summaryOf(1, 0));
+    const [first, second] = await Promise.all([reader.overview(), reader.overview()]);
+    assert.deepEqual(first, overviewOf(1));
+    assert.deepEqual(second, overviewOf(1));
     assert.equal(mountCalls(), 1);
   });
 
@@ -220,13 +318,13 @@ describe("读取器：remote 现读与挂载缓存", () => {
     const failure = new Error("gateway restarted");
     const { host, mountCalls } = hostOf({
       mounts: [failure, { mounted: true }],
-      namespace: namespaceOf({ summary: summaryOf(3, 0) }),
+      namespace: namespaceOf({ overview: overviewOf(3) }),
     });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
-    await assert.rejects(() => reader.summary(), /gateway restarted/u);
-    const summary = await reader.summary();
-    assert.deepEqual(summary, summaryOf(3, 0));
+    await assert.rejects(() => reader.overview(), /gateway restarted/u);
+    const overview = await reader.overview();
+    assert.deepEqual(overview, overviewOf(3));
     assert.equal(mountCalls(), 2);
   });
 
@@ -234,7 +332,7 @@ describe("读取器：remote 现读与挂载缓存", () => {
     const { host } = hostOf({ namespace: 42 });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
-    await assert.rejects(() => reader.summary(), /remote namespace remote\.rtkStats is missing/u);
+    await assert.rejects(() => reader.overview(), MISSING_NAMESPACE);
   });
 
   it("remote 在场但不是 mounter（缺 $mount）时报「通道不可用」，不炸在类型上", async () => {
@@ -242,6 +340,49 @@ describe("读取器：remote 现读与挂载缓存", () => {
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     await assert.rejects(() => reader.status(), /remote channel is not available/u);
+  });
+});
+
+describe("读取器：带参端点", () => {
+  it("insights 把请求原样发给命名空间，解包后过 schema 交回", async () => {
+    const seen: unknown[] = [];
+    const { host } = hostOf({
+      namespace: namespaceOf({ insights: insightsOf(REQUEST), seen }),
+    });
+    const reader = createStatsReader(host);
+    assert.ok(reader !== undefined);
+    const response = await reader.insights(REQUEST);
+    assert.deepEqual(seen, [REQUEST], "实参就是调用方给的那个对象，读取器不替它补字段");
+    assert.equal(response.form, REQUEST.form);
+    assert.equal(response.rangeDays, REQUEST.rangeDays);
+    assert.equal(response.granularity, REQUEST.granularity);
+    assert.equal(response.totals.savedTokens, 800);
+  });
+
+  it("无参方法一个实参都不传（空数组也不传）", async () => {
+    const argCounts: number[] = [];
+    const { host } = hostOf({
+      namespace: {
+        overview: (...args: readonly unknown[]) => {
+          argCounts.push(args.length);
+          return Promise.resolve(ok(overviewOf(1)));
+        },
+      },
+    });
+    const reader = createStatsReader(host);
+    assert.ok(reader !== undefined);
+    await reader.overview();
+    assert.deepEqual(argCounts, [0]);
+  });
+
+  it("线上回执坏形状时点名缺哪个字段（读到坏形状就报错，不硬转）", async () => {
+    // 只给请求位、没有 availability/totals：跨版本时网关可能只回旧形状。
+    const { host } = hostOf({
+      namespace: namespaceOf({ insights: { ...REQUEST } }),
+    });
+    const reader = createStatsReader(host);
+    assert.ok(reader !== undefined);
+    await assert.rejects(() => reader.insights(REQUEST), /availability|totals/u);
   });
 });
 
@@ -257,32 +398,68 @@ describe("读取器：线上结果拆包", () => {
     const { host } = hostOf({ namespace: { status: () => Promise.resolve(ok({})) } });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
-    await assert.rejects(() => reader.summary(), /has no method summary/u);
+    await assert.rejects(() => reader.overview(), /has no method overview/u);
   });
 
   it("result.ok 为假时把 code 与 message 一起抛出来（不吞成因）", async () => {
-    const { host } = hostOf({ namespace: namespaceOf({ summaryFails: true }) });
+    const { host } = hostOf({ namespace: namespaceOf({ overviewFails: true }) });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
-    await assert.rejects(() => reader.summary(), /boom: 网关拒绝/u);
+    await assert.rejects(() => reader.overview(), /boom: 网关拒绝/u);
   });
 
   it("线上回执不是记录（标量 / 数组）时报 wire result 错误，不把 42 当回执拆", async () => {
-    const { host } = hostOf({ namespace: { summary: () => Promise.resolve(42) } });
+    const { host } = hostOf({ namespace: { overview: () => Promise.resolve(42) } });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
-    await assert.rejects(() => reader.summary(), /did not return a wire result/u);
+    await assert.rejects(() => reader.overview(), /did not return a wire result/u);
   });
 
-  it("线上回执是记录但不合 schema 时点名缺哪个字段（读到坏形状就报错，不硬转）", async () => {
-    // 少了 savedBytes / savingsPct / byFilter 三个：跨版本时网关可能只回旧形状。
+  it("概览回执合 schema 但字段类型不对时点名字段", async () => {
+    const broken = { ...overviewOf(1), today: { prefix: 1, pipe: 2 } };
+    const { host } = hostOf({ namespace: namespaceOf({ overview: broken }) });
+    const reader = createStatsReader(host);
+    assert.ok(reader !== undefined);
+    await assert.rejects(() => reader.overview(), /today/u);
+  });
+
+  it("reset 交回的是概览形状（不是旧的 summary）", async () => {
+    const { host } = hostOf({ namespace: namespaceOf({ reset: overviewOf(0) }) });
+    const reader = createStatsReader(host);
+    assert.ok(reader !== undefined);
+    const after = await reader.reset();
+    assert.equal(after.today.pipe.commands, 0);
+    assert.deepEqual(after.availability, { prefix: "ok", pipe: "ok", reasons: [] });
+  });
+});
+
+describe("读取器：明细行两套键", () => {
+  it("filters 行按 name 归组，值原样过 schema", async () => {
+    const filters = [filterOf(CARGO_FILTER, 600)];
     const { host } = hostOf({
-      namespace: {
-        summary: () => Promise.resolve(ok({ commands: 1, originalBytes: 10, compressedBytes: 2 })),
-      },
+      namespace: namespaceOf({ insights: { ...insightsOf(REQUEST), filters } }),
     });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
-    await assert.rejects(() => reader.summary(), /savedBytes/u);
+    const response = await reader.insights(REQUEST);
+    assert.equal(response.filters.length, 1);
+    const [row] = response.filters;
+    assert.ok(row !== undefined);
+    assert.equal(row.name, CARGO_FILTER);
+    assert.equal(row.savedTokens, 600);
+  });
+
+  it("commands 行按 family 归组（表头不能沿用 name）", async () => {
+    const commands = [{ ...filterOf(CARGO_FAMILY, 600), family: CARGO_FAMILY }];
+    const { host } = hostOf({
+      namespace: namespaceOf({ insights: { ...insightsOf(REQUEST), commands } }),
+    });
+    const reader = createStatsReader(host);
+    assert.ok(reader !== undefined);
+    const response = await reader.insights(REQUEST);
+    const [row] = response.commands;
+    assert.ok(row !== undefined);
+    assert.equal(row.family, CARGO_FAMILY);
+    assert.equal(Object.hasOwn(row, "name"), false, "commands 行不该留 name 这一位");
   });
 });

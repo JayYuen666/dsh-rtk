@@ -4,7 +4,8 @@
 // 槽位 key（BUNDLE_PKG）与宿主模块表键必须逐字相同——build-client.mjs 在构建期核对它，
 // 因此这个字面量不能改成模板串。导出形态与兄弟仓一致：只有命名导出，没有 default——
 // 两者混用会让 rolldown 报 MIXED_EXPORTS，且外壳那层取默认导出时拿到的是命名空间对象。
-import { createElement, useCallback, useEffect, useRef, useState } from "react";
+import { createElement, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { RiskConfirmation } from "@deepseek-ai/dsh-client-ui-primitives";
 import type { ReactNode } from "react";
 import {
   CardForm,
@@ -28,7 +29,6 @@ import { RTK_LOGO_DATA_URI } from "./rtk-icon.ts";
 import {
   FORM_MODES,
   cardStore,
-  chartBarsOf,
   draftFields,
   enabledHintKeyOf,
   formModeOf,
@@ -37,14 +37,30 @@ import {
   numberOf,
   stringListOf,
 } from "../lib/card-logic.ts";
-import type { CardSnapshot, CardFields, ChartBar, SettingScope } from "../lib/card-logic.ts";
+import type { CardSnapshot, CardFields, SettingScope } from "../lib/card-logic.ts";
 import { ALL_FILTERS } from "../lib/command-filter.ts";
 import { MIN_RTK_VERSION } from "../lib/rtk-version.ts";
-import type { StatsStatus, StatsSummary } from "../lib/stats-shape.ts";
+import type { AvailabilityReason, StatsOverview } from "../lib/insights-shape.ts";
+import type { StatsStatus } from "../lib/stats-shape.ts";
 import { createStatsReader } from "./stats-reader.ts";
 import type { StatsReader } from "./stats-reader.ts";
+import { RtkPanelIcon } from "./insights-icon.ts";
+import { InsightsPage } from "./insights-page.ts";
+import { useChart } from "./insights-chart-hook.ts";
+import type { ChartSpec } from "./insights-chart-spec.ts";
+import { PANEL_ID, PANEL_ORDER, cardKpiRowsOf } from "../lib/insights-page-logic.ts";
+import type { CardKpiRow } from "../lib/insights-page-logic.ts";
 import { UI_MESSAGES } from "./ui-messages.ts";
-import type { Translate } from "./ui-messages.ts";
+import type { Translate, UiMessages } from "./ui-messages.ts";
+
+/** 卡片上那句不可用提示：原因码 → 文案键（与 Insights 页脚共用同一组键）。 */
+const CARD_AVAILABILITY_KEYS: Readonly<Record<AvailabilityReason, keyof UiMessages>> = {
+  prefixReadonly: "availPrefixReadonly",
+  prefixMissing: "availPrefixMissing",
+  prefixUnreadable: "availPrefixUnreadable",
+  prefixSchema: "availPrefixSchema",
+  pipeUnavailable: "availPipeUnavailable",
+};
 
 /** bundle 包名。槽位 key 必须用它（owner 派发 `entryKey: pkg.name`），用 `id: rtk` 卡片不渲染。
  *  必须是**字面量声明**：build-client.mjs 的 verifyName 用 `/(?:const|let|var)\s+BUNDLE_PKG\s*=\s*"…"/`
@@ -60,28 +76,164 @@ const SECTION_ID = "rtk";
 const SECTION_ORDER = 31;
 /** 卡片样式表 id：同一页面挂两张同 id 的 <style> 会让后一张覆盖前一张。 */
 const STYLE_ID = "rtk-card-css";
-/** 统计轮询间隔：卡片挂在设置页/插件页期间每 5 秒拉一次 summary 与 status。 */
+/** 统计轮询间隔：卡片挂在设置页/插件页期间每 5 秒拉一次概览与 status。 */
 const STATS_REFRESH_MS = 5000;
 /** 卡片自有样式；shared 的 CARD_UI_CSS 由 ensureCardUiCss 单独注入，本文件只放差异项。 */
 const CARD_CSS = [
   ".rtkc-note{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary,inherit);margin:6px 0}",
-  ".rtkc-hint{font-size:12px;line-height:1.7;margin:6px 0;padding:6px 8px;border-radius:6px;background:var(--dsw-alias-bg-warning,#3a2d12);color:var(--dsw-alias-label-primary,inherit)}",
+  // 提示条：宿主没有「警告底色」这一档别名（`--dsw-alias-state-warn-primary` 是实心琥珀色，
+  // 铺成底会把正文压死），所以这里用同色系淡底写死——深浅主题各看得清，也不冒充宿主的语义色。
+  ".rtkc-hint{font-size:12px;line-height:1.7;margin:6px 0;padding:6px 8px;border-radius:6px;background:rgba(224,166,58,.12);box-shadow:inset 0 0 0 1px rgba(224,166,58,.28);color:var(--dsw-alias-label-primary,inherit)}",
   ".rtkc-ready{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary,inherit);margin:6px 0}",
   ".rtkc-actions{margin-top:8px}",
-  // 条形图：纯 div + 宽度百分比，不引第三方图表库（宿主没有可复用的，client 产物只外置
-  // react 与 zod，每多一个依赖都要进产物体积预算）。轨道用半透明前景色，填充用主色，
-  // 主题切换跟着 CSS 变量走，不必在 JS 里读主题。
-  ".rtkc-chart{display:flex;flex-direction:column;gap:6px;margin:8px 0 4px}",
-  ".rtkc-chart-row{display:grid;grid-template-columns:1fr;gap:2px}",
-  ".rtkc-chart-track{position:relative;height:8px;border-radius:4px;background:color-mix(in srgb,currentColor 12%,transparent);overflow:hidden}",
-  ".rtkc-chart-fill{position:absolute;inset-block:0;inset-inline-start:0;border-radius:4px;background:currentColor;opacity:.75}",
-  ".rtkc-chart-label{font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit)}",
+  // 今日摘要：卡片里的 KPI 格。**不复用洞察页那六格**：那是窗口总量、这是今日单形态，
+  // 标签与量纲都不同；共用一套类名会让两处任何一次微调互相牵连。
+  ".rtkc-today-block{margin:8px 0 4px}",
+  ".rtkc-today-block .rtkc-subtitle{margin:0 0 10px}",
+  // 卡片里的两格：比洞察页的六格高一点点（多一行量条），窄屏各占一半、再窄就整行。
+  ".rtkc-today-block .rtkc-kpis{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}",
+  // 这里只补卡片特有的两点（竖排、给右上角留位）；`gap` 与 `padding` 交给 `.rtkc-kpi`
+  // ——两处都写时后加载的那条赢，而「哪条赢」取决于样式注入顺序，不是我们能保证的事。
+  ".rtkc-kpi-card{flex-direction:column;position:relative}",
+  '.rtkc-kpi-card[data-idle="true"]{opacity:.72}',
+  ".rtkc-kpi-body{display:flex;flex-direction:column;gap:6px;min-width:0}",
+  ".rtkc-kpi-line{display:flex;align-items:baseline;gap:4px;flex-wrap:wrap;line-height:1.35}",
+  ".rtkc-kpi-line .rtkc-kpi-value{font-size:16px}",
+  // 量纲词比数字小两档、比标签淡：`67 次 · 81.3k token` 里读者先看数字，但不知道单位就
+  // 得回头猜「67 是什么」。放在数字右侧而不是标签里，是因为两格的单位都不同。
+  ".rtkc-kpi-unit{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-secondary,inherit)}",
+  ".rtkc-kpi-sep{font-size:11px;color:var(--dsw-alias-label-secondary,inherit);opacity:.6;margin:0 2px}",
+  // 量条 + 百分比：条给「占比感」，数字给准值。条在前数字在后，读起来是「占这么多，61.3%」。
+  // 条自己是独立元素而不是伪元素：宽度要跟着 `style.width` 走，伪元素塞不进去。
+  ".rtkc-kpi-meter{display:flex;align-items:center;gap:8px}",
+  ".rtkc-kpi-bar{flex:1;height:4px;border-radius:2px;background:var(--dsw-alias-border-l3,rgba(127,127,127,.28));overflow:hidden}",
+  ".rtkc-kpi-bar-fill{display:block;height:100%;border-radius:2px;background:var(--rtkc-chart-bar);transition:width .2s ease-out}",
+  ".rtkc-kpi-rate{font-size:12px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary,inherit);min-width:44px;text-align:right}",
+  ".rtkc-kpi-idle{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary,inherit)}",
   // 一级分区里没有插件页那层卡片外壳，自己给一点上下留白，样式与插件页那张卡一致。
-  ".rtkc-page{padding:4px 0 8px}",
   // 导航图标：官方标记的 PNG 当 alpha 遮罩，颜色由 `background-color: currentColor` 给，
   // 于是深色主题是浅色标记、浅色主题是深色标记，跟宿主导航行同色。图形一个像素都不改。
   // data URI 来自 `./rtk-icon.ts` 的常量而不是在这里再抄一份字面量：两处字面量迟早会不同步。
   `.rtkc-icon{display:inline-block;background-color:currentColor;-webkit-mask-size:100% 100%;mask-size:100% 100%;-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-image:url(${RTK_LOGO_DATA_URI});mask-image:url(${RTK_LOGO_DATA_URI})}`,
+  // ---- Insights 页 ----
+  //
+  // 字号阶梯（页面只用这四档，别再临时插 13px / 14px）：11 元信息与表头、12 正文与表格、
+  // 17 KPI 数字、1.05em 页标题。行高统一 1.5~1.65——这张页面数字多，行距紧了会挤成一团。
+  //
+  // 颜色只走三个来源：宿主别名变量（`--dsw-alias-*`，深浅主题自动跟）、本包四个图表变量、
+  // 三个语义色（成功绿 / 跳过黄 / 失败红）。语义色在浅色主题下要另一套，所以按
+  // `body:not([data-ds-dark-theme])` 覆盖一次，而不是把深色值写死。
+  //
+  // 宿主**没有** `bg-secondary` / `bg-primary` / `border-dim` / `bg-warning` 这四个别名（那是
+  // 我们早期凭空写的，全会静默落到 fallback）。真实的对应物记在这里，别再靠猜：
+  //   卡片底   `--dsw-alias-card-fill`（暗 #212123 / 亮 #fafafa）
+  //   内层块   `--dsw-alias-card-tile-fill`（暗 5% 白 / 亮 50% 白，叠在卡片底上）
+  //   边框     `--dsw-alias-border-l1/l2/l3`（暗 #ffffff0f/1f/29，亮 #0000000a/1a/1f）
+  //   hover 底 `--dsw-alias-interactive-bg-hover`（暗 #ffffff14 / 亮 #2631480f）
+  //   层底     `--dsw-alias-bg-layer-1/2/3`（暗 #232324/#2c2c2e/#353638，亮三档都是 #fff）
+  // 下面四个本包变量把「表面 / 内层 / 描边 / 悬停」收成一层间接：改主题只改这四行。
+  ":root{--rtkc-chart-bar:#3b6ef6;--rtkc-chart-line:#e08a2e;--rtkc-chart-text:#667085;--rtkc-chart-grid:#e4e7ec;--rtkc-ok:#3ec98a;--rtkc-skip:#e0a63a;--rtkc-fail:#e5645a;--rtkc-gap:12px}",
+  // 四个表面变量必须挂在 **body** 上而不是 :root：宿主把 `--dsw-alias-*` 全定义在 body
+  // （真机 `getComputedStyle(document.body).getPropertyValue("--dsw-alias-card-fill")` 有值，
+  // `document.documentElement` 上是空串）。挂在 :root 时 `var()` 在 html 上求值就落到 fallback，
+  // 于是主题换了、卡片底纹却一直是写死的那个 #1c1d20。
+  "body{--rtkc-surface:var(--dsw-alias-card-fill,#1c1d20);--rtkc-tile:var(--dsw-alias-card-tile-fill,rgba(255,255,255,.06));--rtkc-line:var(--dsw-alias-border-l2,rgba(127,127,127,.22));--rtkc-hover:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));--rtkc-raised:var(--dsw-alias-bg-layer-2,#2c2c2e)}",
+  // 图表配色走 CSS 变量：ECharts 在 chunk 里，读不到本包的样式表，只能由入口在挂载时
+  // 用 getComputedStyle 从这里取（见 `./insights-chart.ts` 的 paletteOf）。
+  //
+  // 轴文字与网格线**必须分主题**：上面 `:root` 那两个是浅色主题的取值（深灰字 + 浅灰线），
+  // 直接用在深色卡片上就是「深灰字压在 #212123 上」，对比度不足 4.5:1，真机上看不清刻度。
+  // 这样写在 body 上而不是只在 :root 改一次，是因为宿主的主题切换只改 body 的属性、不重渲染
+  // 本组件——`useChart` 里那条 MutationObserver 观察到属性变化后，会重新读这里取色再 update。
+  "body[data-ds-dark-theme]{--rtkc-chart-text:#9aa3b2;--rtkc-chart-grid:#ffffff1f}",
+  ".rtkc-page{display:flex;flex-direction:column;gap:var(--rtkc-gap);padding:4px 0 12px}",
+  ".rtkc-page-head{display:flex;align-items:center;justify-content:space-between;gap:12px}",
+  ".rtkc-page-title{display:flex;align-items:center;gap:8px;font-size:1.05em;font-weight:600;margin:0}",
+  // 刷新按钮：hover 才显出边框与底色。常驻边框会让页头看起来比页身还重。
+  ".rtkc-refresh{font:inherit;font-size:12px;padding:4px 12px;border-radius:7px;border:1px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer;transition:background .12s,border-color .12s,color .12s}",
+  ".rtkc-refresh:hover:not(:disabled){background:var(--rtkc-hover);border-color:var(--rtkc-line);color:var(--dsw-alias-label-primary,inherit)}",
+  ".rtkc-refresh:disabled{opacity:.55;cursor:default}",
+  // 控件区：上行形态（换页签换的是**整种数据**）、下行时间（换的是同一种数据的一段）。
+  // 两行之间留 12px、组内 8px：页签与时间栏不是同一级控件，挤成一行时用户会以为切页签
+  // 也会换时间范围（真机反馈原话就是「时间作为筛选条件需单独设计位置」）。
+  ".rtkc-page-controls{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px 16px}",
+  ".rtkc-controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px}",
+  ".rtkc-tabs{display:inline-flex;gap:2px;padding:3px;border-radius:9px;background:var(--rtkc-hover);border:1px solid var(--rtkc-line)}",
+  ".rtkc-tab{font:inherit;font-size:12px;line-height:1.5;padding:5px 18px;border-radius:6px;border:0;background:transparent;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer;transition:background .12s,color .12s}",
+  ".rtkc-tab:hover{color:var(--dsw-alias-label-primary,inherit);background:rgba(127,127,127,.12)}",
+  '.rtkc-tab[data-active="true"]{background:var(--rtkc-raised);color:var(--dsw-alias-label-primary,inherit);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.28)}',
+  '.rtkc-tab[data-active="true"]:hover{background:var(--rtkc-raised)}',
+  ".rtkc-tab:focus-visible{outline:2px solid var(--rtkc-chart-bar);outline-offset:1px}",
+  // 时间栏：一组「标签 + 两个下拉」，自己一块浅底，与页签在视觉上分成两件不同的事。
+  // 标签与下拉之间 8px、下拉之间 8px，两侧内边距不对称（左 10 右 6）——右边紧贴下拉的
+  // 圆角，留同样的 10px 会让整块看起来右侧空了一块。
+  ".rtkc-timebar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:5px 6px 5px 10px;border-radius:9px;background:var(--rtkc-tile);border:1px solid var(--rtkc-line)}",
+  ".rtkc-timebar-label{font-size:11px;line-height:1.5;letter-spacing:.06em;text-transform:uppercase;color:var(--dsw-alias-label-secondary,inherit);opacity:.75;white-space:nowrap}",
+  ".rtkc-select{font:inherit;font-size:12px;line-height:1.5;min-height:28px;padding:4px 8px;border-radius:6px;border:1px solid var(--rtkc-line);background:var(--rtkc-surface);color:var(--dsw-alias-label-primary,inherit);cursor:pointer;transition:border-color .12s,background .12s}",
+  ".rtkc-select:hover{border-color:var(--rtkc-chart-bar);background:var(--rtkc-hover)}",
+  ".rtkc-select:focus-visible{outline:2px solid var(--rtkc-chart-bar);outline-offset:1px}",
+  // 每一块都是卡片：深色主题下只靠间距分块，信息一多就糊成一片。
+  ".rtkc-card{padding:14px 16px;border-radius:12px;border:1px solid var(--rtkc-line);background:var(--rtkc-surface)}",
+  ".rtkc-block{margin:0}",
+  ".rtkc-subtitle{font-size:12px;font-weight:600;letter-spacing:.02em;color:var(--dsw-alias-label-secondary,inherit);margin:0 0 12px}",
+  // KPI：数字大、标签小，卡片之间 10px。hover 时描边亮一档，让人知道这块是可以停下来看的。
+  ".rtkc-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:10px}",
+  ".rtkc-kpi{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border-radius:9px;background:var(--rtkc-tile);border:1px solid var(--rtkc-line);transition:border-color .12s,transform .12s}",
+  ".rtkc-kpi:hover{border-color:var(--dsw-alias-border-l3,rgba(127,127,127,.42))}",
+  ".rtkc-kpi-label{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-secondary,inherit);white-space:nowrap}",
+  ".rtkc-kpi-value{font-size:17px;line-height:1.25;font-weight:600;font-variant-numeric:tabular-nums}",
+  ".rtkc-chart{width:100%;height:220px}",
+  // 卡片小图：**不能矮于 120px**。ECharts 的 `grid` 上下各留 28/24px 给刻度与轴标签，
+  // 64px 高时绘图区只剩约 10px——真机上表现为「一条横线 + 两个看不见的柱」，
+  // 看着像图坏了。162px 给柱子留出约 80px，两根柱子的高度差才读得出来。
+  ".rtkc-card-chart{width:100%;height:162px;margin:10px 0 2px}",
+  // 语义色点：成功绿 / 跳过黄 / 失败红。语义色在浅色主题下压暗一档（见下方覆盖）。
+  ".rtkc-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:7px;vertical-align:1px;background:var(--dsw-alias-label-secondary,#8a8f98)}",
+  '.rtkc-dot[data-tone="ok"]{background:var(--rtkc-ok)}',
+  '.rtkc-dot[data-tone="skip"]{background:var(--rtkc-skip)}',
+  '.rtkc-dot[data-tone="fail"]{background:var(--rtkc-fail)}',
+  // 「最近一次」整行按结局染色：7px 的圆点在一屏数字里太轻，一眼扫过去分不出上一次是成功
+  // 还是跳过。左边一条 2px 竖线 + 一层极淡底色，颜色与文字同时在场（不靠颜色单独表意——
+  // 色弱用户读到的仍是那行「已跳过 · git status · too-small」）。
+  ".rtkc-recent{display:flex;align-items:center;margin:0;padding:8px 10px;border-radius:8px;border-left:2px solid transparent;background:var(--rtkc-tile)}",
+  '.rtkc-recent[data-tone="ok"]{border-left-color:var(--rtkc-ok);background:rgba(62,201,138,.09)}',
+  '.rtkc-recent[data-tone="skip"]{border-left-color:var(--rtkc-skip);background:rgba(224,166,58,.09)}',
+  '.rtkc-recent[data-tone="fail"]{border-left-color:var(--rtkc-fail);background:rgba(229,100,90,.1)}',
+  // 表格：表头小一号大写、行 hover 提亮、首列吃余宽、数值列带量条。
+  //
+  // 表头**必须有实底**：它带 `position:sticky`，透明底时行会从字后面穿过去（深色主题下
+  // 两行数字叠在一起）。底色用「半透明内层叠在不透明的卡片底上」——单用半透明层在浅色
+  // 主题里几乎看不出，单用卡片底又和表体连成一片；叠出来的这一条在深浅两边都比表体深半档。
+  ".rtkc-tables{display:flex;flex-direction:column;gap:var(--rtkc-gap)}",
+  ".rtkc-table-wrap{overflow-x:auto;margin:0 -10px}",
+  ".rtkc-table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums}",
+  ".rtkc-table thead th{position:sticky;top:0;z-index:1;padding:7px 10px;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--dsw-alias-label-secondary,inherit);text-align:left;border-bottom:1px solid var(--rtkc-line);background:linear-gradient(var(--rtkc-tile),var(--rtkc-tile)),var(--rtkc-surface);white-space:nowrap}",
+  ".rtkc-table tbody td{padding:9px 10px;border-bottom:1px solid var(--rtkc-line);vertical-align:middle;transition:background .1s}",
+  // 斑马纹只给偶数行且比 hover 更淡：它是扫行时的辅助，hover 才是「我指着这一行」的反馈。
+  ".rtkc-table tbody tr:nth-child(even) td{background:rgba(127,127,127,.032)}",
+  ".rtkc-table tbody tr:last-child td{border-bottom:0}",
+  ".rtkc-table tbody tr:hover td{background:var(--rtkc-hover)}",
+  // 首列是「身份列」（命令 / 目录 / 原因），比数字重一档；它吃余宽，把数字列推到右边成一条。
+  ".rtkc-table thead th:first-child,.rtkc-table tbody td:first-child{width:100%}",
+  ".rtkc-table tbody td:first-child{color:var(--dsw-alias-label-primary,inherit);font-weight:500}",
+  ".rtkc-num{text-align:right!important;white-space:nowrap}",
+  ".rtkc-text{text-align:left}",
+  // 数值格：细量条 + 数字**同一行**并排。量条压在数字上方时行高会被撑到 60px。
+  ".rtkc-cell-metric{display:inline-flex;align-items:center;gap:7px;justify-content:flex-end;width:100%}",
+  ".rtkc-meter{display:block;width:46px;height:4px;border-radius:2px;background:var(--dsw-alias-border-l3,rgba(127,127,127,.28));overflow:hidden;flex:none}",
+  ".rtkc-meter-fill{display:block;height:100%;border-radius:2px;background:var(--rtkc-chart-bar);transition:width .2s ease-out}",
+  ".rtkc-cell-value{font-variant-numeric:tabular-nums}",
+  // 建议：卡片式，左边框按严重度换色（warn 用跳过黄，不用失败红——它是建议，不是错误）。
+  ".rtkc-suggestion{font-size:12px;line-height:1.6;margin:6px 0;padding:10px 12px;border-radius:9px;border-left:3px solid var(--rtkc-chart-bar);background:var(--rtkc-tile);transition:background .12s}",
+  ".rtkc-suggestion:hover{background:var(--rtkc-hover)}",
+  ".rtkc-suggestion-detail{display:block;margin-top:3px;color:var(--dsw-alias-label-secondary,inherit);opacity:.85}",
+  ".rtkc-warn{border-left-color:var(--rtkc-skip)!important}",
+  ".rtkc-empty{text-align:center;padding:28px 16px;color:var(--dsw-alias-label-secondary,inherit)}",
+  ".rtkc-footnote{margin:0;color:var(--dsw-alias-label-secondary,inherit);opacity:.75;font-size:11px}",
+  // 浅色主题下的语义色：深色值在浅底上偏荧光，压暗一档才看得清又不刺眼。
+  // 判据必须跟着宿主的 `body[data-ds-dark-theme]`（真机 body 上只有这一个属性，
+  // 没有 `data-theme`），写成 `[data-theme="light"]` 会永不匹配、浅色下仍是深色那套。
+  "body:not([data-ds-dark-theme]){--rtkc-ok:#12855a;--rtkc-skip:#a6701a;--rtkc-fail:#c0433a}",
 ].join("\n");
 
 export const inject = ["slots", "configForms", "locale"];
@@ -160,93 +312,235 @@ function RtkHint(props: { t: Translate; status: StatsStatus | undefined }): Reac
   return node;
 }
 
-/** 一根柱子（轨道 + 填充 + 文案）。抽成独立函数是为了让 `createElement` 的嵌套不超三层。 */
-function chartRow(t: Translate, bar: ChartBar): ReactNode {
-  // 百分比宽度是最省事的表达：不依赖任何布局测量，窗口缩放自动跟着走。
-  const fill = createElement("div", {
-    className: "rtkc-chart-fill",
-    style: { inlineSize: `${String(Math.round(bar.ratio * 100))}%` },
-  });
-  const track = createElement("div", { className: "rtkc-chart-track" }, fill);
-  const label = createElement(
-    "span",
-    { className: "rtkc-chart-label" },
-    t("statsChartRow", {
-      filter: bar.filter,
-      tokens: String(bar.savedTokens),
-      share: String(bar.share),
-    }),
+/** `67 次 · 81.3k token`：数字加粗、量纲词小一号且淡一档，换行时以「·」为界断开。 */
+function kpiLineOf(t: Translate, row: CardKpiRow): ReactNode {
+  return createElement(
+    "div",
+    { className: "rtkc-kpi-line" },
+    createElement("strong", { className: "rtkc-kpi-value" }, row.commands),
+    createElement("span", { className: "rtkc-kpi-unit" }, t("todayCommandsUnit")),
+    createElement("span", { className: "rtkc-kpi-sep" }, "·"),
+    createElement("strong", { className: "rtkc-kpi-value" }, row.saved),
+    createElement("span", { className: "rtkc-kpi-unit" }, t("todaySavedUnit")),
   );
-  return createElement("div", { key: bar.filter, className: "rtkc-chart-row" }, track, label);
+}
+
+/** 节省率量条 + 百分比数字。条给占比感，数字给准值。 */
+function kpiMeterOf(row: CardKpiRow): ReactNode {
+  const fill = createElement("span", {
+    className: "rtkc-kpi-bar-fill",
+    style: { width: `${String(row.meterPct)}%` },
+  });
+  const bar = createElement("span", { className: "rtkc-kpi-bar" }, fill);
+  return createElement(
+    "div",
+    { className: "rtkc-kpi-meter" },
+    bar,
+    createElement("span", { className: "rtkc-kpi-rate" }, row.savings),
+  );
+}
+
+/** 非空态的那两行：数字行 + 量条行。 */
+function cardKpiBodyOf(t: Translate, row: CardKpiRow): ReactNode {
+  return createElement("div", { className: "rtkc-kpi-body" }, kpiLineOf(t, row), kpiMeterOf(row));
+}
+
+/** 一格形态摘要：标签 + 次数/省下/节省率 + 一条节省率量条。
+ *
+ * 为什么用卡片格而不是一行文字：卡片里有九格配置项，纯文字行在它们中间读起来像脚注；
+ * 洞察页已经把「一格一个数」这套语言立起来了，两处同一套才不会像两个插件。
+ *
+ * `idle` 那一支渲染「还没有记录」而不是三个 0：0 会被读成「跑了命令但一分钱没省」，
+ * 而事实是今天这条形态没被用过（真机反馈原话「没有的就不要显示避免误导」）。
+ */
+function CardKpi(props: { t: Translate; row: CardKpiRow }): ReactNode {
+  const { t, row } = props;
+  const head = createElement("span", { className: "rtkc-kpi-label" }, t(row.labelKey));
+  const body = row.idle
+    ? createElement("span", { className: "rtkc-kpi-idle" }, t("todayIdle"))
+    : cardKpiBodyOf(t, row);
+  return createElement(
+    "div",
+    { className: "rtkc-kpi rtkc-kpi-card", "data-idle": row.idle },
+    head,
+    body,
+  );
 }
 
 /**
- * 按 filter 的 token 收益条形图。
+ * 设置卡里的今日摘要（`StatsOverview`）。
  *
- * 纯 div + 宽度百分比：宿主没有可复用的图表组件，而 client 产物只外置 react 与 zod——
- * 引一个 charts 库等于把几十 KB 塞进一个 88KB 的产物（`test/floors.ts` 的 budget 是 110KB）。
- * 这些柱子要表达的事情（谁最大、差多少）用长度就够了，不需要坐标轴与刻度。
+ * 只报**今天**：一屏之内说清「今天省了多少」就够，要看历史去 Insights 页。
+ * 两形态并排写而不是合并成一个节省率——spec §6 的口径是两档分开记账，
+ * 合起来算会得到一个既不是改写收益也不是压缩收益的数。
  *
- * 数据来自 `statsSummarySchema` 的 `topFilters`（宿主侧 `summarize` 已排好序并算了占比），
- * 本组件只做归一化与渲染，不重算口径。
+ * 读数缺席（remote 未连接 / 库打不开 / 首读还没回来）时给一行说明，不判错：
+ * 压缩本身不依赖统计，卡片上没有数字不等于功能坏了。
  */
-function StatsChart(props: { t: Translate; summary: StatsSummary }): ReactNode {
-  const bars = chartBarsOf(props.summary);
-  if (bars.length === 0) {
-    return createElement("p", { className: "rtkc-note" }, props.t("statsChartEmpty"));
+function StatsSummaryLine(props: { t: Translate; overview: StatsOverview | undefined }): ReactNode {
+  const { t, overview } = props;
+  if (overview === undefined) {
+    return createElement("p", { className: "rtkc-note" }, t("statsUnavailable"));
   }
-  const title = createElement("p", { className: "rtkc-note" }, props.t("statsChartTitle"));
-  const hint = createElement("p", { className: "rtkc-note" }, props.t("statsChartHint"));
+  const { availability } = overview;
+  const rows = cardKpiRowsOf(overview.today);
+  const cells = createElement(
+    "div",
+    { className: "rtkc-kpis" },
+    ...rows.map((row) => createElement(CardKpi, { t, row, key: row.key })),
+  );
   return createElement(
     "div",
-    { className: "rtkc-chart" },
-    title,
-    hint,
-    ...bars.map((bar) => chartRow(props.t, bar)),
+    { className: "rtkc-today-block" },
+    createElement("p", { className: "rtkc-subtitle" }, t("todayTitle")),
+    cells,
+    // 只有非 ok 才补一句：正常状态不该被一句提示占位。原因是**码**，句子在这里、按界面
+    // 语言拼（service 拼中文的话，en 宿主这张卡上就是一段中文）。
+    availability.reasons.length === 0
+      ? null
+      : createElement(
+          "p",
+          { className: "rtkc-note" },
+          t(CARD_AVAILABILITY_KEYS[availability.reasons[0] ?? "pipeUnavailable"]),
+        ),
   );
 }
 
-/** 统计区：读面缺失或首读未回来时给一行说明，不判错（压缩本身不受统计影响）。 */
+/**
+ * 卡片里的两柱图：今日改写省下的 token 与结果压缩省下的 token。
+ *
+ * 为什么是两柱而不是一根：spec §6 的账是分形态记的，合成一根就得先回答「改写收益怎么和
+ * 压缩收益相加」——它们量的不是同一件事（一个省的是命令输出，一个省的是被压缩的那段）。
+ * 两根并排放在同一个纵轴上，读者看到的是真实比例，不需要先信一个换算。
+ *
+ * 数据全部来自已经取回的 `overview`：**不额外发请求**。ECharts 本体在 chunk 里，选中这一屏
+ * 才会去要（`./insights-chart.ts` 负责那一步），所以卡片本身不会因此变重。
+ */
+function CardChart(props: { t: Translate; overview: StatsOverview | undefined }): ReactNode {
+  const { t, overview } = props;
+  // 三元而不是早退：`return undefined` 在 `consistent-return` 与 `no-useless-undefined`
+  // 两条规则之间没有合法写法，表达式形态一次过。
+  const spec = useMemo<ChartSpec | undefined>(
+    () =>
+      overview === undefined
+        ? undefined
+        : {
+            kind: "bars",
+            labels: [t("todayPrefix"), t("todayPipe")],
+            bar: {
+              name: t("kpiSaved"),
+              values: [overview.today.prefix.savedTokens, overview.today.pipe.savedTokens],
+            },
+            colors: ["", ""],
+            textColor: "",
+            gridColor: "",
+            // 这张图只有 132px 高（`.rtkc-card-chart`）：走紧凑档，刻线降到三条。
+            compact: true,
+          },
+    [overview, t],
+  );
+  const { containerRef } = useChart(spec);
+  // 两形态都还没省下任何东西时不画空图：两根零高度的柱子看起来像「画坏了」。
+  const empty =
+    overview === undefined ||
+    (overview.today.prefix.savedTokens === 0 && overview.today.pipe.savedTokens === 0);
+  return empty ? null : createElement("div", { className: "rtkc-card-chart", ref: containerRef });
+}
+
+/**
+ * 清零的二次确认弹窗。
+ *
+ * 用宿主的 `RiskConfirmation`（`@deepseek-ai/dsh-client-ui-primitives`，平台模块）：它自带
+ * `role="dialog"` / `aria-modal` / Escape 与焦点回归，未勾选时确认键保持 disabled。自己拼一个
+ * 弹窗要重做这一整套无障碍行为，而漏掉的那半在键盘用户那里就是「关不掉」或「直接执行」。
+ *
+ * 为什么值得一次确认：清零不是只清本插件的表——它连同一份库里的 rtk `commands` 一起删，
+ * 删掉的行里带着每条改写命令的原始与改写后文本，误点一次找不回来。（清的是 dsh 自己的库，
+ * 用户终端里的 `rtk gain` 历史不受影响——这一点写在弹窗正文里，免得用户以为全局数据被清。）
+ */
+function ResetConfirmation(props: {
+  t: Translate;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}): ReactNode {
+  const { t, busy, onCancel, onConfirm } = props;
+  const [acknowledged, setAcknowledged] = useState(false);
+  return createElement(RiskConfirmation, {
+    open: true,
+    title: t("resetConfirmTitle"),
+    description: t("resetConfirmDescription"),
+    acknowledgeLabel: t("resetConfirmAcknowledge"),
+    cancelLabel: t("resetCancel"),
+    closeLabel: t("resetClose"),
+    confirmLabel: t("resetConfirmAction"),
+    acknowledged,
+    disabled: busy,
+    onAcknowledgedChange: setAcknowledged,
+    onCancel,
+    onConfirm,
+  });
+}
+
+/**
+ * 统计区：一行今日摘要 + 两柱图 + 清零按钮（历史窗口在 Insights 页）。
+ */
 function StatsSection(props: {
   t: Translate;
   reader: StatsReader | undefined;
-  summary: StatsSummary | undefined;
-  onReset: () => void;
+  overview: StatsOverview | undefined;
+  onReset: () => Promise<void>;
 }): ReactNode {
-  const { t, reader, summary } = props;
-  if (reader === undefined || summary === undefined) {
-    return createElement(
-      Section,
-      { title: t("statusSection") },
-      createElement("p", { className: "rtkc-note" }, t("statsUnavailable")),
-    );
-  }
-  const numbers = [t("statsCommands"), t("statsSaved"), t("statsSavings")].join(" / ");
-  // 省下的量报 **token**（与节省率同一口径）：一个按字节、一个按 token 并排写，
-  // 两个数会各说一套，而用户没法从界面上看出它们不是一回事。
-  const values = [
-    String(summary.commands),
-    String(summary.savedTokens),
-    `${String(summary.savingsPct)}%`,
-  ].join(" / ");
+  const { t, reader, overview, onReset } = props;
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const confirm = useCallback(async (): Promise<void> => {
+    setBusy(true);
+    try {
+      await onReset();
+      setConfirming(false);
+    } finally {
+      setBusy(false);
+    }
+  }, [onReset]);
+  const cancel = useCallback((): void => {
+    setConfirming(false);
+  }, []);
+  // 三元而不是早退：与 CardChart 同一条理由（`consistent-return` 与 `no-useless-undefined`
+  // 之间没有合法的早退写法）。
+  const reset =
+    reader === undefined
+      ? null
+      : createElement(
+          "button",
+          {
+            type: "button",
+            className: "rtkc-actions",
+            onClick: () => {
+              setConfirming(true);
+            },
+          },
+          t("resetStats"),
+        );
+  const dialog = confirming
+    ? createElement(ResetConfirmation, {
+        t,
+        busy,
+        onCancel: cancel,
+        onConfirm: () => {
+          void confirm();
+        },
+      })
+    : null;
   return createElement(
     Section,
     { title: t("statusSection") },
-    createElement("p", null, `${numbers}: ${values}`),
-    createElement(StatsChart, { t, summary }),
-    // spec §6：按形态分账。改写那一档记不到原始字节（命令在进 shell 之前就被换掉了），
-    // 所以这里只报命令数——把两档都塞进「节省字节」会让读数变成半真半假的合计数。
-    createElement(
-      "p",
-      null,
-      `${t("statsByForm")}: ${String(summary.byForm.prefix)} / ${String(summary.byForm.pipe)}`,
-    ),
+    createElement(StatsSummaryLine, { t, overview }),
+    // 两柱图只吃 overview 已经带回来的数：卡上多一条请求就是每次开设置都多付一次扫描。
+    createElement(CardChart, { t, overview }),
     createElement("p", { className: "rtkc-note" }, t("statsNote")),
-    createElement(
-      "button",
-      { type: "button", className: "rtkc-actions", onClick: props.onReset },
-      t("resetStats"),
-    ),
+    reset,
+    dialog,
   );
 }
 
@@ -531,15 +825,18 @@ function cardNumberFields(props: FieldSectionProps): ReactNode[] {
 /**
  * 统计读面的状态与刷新。
  *
- * 卡片挂载期间每 `STATS_REFRESH_MS` 拉一次 summary/status；页面不可见时跳过，
+ * 卡片挂载期间每 `STATS_REFRESH_MS` 拉一次 overview/status；页面不可见时跳过，
  * 一次刷新还在路上时也跳过下一拍，避免慢请求叠出并发。
+ *
+ * 只拉概览、不拉明细：卡片上要的是今日几个数，按天/按 filter 的明细在 Insights 页里读
+ * ——那一条请求比概览贵得多（要按窗口扫事件行），挂在设置卡上等于每次开设置都付一次。
  */
 function useStatsRefresh(reader: StatsReader | undefined): {
-  readonly summary: StatsSummary | undefined;
+  readonly overview: StatsOverview | undefined;
   readonly status: StatsStatus | undefined;
   readonly resetStats: () => Promise<void>;
 } {
-  const [summary, setSummary] = useState<StatsSummary | undefined>(undefined);
+  const [overview, setOverview] = useState<StatsOverview | undefined>(undefined);
   const [status, setStatus] = useState<StatsStatus | undefined>(undefined);
   const refreshing = useRef(false);
 
@@ -550,10 +847,10 @@ function useStatsRefresh(reader: StatsReader | undefined): {
     refreshing.current = true;
     try {
       try {
-        setSummary(await reader.summary());
+        setOverview(await reader.overview());
       } catch {
         // 读面报错不清空已显示的数字：保留上一次成功的读数，比闪成「未连接」更少误导。
-        setSummary(undefined);
+        setOverview(undefined);
       }
       // 状态与统计各读各的：一条失败不该把另一条也抹掉（统计读面缺席时压缩照常，
       // 而 rtk 装没装正是用户最需要看到的那一句）。
@@ -587,13 +884,13 @@ function useStatsRefresh(reader: StatsReader | undefined): {
       return;
     }
     try {
-      setSummary(await reader.reset());
+      setOverview(await reader.reset());
     } catch {
-      setSummary(undefined);
+      setOverview(undefined);
     }
   }, [reader]);
 
-  return { summary, status, resetStats };
+  return { overview, status, resetStats };
 }
 
 function RtkCard(props: CardSlotProps): ReactNode {
@@ -603,7 +900,7 @@ function RtkCard(props: CardSlotProps): ReactNode {
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const { statsRemote: reader, t } = props;
-  const { summary, status, resetStats } = useStatsRefresh(reader);
+  const { overview, status, resetStats } = useStatsRefresh(reader);
   // 越界集与重置信号由 shared 的 `useInvalidFields()` 提供（六个仓共用同一套判定）。
   const invalid = useInvalidFields();
   const { blocked, fields: invalidFields, resetToken, reportInvalid } = invalid;
@@ -665,14 +962,8 @@ function RtkCard(props: CardSlotProps): ReactNode {
     // 引导行在说明之前：rtk 不在 PATH 时下面所有开关都不会有效果，先说这件事。
     createElement(RtkHint, { t, status }),
     createElement("p", { className: "rtkc-note" }, t("saveHint")),
-    createElement(StatsSection, {
-      t,
-      reader,
-      summary,
-      onReset: () => {
-        void resetStats();
-      },
-    }),
+    // 直接把 resetStats 交下去：确认弹窗要等它真的清完才关，包一层 void 就丢了那个 promise。
+    createElement(StatsSection, { t, reader, overview, onReset: resetStats }),
     createElement(
       Section,
       { title: t("switchSection") },
@@ -712,6 +1003,16 @@ function RtkSectionIcon(props: { readonly size: number; readonly active: boolean
 /** 分区页面外壳：一级分区里没有插件页那层卡片外壳，这里补一点留白。 */
 function RtkSection(props: CardSlotProps): ReactNode {
   return createElement("div", { className: "rtkc-page" }, createElement(RtkCard, props));
+}
+
+/**
+ * 侧栏行的图标适配层（`sidebar.panellist` 的 owner props 是 `{size, active}`）。
+ *
+ * 只把两位透给 `RtkPanelIcon`，不直接把它挂上槽位：槽位组件的 props 由宿主按槽位类型注入，
+ * 多一位少一位都只在运行期看出来，这里显式收窄一次，形状不对时编译期就红。
+ */
+function PanelIconSlot(props: { readonly size: number; readonly active: boolean }): ReactNode {
+  return createElement(RtkPanelIcon, { size: props.size, active: props.active });
 }
 
 /** 客户端上下文里本模块用到的那几位（方法子集投影：官方的服务类带私有字段，替身满足不了）。 */
@@ -823,6 +1124,46 @@ function apply(ctx: ClientCtx): void {
         order: SECTION_ORDER,
       },
       RtkSectionIcon,
+    ),
+  );
+
+  // ---- 左侧栏一级面板：Insights ----
+  //
+  // `main` 是 keyed 槽，`key` 由我们定（宿主已占 conversation/plugins/schedule，`rtk` 不撞）；
+  // `sidebar.panellist` 是 list 槽，`id` 与 `main` 的 key 必须是同一个值——点侧栏那一行时宿主
+  // 拿这个 id 去 `main` 里找入口，两边不同源就是「点了没反应」。
+  //
+  // 用 `PANEL_ID`/`PANEL_ORDER` 而不是就地写字面量：`lib/insights-page-logic.ts` 是纯逻辑层，
+  // 这两个值在那里被测试断言过，组件这边只消费。
+  const panelInject = (): { readonly t: Translate; readonly reader: StatsReader | undefined } => ({
+    t,
+    reader: statsRemote,
+  });
+
+  ctx.slots.inject("main", () =>
+    ctx.slots.register(
+      {
+        name: "main",
+        key: PANEL_ID,
+        locale: NS,
+        inject: panelInject,
+        // 面板本体与侧栏行共用同一份文案字典；`label` 写在这里会让宿主每次读导航都重新求值，
+        // 切语言时跟着变。
+      },
+      InsightsPage,
+    ),
+  );
+
+  ctx.slots.inject("sidebar.panellist", () =>
+    ctx.slots.register(
+      {
+        name: "sidebar.panellist",
+        id: PANEL_ID,
+        order: PANEL_ORDER,
+        locale: NS,
+        label: () => t("panelLabel"),
+      },
+      PanelIconSlot,
     ),
   );
 }

@@ -4,7 +4,7 @@
 // 本函数的设计就是只吃已解析的值，于是这里能精确控制每一步门禁、并断言「最后转调的是哪条命令」。
 import { afterAll, describe, it } from "vitest";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -14,6 +14,8 @@ import {
   recordingSubprocess,
   startPrefixHost,
 } from "./integration/host-stack.ts";
+import { unbuildableDir } from "./unbuildable.ts";
+import { forceShadowPlatform } from "./platform/host-platform.ts";
 
 const cleanups = makeCleanups();
 
@@ -32,6 +34,21 @@ const MODEL_CWD = "/tmp/model-picked";
 
 /** 具名 noop：`() => () => undefined` 会撞 `unicorn(no-useless-undefined)`，具名一份两边都过。 */
 const noop = (): void => undefined;
+
+/** 库文件的两个名字：与 `lib/rtk-paths.ts` 的取值同形（这里不 import，避免测被测的表）。 */
+const LEDGER_DIR = "rtk";
+const LEDGER_FILE = "history.db";
+
+/**
+ * 账本库在某个 root 下的路径。
+ *
+ * 提成函数而不是就地写字面量：同一个形状在几条用例里出现（建得出来 / 建不出来 / 故障播报），
+ * 而 `sonarjs(no-duplicate-string)` 数到三次就红——更重要的是，路径形状本身就是被测约定
+ * （`$DSH_HOME/rtk/history.db`），写在一个地方才改得动。
+ * @param root - 假 home
+ * @returns 库文件路径
+ */
+const ledgerPathUnder = (root: string): string => path.join(root, LEDGER_DIR, LEDGER_FILE);
 
 /** 假 bash 的回执形状：三条用例共用，放模块作用域而不是 describe 里（它不捕获任何东西）。 */
 const cargoReply = (text: string) => (): Record<string, unknown> => ({
@@ -56,26 +73,23 @@ const asResult = (
   value as { readonly stdout: { readonly text: string }; readonly exitCode: number };
 
 /**
- * C 形态只在 POSIX 上存在，这个文件的用例因此是 POSIX-only。
+ * C 形态的装配与行为判据在**三个平台**上都要跑。原先这里整片 `skipIf(!POSIX_ONLY)`，理由是
+ * 两条——两条现在都不再成立：
  *
- * 两条都成立，缺一条这个文件就会在 Windows CI 上整片红：
- *   1. **实现侧**：`prefixSupportedOn("win32")` 判否，`installPrefixShadow` 在平台门禁处
- *      直接 return——整层不装，`agent/created` 不挂，`withAgent()` 抛「遮蔽层没有注册任何工具体」。
- *      这是 spec §7.2 的设计（rtk 的 Windows 分发面与 pwsh 命令形态都没在真机验过，而前缀形态
- *      写坏命令的代价是「本来能跑的命令不能跑」），不是缺陷。
- *   2. **夹具侧**：假 rtk 是个 `#!/usr/bin/env node` 的 0755 脚本，靠 PATH 上的裸名被
- *      `spawn("rtk")` 找到；Windows 既没有执行位，也要 `.exe`/`.cmd` 后缀才能 spawn。所以
- *      连「注入 `platform: "linux"` 假装在 POSIX 上跑」这条退路也不通。
- * 平台判定本身由 `test/platform/platform.test.ts` 覆盖（那里显式注入 win32 断言整层不装）。
+ *   1. **实现侧**：`prefixSupportedOn("win32")` 判否，`installPrefixShadow` 在平台门禁处直接
+ *      return。那条**产品决定**不变（rtk 的 Windows 分发面与 pwsh 命令形态没在真机验过），
+ *      由 `test/platform/platform.test.ts` 显式注入 win32 断言「整层不装」。但本文件验的是
+ *      门禁**之后**的逻辑（装配序、埋点时机、argv 形状、sandbox 登记），与宿主是不是 Windows
+ *      无关，所以用 `forceShadowPlatform()` 把宿主平台值换成受支持档——判据不变形，只是不再
+ *      因为宿主 OS 而缺席。
+ *   2. **夹具侧**：假 rtk 早先是「PATH 上一个 0755 的 node 脚本、靠裸名被 `spawn` 找到」。
+ *      现在 `installFakeRtk` 把它拆成两件事：PATH 上那个文件只过装配期门禁（win32 档的
+ *      裸名候选足够），真正的子进程面是内存桩（`lib/cli.ts` 的 `spawn({argv})` 在 Windows 上
+ *      不做 PATHEXT 解析，造不出跨平台可执行的假 rtk——细节见 `installFakeRtk` 的注释）。
  */
-const POSIX_ONLY = process.platform !== "win32";
+const restorePlatform = forceShadowPlatform();
 
-describe.skipIf(!POSIX_ONLY)("c 形态", () => {
-  // 临时目录按文件收尾：每条用例自己 try/finally 还 PATH 与假 rtk，目录在这里一次性删。
-  afterAll(() => {
-    cleanups.drain();
-  });
-
+describe("c 形态", () => {
   describe("c 形态：装配期门禁", () => {
     it("rtk 不在 PATH 时整层不装（连监听器都不注册）", async () => {
       // 把 PATH 指到一个空目录，保证「找不到 rtk」是这条用例的前提而不是本机状态。
@@ -450,7 +464,13 @@ describe.skipIf(!POSIX_ONLY)("c 形态", () => {
           .withAgent()
           .execute({ command: CARGO_TEST, workdir: "pkgs/app" }, exec({ agent: { id: "s1" } }));
         assert.equal(subprocess.calls.length, 1);
-        assert.equal(subprocess.calls[0]?.cwd, `${WORKSPACE_CWD}${path.sep}pkgs${path.sep}app`);
+        // 相对 workdir 是**原样追加**，不重写它内部的分隔符：宿主 `dsh-tool-bash` 的
+        // `resolveWorkdir(modelWorkdir, sessionCwd)` 只有一句 `${sessionCwd}${sep}${modelWorkdir}`
+        // （`packages/shell/tool-bash/src/index.ts:177-183`），模型传 `pkgs/app` 它也只补中间那一个
+        // sep。早先这条断言写成了两个 sep 都被替换，于是**只在 Windows 上红**——POSIX 下 `/` 恰好
+        // 等于 sep，两种写法同形，把那处不一致盖住了（`test/post-execute.test.ts:664` 同一轮里
+        // 已经踩过一次并修好，这里是第二处）。
+        assert.equal(subprocess.calls[0]?.cwd, `${WORKSPACE_CWD}${path.sep}pkgs/app`);
       } finally {
         rtk.restore();
       }
@@ -734,6 +754,143 @@ describe.skipIf(!POSIX_ONLY)("c 形态", () => {
     });
   });
 
+  describe("c 形态：账本注入与沙箱登记", () => {
+    /**
+     * 这一组钉两件事：**命令前面挂上 `RTK_DB_PATH`** 与**目录被登记成可写根**。
+     *
+     * 为什么非有不可：注入是「只统计 dsh 会话」的机制本体——漏了它，rtk 会把行记进用户的全局
+     * 账本，页面上就会混进用户自己终端跑的命令（真机症状：改写成功 0 次却省了 1.7M token）。
+     * 沙箱登记漏了则是记账 EACCES 静默失败，Insights 页永远空、日志里一个字都没有。
+     */
+    it("账本目录建得出来时，命令带 RTK_DB_PATH 转发，且目录被登记成可写根", async () => {
+      const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_CARGO_TEST }]);
+      const root = mkdtempSync(path.join(tmpdir(), "rtk-ledger-home-"));
+      cleanups.push(root);
+      // 父目录还不存在正是真实装配的形状：第一次跑永远没有 `$DSH_HOME/rtk`。
+      const dbPath = ledgerPathUnder(root);
+      const registered: string[] = [];
+      try {
+        const host = await startPrefixHost({
+          reply: cargoReply(CLEAN_TEXT),
+          options: { trackingDbPath: dbPath },
+          sandboxPolicy: {
+            registerWritableRoot: (_session: unknown, dir: string): (() => void) => {
+              registered.push(dir);
+              return noop;
+            },
+          },
+        });
+        await host.withAgent().execute({ command: CARGO_TEST }, exec());
+        // 命令带着注入的赋值转发：改写出来的 `rtk cargo test` 因此只往 dsh 自己的库记账。
+        assert.deepEqual(host.fake.received, [`RTK_DB_PATH='${dbPath}' ${RTK_CARGO_TEST}`]);
+        // 登记的是**目录**而不是那个 .db 文件：`registerWritableRoot` 拒收非目录。
+        // 期望值按物理路径写：宿主拿 `realpathSync` 的结果与原文比，macOS 上 tmpdir 的
+        // `/var/...` 物理路径是 `/private/var/...`，登记原文会被判成符号链接而抛错。
+        assert.deepEqual(registered, [realpathSync.native(path.dirname(dbPath))]);
+      } finally {
+        rtk.restore();
+      }
+    });
+
+    it("账本目录建不出来时：照样注入、不登记、日志点名", async () => {
+      const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_CARGO_TEST }]);
+      // 父级放一个普通文件：`mkdirSync(recursive)` 在三个平台上都必然失败。早先这里写的是
+      // `/dev/null`，靠「字符设备下面建不了目录」——那条只在 POSIX 成立，Windows 上
+      // `/dev/null` 是个普通路径段，`mkdir -p` 会把它建出来，于是这条用例在 windows CI 上
+      // 走的是**建得出来**那一支（实测红）。
+      const dbPath = ledgerPathUnder(unbuildableDir());
+      const lines: string[] = [];
+      const registered: string[] = [];
+      try {
+        const host = await startPrefixHost({
+          reply: cargoReply(CLEAN_TEXT),
+          options: {
+            trackingDbPath: dbPath,
+            log: (line) => {
+              lines.push(line);
+            },
+          },
+          sandboxPolicy: {
+            registerWritableRoot: (_session: unknown, dir: string): (() => void) => {
+              registered.push(dir);
+              return noop;
+            },
+          },
+        });
+        assert.equal(host.installed, true, "建不出目录不该让整层不装");
+        await host.withAgent().execute({ command: CARGO_TEST }, exec());
+        // 判据三件：**照样注入**、不登记、日志里有一句能查的话。
+        //
+        // 「照样注入」是这一条真正的牙齿，而且方向与直觉相反：早先那一版在目录建不出来时
+        // 清空注入路径，理由写的是「让它落回全局账本，总比命令跑不起来好」——那句理由是错的。
+        // rtk 拿不到 `RTK_DB_PATH` 时会退回它自己 `get_db_path()` 的默认，把 dsh 会话的每一行
+        // 写进**用户终端那份全局账本**（实测：`HOME=<空目录> rtk git status` 会在
+        // `~/Library/Application Support/rtk/history.db` 建库并写 1 行）。有了变量但目录写不进去时，
+        // rtk 是**静默丢掉那一行**（exit 0、stdout 正常、stderr 零字节）：少记一行只是「统计不可用」，
+        // 记进别人的账本则是污染用户数据。两者不在一个量级，所以这里必须继续注入。
+        assert.deepEqual(host.fake.received, [`RTK_DB_PATH='${dbPath}' ${RTK_CARGO_TEST}`]);
+        assert.deepEqual(registered, []);
+        // 两行：装配期那句「建不出来」在前，执行期那句 `rewrite: a -> b` 在后。
+        // 不能只断言 `lines.length === 1`——那会把「诊断日志还开着」这件既有行为判成缺陷。
+        assert.equal(lines.length, 2);
+        assert.match(lines[0] ?? "", /cannot prepare .* statistics will report themselves/u);
+      } finally {
+        rtk.restore();
+      }
+    });
+
+    /**
+     * `warn` 是**默认就能看到**的那条播报口，与 `log`（`logFilterMode: 'on'` 才有）分开。
+     *
+     * 为什么非有不可：默认配置下 `log` 是 `undefined`，如果故障只往那里写，症状就只剩
+     * 「Insights 页永远空白」——用户分不出「没采到」与「没数据」。这一条把两条故障都走一遍：
+     * 目录建不出来、以及沙箱不给登记。
+     */
+    it("故障播报走 warn：目录建不出来时不留白，沙箱拒绝登记时也留一句", async () => {
+      const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_CARGO_TEST }]);
+      const warns: string[] = [];
+      try {
+        // 一、目录建不出来：父级是普通文件，三个平台都必然失败。只给 `warn`、不给 `log`。
+        const brokenHost = await startPrefixHost({
+          reply: cargoReply(CLEAN_TEXT),
+          options: {
+            trackingDbPath: ledgerPathUnder(unbuildableDir()),
+            warn: (line) => {
+              warns.push(line);
+            },
+          },
+        });
+        assert.equal(brokenHost.installed, true);
+        assert.equal(warns.length, 1);
+        assert.match(warns[0] ?? "", /cannot prepare .* statistics will report themselves/u);
+
+        // 二、目录建得出来，但沙箱拒绝登记：同样是「记账这条链断了」，同样要留痕。
+        const root = mkdtempSync(path.join(tmpdir(), "rtk-ledger-warn-"));
+        cleanups.push(root);
+        warns.length = 0;
+        const refusedHost = await startPrefixHost({
+          reply: cargoReply(CLEAN_TEXT),
+          options: { trackingDbPath: ledgerPathUnder(root) },
+          sandboxPolicy: {
+            registerWritableRoot: (): (() => void) => {
+              throw new Error("SANDBOX_INVALID_ROOT");
+            },
+          },
+          warn: (line) => {
+            warns.push(line);
+          },
+        });
+        // 登记失败不让整层失效：命令照旧带注入转发。
+        await refusedHost.withAgent().execute({ command: CARGO_TEST }, exec());
+        assert.equal(refusedHost.fake.received.length, 1);
+        assert.equal(warns.length, 1);
+        assert.match(warns[0] ?? "", /cannot grant .* bookkeeping will fail silently/u);
+      } finally {
+        rtk.restore();
+      }
+    });
+  });
+
   describe("c 形态：volatile 配置项逐次现读", () => {
     /**
      * 这一组钉的是「卡片上改完，下一次调用就生效」。
@@ -791,8 +948,19 @@ describe.skipIf(!POSIX_ONLY)("c 形态", () => {
   });
 });
 
-// 与上面同一个理由：晚装载验的也是 C 形态的装配路径，win32 上整层不装。
-describe.skipIf(!POSIX_ONLY)("晚装载：装配时已经存在的 agent 也要被遮蔽", () => {
+// 与上面同一个理由：晚装载验的也是 C 形态的装配路径，宿主平台值已由 `forceShadowPlatform()`
+// 换成受支持档，所以这一组在三个 runner 上都跑。
+//
+// 收摊挂在这一组上，因为它**是文件里最后一个 describe**：describe 的 hook 在该 describe 跑完
+// 时触发，注册顺序即执行顺序。早先 `afterAll` 挂在第一个 describe 上，于是「晚装载」这组拿到
+// 的是已经还原的平台值——win32 模拟下整层不装、断言 0 !== 1（实测症状）。`afterAll` 又不许
+// 写在顶层（`vitest(no-top-level-after-all)`），所以位置只有一个。
+describe("晚装载：装配时已经存在的 agent 也要被遮蔽", () => {
+  afterAll(() => {
+    restorePlatform();
+    cleanups.drain();
+  });
+
   it("agents.list() 里的 agent 在装配那一刻就拿到遮蔽体", async () => {
     // 根因：`agent/created` 只对之后新建的 agent 触发。插件在已经跑着的宿主里装上
     // （HMR / plugin add 之后不重启）时，那些已有 agent 永远拿不到遮蔽层——用户以为开了、
