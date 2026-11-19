@@ -23,6 +23,7 @@ import type { Context, Volatile } from "@deepseek-ai/cordis";
 import type { SpillRef } from "@deepseek-ai/dsh-spill";
 import { isJsonValue } from "@deepseek-ai/dsh-util-values";
 import type { JsonValue } from "@deepseek-ai/dsh-util-values";
+import type { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
 import {
   LOCALE_SETTINGS_NAMESPACE,
   messagesFor,
@@ -37,9 +38,15 @@ import { hasMethods, isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 // 之外；锁随在册那一份的 fiber 卸载自动释放，所以后续装配仍能抢到。
 import { claimInstance } from "@jayyuen66/dsh-plugin-shared/lib/instance-lock";
 
-import { RTK_REWRITE_ENV, runRtkPipe, runRtkRewrite } from "./lib/cli.ts";
+import { RTK_REWRITE_ENV, runRtkHook, runRtkPipe, runRtkRewrite } from "./lib/cli.ts";
 import { commandFamilyOf, rewrittenFamilies } from "./lib/command-family.ts";
-import { ALL_FILTERS, DEFAULT_ENABLED_FILTERS, filterOf } from "./lib/command-filter.ts";
+import {
+  ALL_FILTERS,
+  DEFAULT_ENABLED_FILTERS,
+  filterOf,
+  HOOK_FILTER,
+  WINDOW_FILTER,
+} from "./lib/command-filter.ts";
 import type { RewrittenCalls } from "./lib/dedup.ts";
 import { createRewrittenCalls, shouldSkipPipe } from "./lib/dedup.ts";
 import { guardCompressed, keptOutputOf } from "./lib/guard.ts";
@@ -49,6 +56,7 @@ import { createDeferredInsights } from "./lib/insights-sink.ts";
 import { MESSAGES } from "./lib/messages.ts";
 import type { Messages } from "./lib/messages.ts";
 import { findOnPath, pipeStructuralReject } from "./lib/prefix-safety.ts";
+import { registerUsageSkill, USAGE_ORDER, USAGE_SECTION } from "./lib/skill.ts";
 import { createRewriter } from "./lib/rewrite.ts";
 import type { RewriteCache } from "./lib/rewrite-cache.ts";
 import { createRewriteCache } from "./lib/rewrite-cache.ts";
@@ -56,13 +64,28 @@ import { resolveWorkdir, restoreGatedSegments, shouldSkipRewrite } from "./lib/r
 import type { RewriteGateOptions } from "./lib/rewrite-gate.ts";
 import { verifyRewrite } from "./lib/rewrite-verify.ts";
 import { createRtkLedger, ensureRtkDir, registerRtkWritableRoot } from "./lib/rtk-ledger.ts";
-import { resolveLedgerPaths, withRtkDbPath, withoutRtkDbEnv } from "./lib/rtk-paths.ts";
+import {
+  prepareHookConfig,
+  resolveHookPaths,
+  resolveLedgerPaths,
+  withRtkLedgerEnv,
+  withoutRtkDbEnv,
+} from "./lib/rtk-paths.ts";
+import type { RtkPaths } from "./lib/rtk-paths.ts";
+import { buildHookPayload, hookEnvOf, parseHookOutput, pipelineToml } from "./lib/rtk-hook.ts";
+import {
+  DEFAULT_WINDOW_HEAD_LINES,
+  DEFAULT_WINDOW_TAIL_LINES,
+  isLogTarget,
+  isReadingTarget,
+  windowOf,
+} from "./lib/output-window.ts";
 import { shapeMatches } from "./lib/shape-precheck.ts";
 import type { StatsStatus } from "./lib/stats-remote.ts";
 import { installStatsRemote } from "./lib/stats-remote.ts";
 import { loadLegacyAccumulator } from "./lib/stats-store.ts";
 import { capCompressed, spillOriginal } from "./lib/spill.ts";
-import type { SpilledOriginal } from "./lib/spill.ts";
+import type { CappedText, SpilledOriginal } from "./lib/spill.ts";
 import { readSpillFullText } from "./lib/spill-read.ts";
 import type { Extracted } from "./lib/stdout-extract.ts";
 import { extractBody, reassemble } from "./lib/stdout-extract.ts";
@@ -117,6 +140,17 @@ export interface WorkingDirectoryFace {
 export interface ToolsFace {
   readonly get: (name: string, scope?: Agent) => unknown;
 }
+
+/**
+ * 官方 SystemPrompt（`@deepseek-ai/dsh-system-prompt` 的 cordis Service，带 private 字段 →
+ * 名义比较）的方法子集投影：本包只 `section()` 注册常驻摘要段。
+ *
+ * 与兄弟仓 dsh-zvec-grep 同一条纪律：**只 Pick 本包调的那一位**，签名一个字都不重述——
+ * 入参即官方 `PromptSection`（name/order/text，text 允许 `string | (ctx) => string`），
+ * 返回值是官方承诺的 Cordis effect disposer。注册在 `apply` 里、随插件 fiber 回收，
+ * 故不接这个 disposer（`section()` 内部的 `layers.effect` 已经把它挂在调用方 ctx 上）。
+ */
+type SystemPromptFace = Pick<SystemPrompt, "section">;
 
 /**
  * agent 注册表里本插件唯一用到的那一枚读面。
@@ -246,17 +280,22 @@ export interface PrefixOptions {
    */
   readonly supported: () => boolean | undefined;
   /**
-   * 本插件的账本路径（`$DSH_HOME/rtk/history.db`，默认 `~/.dsh/rtk/history.db`）。
+   * 本插件的两个库路径（`$DSH_HOME/rtk/`，默认 `~/.dsh/rtk/`）：
+   * `history.db`（记账 + 本插件的 `dsh_*` 表）与 `recall.db`（rtk 折叠中段的取回通道）。
    *
-   * 三处用它：① 改写出来的每段 `rtk …` 前面注入 `RTK_DB_PATH` 指到它（rtk 因此只往这里记账）；
-   * ② 自己那几张 `dsh_*` 表写进同一个文件；③ 清零时把两侧一起清。
+   * 三处用它：① 改写出来的每段 `rtk …` 前面注入 `RTK_DB_PATH` 与 `RTK_RECALL_DB` 指到它们
+   * （rtk 因此只往这里写）；② 自己那几张 `dsh_*` 表写进 `history.db`；③ 清零时把两侧一起清。
    *
-   * **为什么不指向 rtk 的全局账本**：那张 `commands` 表里是用户自己终端跑的全部命令，混进本页
+   * **为什么不指向 rtk 的全局库**：那张 `commands` 表里是用户自己终端跑的全部命令，混进本页
    * 就会与「只统计 dsh 会话」的计数自相矛盾（用户裁决原话：「数据都只统计 dsh 宿主中的」）。
-   * 空串 = 用户显式关掉了记账：不注入、统计面报不可用。**目录不可建不算空串**——那时照样注入，
-   * 因为拿不到变量 rtk 会写进全局账本（见 `prepareLedgerDir` 的 `LedgerPlan`）。
+   * recall 库同理，而且它更隐蔽：只注入 `RTK_DB_PATH` 时 rtk 仍会把折叠内容写进用户的全局
+   * recall 库（实测干净 `HOME` 下一次 `rtk ls -la` 就建出并写一行）。
+   *
+   * `historyDb` 为空串 = 用户显式关掉了记账：两个都不注入、统计面报不可用。**目录不可建不算
+   * 空串**——那时照样注入，因为拿不到变量 rtk 会写进全局库（见 `prepareLedgerDir` 的
+   * `LedgerPlan`）。
    */
-  readonly trackingDbPath: string;
+  readonly ledgerPaths: RtkPaths;
 }
 
 /** 跨调用共享的三份依赖，都在 `apply` 顶部造一次。 */
@@ -443,28 +482,6 @@ export async function readRtkVersion(ctx: HostContext): Promise<string | undefin
 }
 
 /**
- * 前缀形态支持哪些平台。**win32 明确判否**，而不是「没测过就都不支持」那种含糊档。
- *
- * 三条理由（spec §7.2）：
- *   1. rtk 的 Windows 分发面（`winget install rtk-ai.rtk`）没有在真机验过；
- *   2. pwsh 的命令解析与 rtk 的 `.exe`/`.cmd` 存在形态全部未验；
- *   3. 前缀形态一旦把命令写坏（rc=127），损害是「本来能跑的命令不能跑」——比 pipe 形态
- *      「不压缩」严重一个量级。
- *
- * 降级方向也重要：这里返回 false 是**整层不装**（连 `agent/created` 监听器都不挂），
- * 不是「装上一个不干活的壳」。装了壳会让模型看到的 bash 来自本插件、出问题要往这里查；
- * 不装则宿主原生 bash 原样生效，插件在该平台上等于不存在。
- *
- * 注意连带后果：默认 `enabledForms` 是 `['prefix']`（不含 pipe），所以在 win32 上
- * **两层都不生效**——前缀层整层不装，结果压缩层的监听器虽然常驻，但 `decide` 现读到的
- * `forms` 不含 pipe，一律原样放行。插件装载但完全不动命令与输出。这不是缺陷，是「默认只开
- * 前缀」在那条平台上的直接投影；要看效果的 Windows 用户得显式把 `enabledForms` 改成 `['pipe']`。
- */
-export function prefixSupportedOn(platform: NodeJS.Platform): boolean {
-  return platform !== "win32";
-}
-
-/**
  * 装配瞬间**已经存在**的 agent 全集。
  *
  * 两条纪律：① 服务面按运行期事实判（`ctx.get?.("agents")` 交回 `unknown`，逐方法判可调用），
@@ -499,34 +516,35 @@ function readLiveAgents(ctx: HostContext): readonly Agent[] {
  * 记进全局账本则是**污染用户的数据**——两者严重性不在一个量级。
  */
 interface LedgerPlan {
-  /** 注入 `RTK_DB_PATH` 用的路径；空串 = 用户把 `trackingDbPath` 配空了，本次不碰账本。 */
-  readonly inject: string;
+  /** 注入用的两个库路径；`historyDb` 空串 = 用户把路径配空了，本次不碰账本。 */
+  readonly paths: RtkPaths;
   /** 核过的目录；undefined = 建不出来，统计会报不可用，也不登记沙箱写根。 */
   readonly writableDir: string | undefined;
 }
 
 /**
- * 备好 rtk 账本目录，并交出上面那两个事实。
+ * 备好 rtk 库目录，并交出上面那两个事实。
  *
- * 抽成函数只为让 `installPrefixShadow` 的门禁区三行读得懂：平台门 → rtk 门 → 账本门。
+ * 抽成函数只为让 `installPrefixShadow` 的门禁区两行读得懂：rtk 门 → 账本门。
  *
- * 建目录是**两个写者共同的前提**：rtk 要往 `$DSH_HOME/rtk/history.db` 记账，我们自己的
- * `dsh_*` 表也落进同一个文件。目录建不出来（只读 home、权限不对）时仍然注入，见 `LedgerPlan`。
+ * 建目录是**三个写者共同的前提**：rtk 要往 `$DSH_HOME/rtk/history.db` 记账、往 `recall.db`
+ * 写折叠中段，我们自己的 `dsh_*` 表也落进 `history.db`。目录建不出来（只读 home、权限不对）
+ * 时仍然注入，见 `LedgerPlan`。
  */
 function prepareLedgerDir(options: PrefixOptions): LedgerPlan {
-  const dbPath = options.trackingDbPath;
-  if (dbPath === "") {
-    return { inject: "", writableDir: undefined };
+  const { ledgerPaths } = options;
+  if (ledgerPaths.historyDb === "") {
+    return { paths: ledgerPaths, writableDir: undefined };
   }
-  const dir = path.dirname(dbPath);
+  const dir = path.dirname(ledgerPaths.historyDb);
   if (ensureRtkDir(dir)) {
-    return { inject: dbPath, writableDir: dir };
+    return { paths: ledgerPaths, writableDir: dir };
   }
   // 两个口都留：`log` 是开了诊断才看的逐步流水，`warn` 是默认就能看到的故障播报。
   const line = `[rtk] prefix: cannot prepare ${dir}; statistics will report themselves unavailable`;
   options.log?.(line);
   options.warn?.(line);
-  return { inject: dbPath, writableDir: undefined };
+  return { paths: ledgerPaths, writableDir: undefined };
 }
 
 /**
@@ -621,6 +639,8 @@ async function planPrefixRewrite(
   // 原实现按它跑；插件算 cwd 时不读它就会与「命令实际跑在哪个目录」分叉。
   const cwd = await resolveWorkdir(
     exec,
+    /* v8 ignore next —— 真宿主只把作用域键（agent）交给 ensure；这个 undefined 是 ensure
+       契约里「没有会话身份」那一位的兜底，进程内没有一条路径会把非 agent 的形状递进来。 */
     async (target) =>
       isAgent(target) ? ctx.workingDirectory.ensure(target, exec.signal) : undefined,
     invocation.forwarded["workdir"],
@@ -735,14 +755,14 @@ async function runShadowedBash(input: {
   readonly args: unknown;
   readonly exec: ToolRunContext;
   /**
-   * 装配期定下的注入路径（`prepareLedgerDir` 的 `inject`，空串 = 用户把路径配空了）。
+   * 装配期定下的注入路径（`prepareLedgerDir` 的 `paths`，`historyDb` 空串 = 用户把路径配空了）。
    *
-   * 走装配期那一份、而不是每次现读 `options.trackingDbPath` 原文，是为了让「配了」与「不碰」
+   * 走装配期那一份、而不是每次现读 `options.ledgerPaths` 原文，是为了让「配了」与「不碰」
    * 这两个事实在整层里只算一次：原文是「打算用的路径」，而这一位是「本次装配接受的那条」。
-   * 目录建不出来时**它照样有值**（照样注入，理由是 rtk 拿不到变量会写进用户的全局账本），
+   * 目录建不出来时**它照样有值**（照样注入，理由是 rtk 拿不到变量会写进用户的全局库），
    * 那时统计面报不可用、沙箱登记跳过——这三件事各自独立，别把「目录没核过」读成「不注入」。
    */
-  readonly trackingDbPath: string;
+  readonly ledgerPaths: RtkPaths;
 }): Promise<unknown> {
   const plan = await planPrefixRewrite(
     input.ctx,
@@ -757,7 +777,9 @@ async function runShadowedBash(input: {
   const { options, deps, exec } = input;
   // 记账必须在转调之前：background bash 立即返回，post-execute 可能随后几条语句内就跑；
   // 写在后面就有「B 先压了、C 的账还没记上」的窗口。
-  deps.rewrittenCalls.mark(exec.callId);
+  // 记的是**改写后的命令**：结果侧要分辨「改写成 rtk read（逐字节透传）」与「改写成
+  // rtk cargo test（真的在压）」这两件事，只记一个「已改写」的 boolean 分辨不出来。
+  deps.rewrittenCalls.mark(exec.callId, plan.command);
   // 记账紧跟着 mark：这两个都在「命令真的被改写了」这一支上，而 mark 之后
   // post-execute 可能立刻拿 callId 去查表，所以顺序只能是 mark → 记账 → count → 转调。
   safeRecord(() => {
@@ -770,16 +792,20 @@ async function runShadowedBash(input: {
     });
   }, options.log);
   options.log?.(`[rtk] rewrite: ${plan.raw} -> ${plan.command}`);
-  // 注入账本路径之后再转发：每段 `rtk …` 前面挂一个 `RTK_DB_PATH='<dsh 库>'`。
+  // 注入库路径之后再转发：每段 `rtk …` 前面挂 `RTK_DB_PATH='<dsh 库>' RTK_RECALL_DB='<dsh 库>'`。
   //
-  // **这是「只统计 dsh 会话」的机制本体**：rtk 按 `get_db_path()` 的第一优先读这个变量，于是
-  // 它把行写进 `$DSH_HOME/rtk/history.db`，而用户自己终端里的 `rtk` 仍写全局那份——两条流从此
-  // 不相交，本页每个数字都只关于 dsh。空串（用户把路径配空了）时不注入，那是显式选择；
-  // **目录建不出来时照样注入**：rtk 写不进去会静默丢掉那一行，而拿不到这个变量它会写进
-  // 用户的全局账本——污染别人的数据比少记一行严重得多。
+  // **这是「只统计 dsh 会话」的机制本体**：rtk 按 `get_db_path()` 的第一优先读 `RTK_DB_PATH`，
+  // 于是它把行写进 `$DSH_HOME/rtk/history.db`，而用户自己终端里的 `rtk` 仍写全局那份——两条流
+  // 从此不相交，本页每个数字都只关于 dsh。`RTK_RECALL_DB` 是同一个决定的另一半：不给它时 rtk
+  // 会把折叠掉的输出存进**用户的全局** `recall.db`（实测干净 `HOME` 下跑一次 `rtk ls -la` 就会
+  // 建库并写一行），那既是污染、也让「到哪取回」这件事说不清。
+  //
+  // 空串（用户把路径配空了）时两个都不注入，那是显式选择；**目录建不出来时照样注入**：rtk
+  // 写不进去会静默丢掉那一行，而拿不到变量它会写进用户的全局库——污染别人的数据比少记一行
+  // 严重得多。
   //
   // 其余参数原样带回，只替换命令这一位（被遮蔽工具的 schema 里可能还有别的字段）。
-  const command = withRtkDbPath(plan.command, input.trackingDbPath);
+  const command = withRtkLedgerEnv(plan.command, input.ledgerPaths);
   const result = await input.orig.execute({ ...plan.forwarded, command }, exec);
   if (options.warnHint() && isCargoTest(plan.raw)) {
     return appendWarnHint(result, deps.messages().cargoTestWarnHint);
@@ -790,11 +816,11 @@ async function runShadowedBash(input: {
 /**
  * C 形态装配：给每个新 agent 在它自己的作用域里注册一个同名的 bash，内部先求改写再转调。
  *
- * 装配期门禁两条，缺一不装：
- *   1. 平台被认作支持（见 `prefixSupportedOn`）；
- *   2. 装配时 `findOnPath("rtk")` 命中。
+ * 装配期门禁一条：装配时 `findOnPath("rtk")` 命中。三平台的 rtk 名称档位
+ * （win32 的 `.exe`/`.cmd`/裸名，POSIX 只看裸名）由 `lib/prefix-safety.ts` 的
+ * `findOnPath` 按宿主平台处理。
  *
- * **`forms` 与 `enabled` 都不在这两条里**：层常驻，`execute` 每次现读
+ * **`forms` 与 `enabled` 都不在这条里**：层常驻，`execute` 每次现读
  * `forms().includes("prefix")`、`enabled()` 与 `supported()`。卡片改完形态后下一次工具调用
  * 就生效，不需要重启宿主。早先 `forms` 是装配期门禁，于是「切到 prefix」必须重启；
  * `enabled` 早退则让默认路径整条不通（装好插件、打开开关，下一次 bash 什么都没发生）。
@@ -808,19 +834,12 @@ async function runShadowedBash(input: {
  * 用 `agent.ctx.tools.register` 注册同名工具是宿主的正式语义（scoped 遮蔽 global、随 agent
  * 销毁），不是绕过任何机制：`ToolsService.register` 的 JSDoc 与 `docs/architecture.md`
  * 都明写插件该用 `agent.ctx` 注册 per-agent 工具。
- *
- * `platform` 可注入只为可测，与 `findOnPath` 的第二个参数同一理由：win32 的判定在 POSIX
- * 测试机上永远走不到，若焊死 `process.platform`，那条分支只能靠放宽阈值或 ignore 注释糊过去。
  */
 export function installPrefixShadow(
   ctx: PrefixContext,
   options: PrefixOptions,
   deps: PrefixDeps,
-  platform: NodeJS.Platform = process.platform,
 ): void {
-  if (!prefixSupportedOn(platform)) {
-    return;
-  }
   if (findOnPath("rtk") === undefined) {
     return;
   }
@@ -833,7 +852,7 @@ export function installPrefixShadow(
   // 保留注入，只把「目录没核过」这件事记在 `writableDir` 上：统计面报不可用、沙箱登记跳过。
   // 建目录失败**不该**让整层失效：那等于让一个附加功能否决主功能。
   const ledger = prepareLedgerDir(options);
-  const trackingDbPath = ledger.inject;
+  const { paths: injectedPaths } = ledger;
 
   /**
    * 故障播报：两个口都走一遍。
@@ -914,7 +933,15 @@ export function installPrefixShadow(
         ) {
           return orig.execute(args, exec);
         }
-        return runShadowedBash({ ctx, options, deps, orig, args, exec, trackingDbPath });
+        return runShadowedBash({
+          ctx,
+          options,
+          deps,
+          orig,
+          args,
+          exec,
+          ledgerPaths: injectedPaths,
+        });
       },
     };
     markAsShadow(shadow);
@@ -992,6 +1019,14 @@ export interface PipeOptions {
   readonly minBytes: () => number;
   readonly minGainRatio: () => number;
   readonly stdoutCapBytes: () => number;
+  /**
+   * 日志窗口保留的头部 / 尾部行数（`lib/output-window.ts`）。
+   *
+   * 与上面几位同样是**取值函数**：用户在卡片上把 200 改成 80 之后，下一次 `cat` 就该按新值切。
+   * 默认值与 rtk `cap` method 那一组同值（50 / 200），改它们只是换一个观察口径。
+   */
+  readonly windowHeadLines: () => number;
+  readonly windowTailLines: () => number;
   readonly pipeTimeoutMs: number;
   /**
    * 诊断日志：非 `undefined` 时每次管道决策记一行。由 `logFilterMode`（部署级，重启生效）装配，
@@ -1000,6 +1035,25 @@ export interface PipeOptions {
   readonly log: ((line: string) => void) | undefined;
   /** 探到的 rtk 是否达下限；`false` 时这一层整段不跑（与 C 形态同一口径）。 */
   readonly supported: () => boolean | undefined;
+  /**
+   * rtk 清理链的三处位置与它的开关心跳。
+   *
+   * `undefined` = 这条路径不可用（配置目录建不出来、用户没开 `hook`、或 rtk 版本不支持
+   * `hook` 子命令），此时行为与接入之前逐字节相同。写成取值函数而不是快照：`hook` 同样
+   * 在启用集合里，用户勾掉它之后下一次长输出就该不再 spawn。
+   *
+   * 每次调用现算三处路径的成本可以忽略（纯字符串拼接），但 `prepareHookConfig` 要写文件，
+   * 所以它**不在这里**——目录与配置文件在装配期写一次（`apply`），这里只交位置。
+   */
+  readonly hook: () => HookEnv | undefined;
+}
+
+/** `rtk hook` 一次调用需要的位置：配置目录、隔离的家目录、账本、取回库。 */
+export interface HookEnv {
+  readonly configDir: string;
+  readonly home: string;
+  readonly dbPath: string;
+  readonly recallDb: string;
 }
 
 /** B 形态的四份依赖，都在 `apply` 顶部造一次（`messages`/`rewrittenCalls` 与 C 形态共用）。 */
@@ -1120,11 +1174,26 @@ interface PipePlan {
   /**
    * 这一次的压缩在哪一侧做。
    *
-   * `rtk` = spawn 一次 `rtk pipe -f <filter>`；`strip` = 本包原地删掉 vitest 的通过行。
-   * 分支存在的原因是 vitest 5 上 `rtk pipe -f vitest` 走 Tier2 正则、把断言整段吃掉
-   * （实测 4 个失败的 `AssertionError` 计数 4→0，护栏还判它通过）。
+   * `rtk` = spawn 一次 `rtk pipe -f <filter>`；`strip` = 本包原地删掉 vitest 的通过行；
+   * `window` = 本包在内存里给日志类输出套一层头尾窗口（`lib/output-window.ts`）。
+   *
+   * 前两支存在的原因是 rtk 自己的解析器在这两种形状上要么吃掉断言（vitest 5 走 Tier2 正则，
+   * 实测 4 个失败的 `AssertionError` 计数 4→0），要么根本没有对应的 filter。
+   * `window` 那一支的理由更直接：**rtk 的 `read` 在默认档位下逐字节透传**（`--level none`，
+   * 实测 `rtk read ps-native.txt` 与原生 md5 相同），`rtk pipe` 也没有 `cat`/日志这档 filter，
+   * 所以日志类输出要压只能由本包自己做——顺带把省掉的那段原文落进 spill，取回路径与其余路径一致。
    */
   readonly mode: PipeMode;
+  /** 原始命令串：`hook` 那一支要把它放进 PostToolUse 载荷（`is_rtk_command` 靠它判）。 */
+  readonly command: string;
+  /**
+   * 这一条还要不要再套一层本包的头尾窗口。
+   *
+   * `window` 档恒 `true`；`hook` 档只在「这条命令是日志类目标、且用户没关掉 `window`」时
+   * 为 `true`——先过 rtk 的清理链、再切头尾，实测 792 行构建日志 32,550 B → 9,228 B
+   * （只窗口是 10,366 B、只清理链是 23,288 B）。
+   */
+  readonly window: boolean;
   readonly cwd: string;
   readonly extracted: Extracted;
   readonly input: string;
@@ -1137,7 +1206,7 @@ interface PipePlan {
 }
 
 /** 压缩落在哪一侧。见 `PipePlan.mode`。 */
-type PipeMode = "rtk" | "strip";
+type PipeMode = "rtk" | "strip" | "window" | "hook";
 
 /**
  * 一条回执的 pipe 判定结果。
@@ -1240,7 +1309,16 @@ function worthPiping(
   let reason: PipeSkipReason | undefined;
   if (Buffer.byteLength(candidate, "utf8") < options.minBytes()) {
     reason = "too-small";
-  } else if (!shapeMatches(filter, candidate)) {
+  } else if (
+    filter !== WINDOW_FILTER &&
+    filter !== HOOK_FILTER &&
+    !shapeMatches(filter, candidate)
+  ) {
+    // `window` 与 `hook` 这两档没有形态可校：前者只问「这段文本是不是够长」，后者是
+    // 「任何一段长输出都值得先做一次 ANSI / 进度条 / 重复行清理」。拿 `shapeMatches` 去问
+    // 它们必然落空（两者都不在 `SHAPE_TOKENS` 里，函数会放行），但把判据写成显式的例外，
+    // 比依赖「未登记就放行」那条兜底更清楚——将来有人给 `SHAPE_TOKENS` 补一条宽泛的默认值时，
+    // 这里不会跟着变严。
     reason = "shape-mismatch";
   }
   return reason;
@@ -1288,12 +1366,25 @@ function recordSkip(input: BaseContext, decision: Extract<PipeDecision, { kind: 
  * 也不依赖 rtk 的版本行为。一条路径胜过两条，所以版本门在 B 形态这一侧不再需要。
  */
 function modeOf(filter: string): PipeMode {
-  return filter === VITEST_FILTER ? "strip" : "rtk";
+  let mode: PipeMode = "rtk";
+  if (filter === VITEST_FILTER) {
+    mode = "strip";
+  } else if (filter === WINDOW_FILTER) {
+    mode = "window";
+  } else if (filter === HOOK_FILTER) {
+    mode = "hook";
+  }
+  return mode;
 }
 
 /** 回执拆解与输入判据那一段。 */
 async function pipedPlan(
-  input: PlanContext & { readonly filter: string; readonly command: string },
+  input: PlanContext & {
+    readonly filter: string;
+    readonly command: string;
+    /** 这一条还要不要再套一层本包的头尾窗口（只有 `hook` 档可能给 false）。 */
+    readonly window?: boolean;
+  },
 ): Promise<PipeDecision> {
   const { options, deps, result, filter, command, cwd } = input;
   const commandFamily = commandFamilyOf(command);
@@ -1319,6 +1410,8 @@ async function pipedPlan(
               plan: {
                 filter,
                 mode: modeOf(filter),
+                command,
+                window: input.window ?? filter === WINDOW_FILTER,
                 cwd,
                 extracted,
                 input: candidate,
@@ -1366,17 +1459,62 @@ async function planForCommand(
     return { kind: "skip", reason: "structural-reject", commandFamily, workdir: cwd };
   }
   // 这条命令已经被 C 形态改写过：rtk 的那份输出不再适合按原 filter 再压一次。
+  //
+  // 但「被改写过」不等于「已经被压过」：`rtk rewrite` 会把 `cat build.log` 改写成
+  // `rtk read build.log`，而 `rtk read` 的 `--level` 默认 `none`——实测 22,390 B 进、
+  // 22,390 B 出，一个字节都没动。那种改写让路等于白丢一次机会（真实账本里这一支有
+  // 1,855,886 input token 是日志扩展名命中的），所以判据放在 `shouldSkipPipe` 里按
+  // **改写产物**分辨，见 `lib/dedup.ts` 的 `isVerbatimRewrite`。
   if (shouldSkipPipe({ callId: exec.callId }, options.forms(), deps.rewrittenCalls)) {
     return { kind: "skip", reason: "already-rewritten", commandFamily, workdir: cwd };
   }
   // 白名单**在这里现读**（不是装配期快照一份 Set）：`enabledFilters` 标了 volatile，
   // 用户在卡片上勾掉一个 filter 之后，下一次 post-execute 就该按新集合查表。
-  const filter = filterOf(command, new Set(options.enabledFilters()));
-  if (filter === undefined) {
-    recordPotential(input, command);
-    return { kind: "skip", reason: "no-filter", commandFamily, workdir: cwd };
+  const enabled = new Set(options.enabledFilters());
+  const filter = filterOf(command, enabled);
+  if (filter !== undefined) {
+    // 表里命中的命令**不过清理链**：那一路已经由 `rtk pipe -f <filter>` 一步到位
+    // （它自己的 filter 就认该工具的输出格式）。硬要先跑 `rtk hook` 会多一次 spawn 且
+    // 让 rtk 的 `cap` / 计数器口径与本包窗口互相干扰。用户裁决的范围本来也只有两条：
+    // 日志窗口与「无 filter」。
+    return pipedPlan({ ...input, filter });
   }
-  return pipedPlan({ ...input, filter });
+  // 表里没有这行命令时还剩两条路，次序是**先清理链、后本地窗口**：
+  //
+  // 1. 清理链（`rtk hook`，`lib/rtk-hook.ts`）：`ansi` / `progress` / `dedup` 三件事
+  //    `rtk pipe` 的 27 个 filter 一件都做不到——它不读 pipeline 配置。这条路径接管的是
+  //    两批输出：日志类目标（`cat` / `journalctl` / `docker logs` / `ps`；`rtk read` 默认
+  //    `--level none` 逐字节透传、`rtk pipe` 没有 `cat` 这档）与**没有任何 filter 命中**的
+  //    长输出（构建日志、一次性脚本输出那一类，rtk 的账本里占 44%）。
+  // 2. 本地头尾窗口（`lib/output-window.ts`）：清理链不可用、关掉、或没省东西时的兜底。
+  //    它只在**日志类目标**上生效——读源码一个字节都不动（`isLogTarget` 是命令 × 扩展名
+  //    双判据）。日志类目标两条都开时是「先清理再切头尾」，实测 792 行构建日志 32,550 B →
+  //    9,228 B（只窗口 10,366 B、只清理链 23,288 B）。
+  //
+  // 两次 spawn 的代价要先看清：`rtk hook` 与 `rtk pipe` 同量级（实测小输入 19~21 ms）。
+  // 这条分支**不是**每条 bash 调用都走——`pipedPlan` 的 `worthPiping` 先用 `minBytes`
+  // （默认 256 字节）挡掉短输出，形态预检对这两档不设限（见那里的注释）。
+  //
+  // **阅读材料一律不碰**（用户裁决：压缩不能让模型读到的东西变样）。`cat src/app.ts`、
+  // `head -1000 lib/guard.ts`、`cat notes.txt` 这些是模型用来判断下一步的正文，两条路都
+  // 不许压：窗口会挖掉中段，`dedup` 会把连续重复行折成 `[xN]`（实测 200 行相同文档
+  // 6,221 B → 102 B）。判据在 `isReadingTarget`，与 `isLogTarget` 是同一把尺子的反面。
+  const reading = isReadingTarget(command);
+  const windowTarget = !reading && isLogTarget(command);
+  const windowReady = enabled.has(WINDOW_FILTER);
+  const hookReady = enabled.has(HOOK_FILTER) && options.hook() !== undefined;
+  if (hookReady && !reading) {
+    return pipedPlan({
+      ...input,
+      filter: HOOK_FILTER,
+      window: windowReady && windowTarget,
+    });
+  }
+  if (windowReady && windowTarget) {
+    return pipedPlan({ ...input, filter: WINDOW_FILTER });
+  }
+  recordPotential(input, command);
+  return { kind: "skip", reason: "no-filter", commandFamily, workdir: cwd };
 }
 
 /** 把一条回执喂给 pipe 之前要过的全部判据。 */
@@ -1423,6 +1561,93 @@ function relaxedHeaderOf(
     .replace("{hint}", spilled.retrievalHint);
 }
 
+/**
+ * 落帽时写进正文首行的提示：帽值、切掉多少、原文在哪。
+ *
+ * 与 spillRelaxed 分开的键：两件事可以同时发生（放宽放行的正文又超了帽），
+ * 那时首行会有两句；合成一句会让「为什么少了」和「少了多少」互相盖住。
+ */
+function cappedHeaderOf(
+  readMessages: () => Messages,
+  spilled: SpilledOriginal,
+  cap: number,
+  omitted: number,
+): string {
+  const template = readMessages().spillCapped;
+  const text = typeof template === "string" ? template : "{cap} {omitted} {path} {hint}";
+  return text
+    .replace("{cap}", String(cap))
+    .replace("{omitted}", omittedTextOf(omitted))
+    .replace("{path}", spilled.locator)
+    .replace("{hint}", spilled.retrievalHint);
+}
+
+interface CappedBodyInput {
+  readonly cap: number;
+  readonly output: string;
+  readonly visible: string;
+  readonly relaxed: boolean;
+  readonly spilled: SpilledOriginal | undefined;
+  /** reassemble 会补回来的退出标记（含前面那个换行）占的字节。 */
+  readonly suffixBytes: number;
+  readonly readMessages: () => Messages;
+}
+
+/** 把提示行与正文拼成一个正文；空段不占换行。 */
+function joinBodyLines(lines: readonly string[], text: string): string {
+  const parts = [...lines, text].filter((part) => part !== "");
+  return parts.join("\n");
+}
+
+/** 组成最终正文：提示行 + 帽后的正文；提示占的字节也计入帽。 */
+function composeCappedBody(input: CappedBodyInput): CappedText & { readonly body: string } {
+  const { cap, output, visible, relaxed, spilled, suffixBytes, readMessages } = input;
+  const prefixLinesOf = (capped: CappedText): string[] => {
+    /* v8 ignore next 3 —— 只有「压缩输出与原可见面逐字相同（无损）且没落 spill」才会带着
+       undefined 走到这里；那种情况没有要提示的省略量，提示行为空。真实数据构造不出
+       这一格（护栏的收益阈值会先拒绝零收益的压缩），留着是给无损放行留一条明确分支。 */
+    if (spilled === undefined) {
+      return [];
+    }
+    const lines: string[] = [];
+    if (relaxed) {
+      const visibleBytes = Buffer.byteLength(visible, "utf8");
+      const cappedBytes = Buffer.byteLength(capped.text, "utf8");
+      lines.push(relaxedHeaderOf(readMessages, spilled, Math.max(visibleBytes - cappedBytes, 0)));
+    }
+    if (capped.truncated) {
+      lines.push(cappedHeaderOf(readMessages, spilled, cap, capped.omittedBytes));
+    }
+    return lines;
+  };
+  let budget = Math.max(cap, 0);
+  let capped = capCompressed(output, budget);
+  let lines = prefixLinesOf(capped);
+  // 提示长度依赖「是否截断」，截断又依赖提示让出的预算 —— 固定点最多两三轮：
+  // 第一轮保守按整帽落，发现截断后加提示；第二轮把提示的字节从帽里扣掉。
+  for (let pass = 0; pass < 4; pass += 1) {
+    const prefixBytes =
+      (lines.length === 0 ? 0 : Buffer.byteLength(lines.join("\n"), "utf8") + 1) + suffixBytes;
+    const next = Math.max(cap - prefixBytes, 0);
+    if (next === budget) {
+      break;
+    }
+    budget = next;
+    capped = capCompressed(output, budget);
+    lines = prefixLinesOf(capped);
+  }
+  let body = joinBodyLines(lines, capped.text);
+  // 提示行本身超过帽（帽被设得极小）时上面的固定点收敛不到：再按超出量往下压一次。
+  for (let pass = 0; pass < 2 && Buffer.byteLength(body, "utf8") + suffixBytes > cap; pass += 1) {
+    const overflow = Buffer.byteLength(body, "utf8") + suffixBytes - cap;
+    budget = Math.max(budget - overflow, 0);
+    capped = capCompressed(output, budget);
+    lines = prefixLinesOf(capped);
+    body = joinBodyLines(lines, capped.text);
+  }
+  return { ...capped, body };
+}
+
 /** 把命令的原始可见面落进 spill：取回通道的唯一实现。 */
 async function spillOf(input: RenderInput): Promise<SpilledOriginal | undefined> {
   const { ctx, exec, plan } = input;
@@ -1443,6 +1668,35 @@ async function spillOf(input: RenderInput): Promise<SpilledOriginal | undefined>
   return spilled;
 }
 
+/**
+ * 护栏拒：记一格 `guard:<reason>`，并把这一条留给面板解释「为什么这次没压」。
+ *
+ * 同步函数：拒绝路径上除了记账没有别的异步动作，`async` 只会让调用点多一层 await
+ * （`typescript(require-await)` 也是这么判的）。
+ */
+function rejectCompressed(
+  input: RenderInput & { readonly latencyMs: number },
+  reason: string,
+): PostToolDecision | undefined {
+  input.options.log?.(`[rtk] pipe ${input.plan.filter}: skipped (${reason})`);
+  safeRecordPipe(
+    input.deps,
+    () => ({
+      kind: "pipe-skip",
+      ts: Date.now(),
+      reason: `guard:${reason}`,
+      filter: input.plan.filter,
+      commandFamily: input.plan.commandFamily,
+      workdir: input.plan.cwd,
+      originalTokens: input.plan.originalTokens,
+      originalBytes: input.plan.originalBytes,
+      latencyMs: input.latencyMs,
+    }),
+    input.options.log,
+  );
+  return undefined;
+}
+
 /** 压成功之后：落 spill、记账、拼回原形状。 */
 async function finishCompressed(
   input: RenderInput & {
@@ -1456,7 +1710,7 @@ async function finishCompressed(
   },
 ): Promise<PostToolDecision | undefined> {
   const { options, deps, plan, visible, output, latencyMs, relaxed = false } = input;
-  const capped = capCompressed(output, options.stdoutCapBytes());
+  const cap = options.stdoutCapBytes();
   const spilled = input.spilled ?? (await spillOf(input));
   // 取回通道成不成，四个后果里只有「模型看不到原文」是不可见的：
   // - 落了库：诊断日志留一行 locator（默认关时这行不花一次字符串拼接）；
@@ -1466,21 +1720,49 @@ async function finishCompressed(
     deps.log.warn(
       "[rtk] spill: no backend or saveText failed; compressed output has no retrieval path",
     );
+    // 压缩改动了正文（`output !== visible`）就是有信息损失；没有取回通道时这条压缩比原文更坏，
+    // 整条放弃、把下游原决定（原文）留给模型。只有压缩输出与原可见面逐字相同（无损）时才继续，
+    // 那种情况没有「取不回的内容」，下面 `cap-no-spill` 只拦落帽切字节。
+    /* v8 ignore next 3 —— 零收益的压缩会被护栏先拒（minGainRatio 0.95），真实数据走不到
+       「无损且没 spill」；这里保留无损放行的分支，防将来阈值放宽后误拒无信息损失的压缩。 */
+    if (output !== visible) {
+      return rejectCompressed({ ...input, latencyMs }, "spill-unavailable");
+    }
   } else if (options.log !== undefined) {
     options.log(`[rtk] spill: saved ${spilled.locator}`);
   }
+  // 帽一旦切掉字节，模型必须能同时看到「这里少了东西」和「去哪取回」。没有 spill 时
+  // 两者都做不到：残件既没有提示、也没有路径 —— 这种压缩比原文更坏，所以整条放弃。
+  // 判据用未落帽的文本先判：正文没超帽就不需要取回通道，压缩照常生效。
+  // 退出标记是 reassemble 拼回去的，不占 output 的字节，但占最终正文的字节：
+  // 帽要把这一截也预留下来，否则「硬上界」在两个字节的 marker 上失守。
+  const suffixBytes =
+    plan.extracted.marker === "" ? 0 : Buffer.byteLength(`\n${plan.extracted.marker}`, "utf8");
+  /* v8 ignore next 3 —— 有损且没 spill 已在上面按 `spill-unavailable` 拒绝；能到这里的
+     无 spill 只可能是「压缩输出与原可见面逐字相同」，而那种零收益的压缩会被护栏先挡掉。
+     这一条留着防实现漂移：万一将来护栏放宽，落帽切字节仍然不该在没有取回通道时放行。 */
+  if (capCompressed(output, Math.max(cap - suffixBytes, 0)).truncated && spilled === undefined) {
+    return rejectCompressed({ ...input, latencyMs }, "cap-no-spill");
+  }
   const originalBytes = Buffer.byteLength(visible, "utf8");
-  // 放宽放行的这一次（护栏原本判 `lost-hash` / `folded-entries`）：正文第一行必须写出路径。
-  // 它进正文而不是只进 `additionalContexts`，因为这一份正文本身少了东西——模型很可能只看正文。
-  const header =
-    relaxed && spilled !== undefined
-      ? relaxedHeaderOf(
-          deps.messages,
-          spilled,
-          Math.max(originalBytes - Buffer.byteLength(capped, "utf8"), 0),
-        )
-      : undefined;
-  const body = header === undefined ? capped : `${header}\n${capped}`;
+  // 放宽放行（护栏原本判 lost-hash / folded-entries）与落帽两件事都可能要往正文首行
+  // 加提示。提示本身也花字节，所以帽要给它们让位：先按帽落一版，量出提示长度，再把
+  // 正文预算缩到 cap - 提示，反复到稳定；最后仍超帽就整条放弃，不交一件超帽的残品。
+  const composed = composeCappedBody({
+    cap,
+    output,
+    visible,
+    relaxed,
+    spilled,
+    suffixBytes,
+    readMessages: deps.messages,
+  });
+  if (Buffer.byteLength(composed.body, "utf8") + suffixBytes > cap) {
+    return rejectCompressed({ ...input, latencyMs }, "cap-overflow");
+  }
+  const { body } = composed;
+  // 账目仍按「filter 压出来的正文」计（与改造前同口径）：退出标记不是压缩产物，
+  // 它只是回填时跟回来的原字节。硬上界那条判据另把 suffixBytes 算进去。
   const compressedBytes = Buffer.byteLength(body, "utf8");
   // token 与字节各算一次：宿主扣钱按前者、可复算的物理量是后者。两侧都用同一个定价函数，
   // 「省下多少」才是同一把尺子量出来的（`savedTokens` 与 `savedBytes` 因此不会互相矛盾）。
@@ -1519,35 +1801,6 @@ async function finishCompressed(
           };
   }
   return accepted;
-}
-
-/**
- * 护栏拒：记一格 `guard:<reason>`，并把这一条留给面板解释「为什么这次没压」。
- *
- * 同步函数：拒绝路径上除了记账没有别的异步动作，`async` 只会让调用点多一层 await
- * （`typescript(require-await)` 也是这么判的）。
- */
-function rejectCompressed(
-  input: RenderInput & { readonly latencyMs: number },
-  reason: string,
-): PostToolDecision | undefined {
-  input.options.log?.(`[rtk] pipe ${input.plan.filter}: skipped (${reason})`);
-  safeRecordPipe(
-    input.deps,
-    () => ({
-      kind: "pipe-skip",
-      ts: Date.now(),
-      reason: `guard:${reason}`,
-      filter: input.plan.filter,
-      commandFamily: input.plan.commandFamily,
-      workdir: input.plan.cwd,
-      originalTokens: input.plan.originalTokens,
-      originalBytes: input.plan.originalBytes,
-      latencyMs: input.latencyMs,
-    }),
-    input.options.log,
-  );
-  return undefined;
 }
 
 /** pipe 成功了：过护栏，然后交给 `finishCompressed`。 */
@@ -1600,19 +1853,77 @@ async function acceptCompressed(
 }
 
 /**
- * 按 `plan.mode` 拿到「压完之后的那一段」；拿不到（`rtk pipe` 失败）返回 `undefined`。
+ * 过一遍 rtk 的清理链，再（可选）套本包的头尾窗口。
  *
- * `strip` 那一支不 spawn 任何进程：它只在内存里删掉 `✓` 通过行。这样做的理由是 rtk 在
- * vitest 上拿不到可用的结构化输入（见 `lib/vitest-strip.ts` 的头注释），而模型本来会看到的
- * 就是这份纯文本——删通过行是「同一份文本变短」，不是「换一条渲染路径重新描述结果」。
+ * 次序是实测选出来的：**先清理再切头尾**那一边更好（792 行构建日志 9,228 B vs 反过来
+ * 9,309 B）。原因是窗口先砍行会让 `dedup` 少看到重复、`progress` 少看到中间帧，而清理
+ * 在前时窗口切的是已经干净了的文本。
  *
- * 计时口径两边一致：调用方在调这里之前取起点，所以面板里的 `latency_ms` 在 `strip` 档
- * 量到的是纯 CPU 耗时（通常 < 1 ms），在 `rtk` 档照旧含 spawn。
+ * 三层回退，每一层都保留「不压」的可能：
+ * 1. 清理链不可用或失败（`hook()` 给 `undefined`、spawn 失败、`never_worse` 判无收益）→ 用原文继续；
+ * 2. 有窗口就切；**窗口没超阈值**（`windowOf` 回 `undefined`）时，只要清理链真的改过内容就
+ *    交清理后的全文——那本身已经是一次有效压缩（200 行重复告警 6,200 B → 81 B，远低于任何
+ *    窗口阈值）；
+ * 3. 两层都没动过 → `undefined`，调用方记 `guard:low-gain`（「本来就没什么可省」，不是故障）。
+ *
+ * `parseHookOutput` 给出 `undefined` 时**没有第三态**：rtk 的空 stdout 既可能是「无收益」也可能是
+ * 「配置没读到」，两种都不该让插件去猜——当作没清理过，安全的一侧。
+ */
+async function hookedTextOf(input: RenderInput): Promise<string | undefined> {
+  const { ctx, options, plan } = input;
+  const hook = options.hook();
+  let cleaned = plan.input;
+  if (hook !== undefined) {
+    const ran = await runRtkHook({
+      subprocess: ctx.subprocess,
+      stdin: buildHookPayload({ command: plan.command, stdout: plan.input }),
+      cwd: plan.cwd,
+      timeoutMs: options.pipeTimeoutMs,
+      env: hookEnvOf(hook),
+    });
+    const parsed = ran.ok ? parseHookOutput(ran.stdout) : undefined;
+    if (parsed !== undefined) {
+      cleaned = parsed;
+    }
+  }
+  const windowed = plan.window
+    ? windowOf(cleaned, options.windowHeadLines(), options.windowTailLines())?.text
+    : undefined;
+  if (windowed !== undefined) {
+    return windowed;
+  }
+  return cleaned === plan.input ? undefined : cleaned;
+}
+
+/**
+ * 按 `plan.mode` 拿到「压完之后的那一段」；拿不到就返回 `undefined`。
+ *
+ * 四支各有一条不 spawn 的理由，也各有一个「拿不到」的语义：
+ *
+ * - `strip`（vitest）不 spawn：只在内存里删掉 `✓` 通过行。rtk 在 vitest 上拿不到可用的结构化
+ *   输入（见 `lib/vitest-strip.ts` 的头注释），而模型本来会看到的就是这份纯文本——删通过行是
+ *   「同一份文本变短」，不是「换一条渲染路径重新描述结果」。一行没删掉时它会返回与输入等长的
+ *   文本，由护栏的 `low-gain` 判掉。
+ * - `window`（日志）不 spawn：`rtk pipe` 里根本没有日志/`cat` 这档 filter，`rtk read` 的默认档位
+ *   又是逐字节透传（`--level none`），所以这一段只能本包自己切。`undefined` 的意思是「这份输出
+ *   本来就没超头+尾的阈值」——调用方据此记 `guard:low-gain`，不记 `pipe-failed`。
+ * - `hook` 会 spawn 一次 `rtk hook claude`，且**可能什么都没变**：清理链判无收益时 rtk 回 0 字节，
+ *   窗口又没超阈值时 `hookedTextOf` 也返回 `undefined`。这时同样是「没什么可省」，不是「出错」。
+ * - `rtk` 走 `rtk pipe -f <filter>`，spawn 失败或非 0 退出才返回 `undefined`（记 `pipe-failed`）。
+ *
+ * 计时口径四支一致：调用方在调这里之前取起点，所以面板里的 `latency_ms` 在 `strip` / `window`
+ * 档量到的是纯 CPU 耗时（通常 < 1 ms），在 `hook` / `rtk` 档含一次 spawn（实测同量级，约 20 ms）。
  */
 async function pipedTextOf(input: RenderInput): Promise<string | undefined> {
   const { ctx, options, plan } = input;
   if (plan.mode === "strip") {
     return stripPassingTests(plan.input).text;
+  }
+  if (plan.mode === "window") {
+    return windowOf(plan.input, options.windowHeadLines(), options.windowTailLines())?.text;
+  }
+  if (plan.mode === "hook") {
+    return hookedTextOf(input);
   }
   const piped = await runRtkPipe({
     subprocess: ctx.subprocess,
@@ -1643,7 +1954,15 @@ async function renderCompressed(input: RenderInput): Promise<PostToolDecision | 
       () => ({
         kind: "pipe-skip",
         ts: Date.now(),
-        reason: "pipe-failed",
+        // `window` 与 `hook` 这两支拿不到结果都只有一个原因：**这份输出本来就没得省**——
+        // 窗口没超头+尾的阈值，或清理链判无收益（rtk 回 0 字节）而窗口也没超阈值。把它记成
+        // `pipe-failed` 会让面板把「本来就没什么可省」误报成「rtk 挂了」，那是两件需要用户做
+        // 不同反应的事。`guard:low-gain` 与护栏自己那条判据同名同义（`lib/guard.ts` 的
+        // `reason` 就是这个串），读面上两处会归到同一档。
+        //
+        // `rtk` 那一支才真的是 `pipe-failed`：它只有 spawn 失败 / 非 0 退出 / 空回执时回
+        // `undefined`，而 `hook` 的空回执在 `hookedTextOf` 里已经被吸收成「没清理过」。
+        reason: plan.mode === "window" || plan.mode === "hook" ? "guard:low-gain" : "pipe-failed",
         filter: plan.filter,
         commandFamily: plan.commandFamily,
         workdir: plan.cwd,
@@ -1818,8 +2137,11 @@ const configSchema = Schema.object({
    */
   enabled: Schema.boolean().volatile(),
   /**
-   * 启用的形态。默认只开 C（prefix）：B 的 vitest filter 在 5.x 上只剩一行 passthrough，
-   * 且会在用户仓库里落 `.vitest/json/output.json`，等官方修好再默认打开。
+   * 启用的形态。默认只开 C（prefix）：两种形态都会让模型看到的输出与本机原生命令不同，
+   * 而后者才是用户没装插件时的基线——默认只动「命令怎么跑」，不动「输出长什么样」。
+   *
+   * （这条默认与 vitest 无关：从 0.2.1 起 B 形态的 vitest 那一路完全不调 rtk，改由
+   * `lib/vitest-strip.ts` 在内存里删掉通过行，既不 spawn 也不再落 `.vitest/json/output.json`。）
    *
    * **volatile 且运行期现读**：两层常驻，C 在 execute 里读、B 在 decide 里读；卡片改完
    * 下一次工具调用即生效，不需要重启宿主。
@@ -1829,7 +2151,12 @@ const configSchema = Schema.object({
     .volatile(),
   /** 用户追加的拒绝前缀（首词字面量）。内置的信息损失拒绝表不受它影响，只增不减。 */
   denyCommands: Schema.array(Schema.string()).default([]).volatile(),
-  /** B 形态的 filter 白名单。vitest 刻意不在默认里（见 enabledForms 的理由）。 */
+  /**
+   * B 形态的 filter 白名单（`DEFAULT_ENABLED_FILTERS` 是一张判据表，理由写在那个常量上方）。
+   *
+   * 它装的**不是** rtk 的 filter 全表：`window` 与 `hook` 是本包自己的两档，`vitest` 那一路
+   * 也不调 rtk。所以「名单里有什么」与「rtk pipe 认得什么」是两件事。
+   */
   enabledFilters: Schema.array(Schema.string())
     .default([...DEFAULT_ENABLED_FILTERS])
     .volatile(),
@@ -1839,6 +2166,15 @@ const configSchema = Schema.object({
   minGainRatio: Schema.number().min(0).max(1).default(0.95).volatile(),
   /** 压缩结果的硬上限（字节）。 */
   stdoutCapBytes: Schema.natural().min(1).default(64_000).volatile(),
+  /**
+   * 日志窗口保留的头部行数（`lib/output-window.ts`）。默认 50 = rtk `cap` method 的 `HEAD_LINES`。
+   *
+   * 为什么做成卡片旋钮：同一份日志「看开头多少行」是观察习惯，不是部署预算。50 行够看出
+   * 这一步在干什么，而有人要的是前 200 行。**它是 volatile**，改完下一次 `cat` 就生效。
+   */
+  windowHeadLines: Schema.natural().min(0).default(DEFAULT_WINDOW_HEAD_LINES).volatile(),
+  /** 日志窗口保留的尾部行数。默认 200 = rtk `cap` 的 `TAIL_LINES`（错误通常压在最末）。 */
+  windowTailLines: Schema.natural().min(0).default(DEFAULT_WINDOW_TAIL_LINES).volatile(),
   /** cargo test 丢编译警告时追加一行常量提示。 */
   warnHint: Schema.boolean().default(true).volatile(),
   /**
@@ -1862,7 +2198,7 @@ const configSchema = Schema.object({
 export { configSchema as Config };
 
 /**
- * `apply` 收到的配置面。**九项 volatile 是引用（要 `.get()`），五项非 volatile 是普通值**——
+ * `apply` 收到的配置面。**十一项 volatile 是引用（要 `.get()`），五项非 volatile 是普通值**——
  * 这个差别是官方 `.volatile()` 的语义（`SchemaOutput<T, 'volatile'> = Volatile<T | undefined>`），
  * 不是本包自选。声明里把 volatile 的值写成 `| undefined`：官方 `Volatile.get()` 的 d.ts 原文是
  * 「including undefined for an absent value」，条目没被 volatile 投影 / 宿主退化时交回来的就是空引用，
@@ -1876,6 +2212,8 @@ export interface Config {
   minBytes: Volatile<number | undefined>;
   minGainRatio: Volatile<number | undefined>;
   stdoutCapBytes: Volatile<number | undefined>;
+  windowHeadLines: Volatile<number | undefined>;
+  windowTailLines: Volatile<number | undefined>;
   warnHint: Volatile<boolean | undefined>;
   rewriteHostEnv: Volatile<string | undefined>;
   /** 以下五项是部署级预算项：普通值，改 cordis.yml 的 `config:` 后重启生效。 */
@@ -1913,6 +2251,12 @@ interface InjectedContext {
  */
 export interface HostServices extends HostContext {
   readonly settings: SettingsFace;
+  /**
+   * systemPrompt 面：只用来注册一段常驻摘要（见 `lib/skill.ts` 头注释里「摘要 + skill 全文」
+   * 那个拆分）。它进 `inject` 而 `skills` 不进：摘要段是**必需**的（少了它模型不知道自己
+   * 读到的输出可能被压过），而 skill 只是全文的载体，服务缺席时摘要照旧生效。
+   */
+  readonly systemPrompt: SystemPromptFace;
   readonly get: NonNullable<HostContext["get"]>;
   /**
    * 注入口。回调收到的子上下文**只声明本插件真正用到的那两位**（`settings` 与 `effect`）：
@@ -1953,6 +2297,8 @@ function hasMethod(
  *
  * `storageDomain` **不在其中**：Insights 之后统计落在两本自有账本上（SQLite），宿主的
  * storage domain 只用来读一次旧累计账本，读不到就跳过迁移——它缺席不该让整层装不起来。
+ * `skills` 同样不在其中：skill 是口径全文的载体，服务缺席时只丢那一份可加载的正文，
+ * 常驻摘要段（`systemPrompt.section`）照旧生效。
  */
 function isRtkHost(value: unknown): value is HostServices {
   if (!isRecord(value)) {
@@ -1963,6 +2309,7 @@ function isRtkHost(value: unknown): value is HostServices {
     hasMethod(value, "tools", ["get"]) &&
     hasMethod(value, "subprocess", ["spawn"]) &&
     hasMethod(value, "workingDirectory", ["ensure"]) &&
+    hasMethod(value, "systemPrompt", ["section"]) &&
     typeof value["get"] === "function" &&
     typeof value["on"] === "function" &&
     typeof value["inject"] === "function" &&
@@ -2032,6 +2379,8 @@ export function pipeReadersOf(
   readonly minBytes: () => number;
   readonly minGainRatio: () => number;
   readonly stdoutCapBytes: () => number;
+  readonly windowHeadLines: () => number;
+  readonly windowTailLines: () => number;
 } {
   return {
     enabled: () => config.enabled.get() ?? ready() === true,
@@ -2041,6 +2390,8 @@ export function pipeReadersOf(
     minBytes: () => withDefault(config.minBytes.get(), 256),
     minGainRatio: () => withDefault(config.minGainRatio.get(), 0.95),
     stdoutCapBytes: () => withDefault(config.stdoutCapBytes.get(), 64_000),
+    windowHeadLines: () => withDefault(config.windowHeadLines.get(), DEFAULT_WINDOW_HEAD_LINES),
+    windowTailLines: () => withDefault(config.windowTailLines.get(), DEFAULT_WINDOW_TAIL_LINES),
   };
 }
 
@@ -2166,7 +2517,9 @@ const INSTANCE_LOCK_KEY = "@jayyuen66/dsh-rtk/instance";
  */
 function apply(ctx: unknown, config: Config): void {
   if (!isRtkHost(ctx)) {
-    throw new Error("[rtk] required services (settings/tools/subprocess/workingDirectory) missing");
+    throw new Error(
+      "[rtk] required services (settings/tools/subprocess/workingDirectory/systemPrompt) missing",
+    );
   }
   const host = ctx;
 
@@ -2195,15 +2548,62 @@ function apply(ctx: unknown, config: Config): void {
   // 2. 文案 thunk（每次现读 locale 偏好）。
   const messages = createLocaleMessages(host);
 
+  // 2a. 常驻摘要（systemPrompt）＋ 口径全文（虚拟 skill）。
+  //
+  //     为什么拆两份：摘要里只放「不照做会误判」的三条（读文件不压、被压掉的原文取回得到、
+  //     要精确判断时 `rtk bypass`），每轮都付这点常驻代价是值的；全文约 3.4KB，只在模型真要
+  //     判断「这份输出是不是残件」时才值一次加载。两处各放什么见 `lib/skill.ts` 头注释。
+  //
+  //     skill 注册**不当作装配前提**：`@deepseek-ai/dsh-skill` 未装载时 `get("skills")` 回
+  //     undefined，`registerSkill` 只回 false；摘要段照旧生效。所以 `skills` 不进 inject，
+  //     也没必要为它加一条 `isRtkHost` 判据。
+  //
+  //     段名用 `USAGE_SECTION`（`rtk-usage`），顺序 1565：zvec-grep 1550 / ocr-review 1555 /
+  //     lesson-loop 1560 之后、jobs 工具说明 1600 之前。
+  const registered = messages();
+  host.systemPrompt.section({
+    name: USAGE_SECTION,
+    order: USAGE_ORDER,
+    text: registered.usageSummary,
+  });
+  registerUsageSkill(host, registered.usageText, registered.skillDescription);
+
   // 2b. 账本位置：`$DSH_HOME/rtk/history.db`，**在装配期解析一次**——`DSH_HOME` 是进程级输入，
   //     解析它不该出现在每次工具调用的热路径上。这里只算路径、**不建目录**：建目录是这一层
-  //     真的要装（rtk 在、平台支持）之后才该做的事，见 `installPrefixShadow`。
+  //     真的要装（rtk 在）之后才该做的事，见 `installPrefixShadow`。
   //
   //     落在 dsh 自己家里（而不是 rtk 的全局目录）是**口径决定**：本页只统计 dsh 会话，
   //     而全局 `commands` 表里还有用户终端自己跑的命令。注入 `RTK_DB_PATH` 把 rtk 的记账引到
   //     这里，两条流因此不相交。
   const ledgerPaths = resolveLedgerPaths();
-  const trackingDbPath = ledgerPaths.historyDb;
+
+  // 2c. rtk 清理链（`rtk hook`）的三处位置。配置文件在**装配期写一次**：它是本包的产物
+  //     （第一行就写明「改动会被覆盖」），每次调用重写只会白做 IO；而三处路径本身是纯字符串
+  //     拼接，所以交给 `PipeOptions.hook` 现算不影响 volatile 语义（用户在卡片上勾掉 `hook`
+  //     之后下一次长输出就不再 spawn，那一位由 `enabledFilters` 管，不在这里）。
+  //
+  //     写不出来就明确关掉这条路径并留一行：实测 `RTK_CONFIG_DIR` 指到不存在的目录时
+  //     `rtk hook` 回 0 字节（rc 仍是 0），那一路会静默退化成「没收益」，读面上与
+  //     「这条输出本来就没得省」完全一样——两种原因不该共用一个读法。
+  //
+  //     沙箱写许可不单独登记：三处都在 `$DSH_HOME/rtk/` 之下，C 形态已经为账本登记过
+  //     那个目录（`registerRtkWritableRoot` 收的是目录，父目录的授权覆盖子目录）。
+  const hookPaths = resolveHookPaths();
+  const hookConfigDir = prepareHookConfig(hookPaths, pipelineToml());
+  const hookEnv =
+    hookConfigDir === undefined
+      ? undefined
+      : {
+          configDir: hookConfigDir,
+          home: hookPaths.home,
+          dbPath: hookPaths.dbPath,
+          recallDb: ledgerPaths.recallDb,
+        };
+  if (hookEnv === undefined) {
+    warnSinkOf(host)(
+      `[rtk] hook: cannot prepare ${hookPaths.configDir}; the cleanup chain stays off`,
+    );
+  }
 
   // 3. 结论缓存与去重账本：跨调用共享，所以必须建在 apply 层而不是 execute 里。
   //    `rewriteCacheSize` 是普通值（部署级）；`rewrittenCalls` 的 512 只是防泄漏兜底，
@@ -2282,7 +2682,7 @@ function apply(ctx: unknown, config: Config): void {
       // 故障播报不走 `diag`：后者默认是 `undefined`，而「记账链断了」必须在默认配置下可见。
       warn: warnSinkOf(host),
       supported,
-      trackingDbPath,
+      ledgerPaths,
     },
     {
       messages,
@@ -2301,6 +2701,7 @@ function apply(ctx: unknown, config: Config): void {
       pipeTimeoutMs: config.pipeTimeoutMs,
       log: diag,
       supported,
+      hook: () => hookEnv,
     },
     {
       messages,
@@ -2322,7 +2723,7 @@ function apply(ctx: unknown, config: Config): void {
   //    未验证项之一），所以页面文案按部署默认模式说明。
   const service = createInsightsService({
     store: () => insights.store(),
-    ledger: createRtkLedger(trackingDbPath),
+    ledger: createRtkLedger(ledgerPaths.historyDb, ledgerPaths.recallDb),
     status,
     sandboxMode: () => sandboxModeOf(host),
     enabledFilters: () => [...withDefault(config.enabledFilters.get(), DEFAULT_ENABLED_FILTERS)],
@@ -2334,7 +2735,7 @@ function apply(ctx: unknown, config: Config): void {
 }
 
 export default {
-  inject: ["settings", "subprocess", "tools", "workingDirectory"],
+  inject: ["settings", "subprocess", "tools", "workingDirectory", "systemPrompt"],
   Config: configSchema,
   apply,
 };

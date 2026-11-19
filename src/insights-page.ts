@@ -28,6 +28,7 @@ import {
   rangeKeyOf,
   recentTitleKeyOf,
   requestOf,
+  rtkSelfLinesOf,
   savedValuesOf,
   savingsValuesOf,
   suggestionLinesOf,
@@ -60,6 +61,8 @@ import type { Translate, UiMessages } from "./ui-messages.ts";
 const BLOCK = "rtkc-block";
 const SUBTITLE = "rtkc-subtitle";
 const NOTE = "rtkc-note";
+/** 退成柱子时那段说明的类名。与 `NOTE` 分开是刻意的：两者读起来不该是同一级信息。 */
+const SPARSE = "rtkc-sparse";
 
 /** 一次读面的结局。`error` 与 `data` 互斥：读失败时不留半份旧图，那会让人以为是最新读数。 */
 interface Loaded {
@@ -266,7 +269,9 @@ function ChartBlock(props: {
     createElement("div", { className: "rtkc-chart", ref: containerRef }),
     // 原因不写死英文：`loadFailed` 的模板在 `ui-messages` 里，`{reason}` 也翻译过。
     failed ? createElement("p", { className: NOTE }, failedText) : null,
-    spec.kind === "bars" ? createElement("p", { className: NOTE }, t("chartSparseNote")) : null,
+    // 退成柱子时那句说明走**独立类名**：它回答的是「比率去哪了」，而 `rtkc-note` 是页脚、
+    // 空窗口、加载中那一族的灰色小字——同色同号会让这句话被一起跳过（真机上就是这样）。
+    spec.kind === "bars" ? createElement("p", { className: SPARSE }, t("chartSparseNote")) : null,
   );
 }
 
@@ -376,6 +381,12 @@ function Footnote(props: {
     availabilityKeyOf(response.availability) === "unavailable"
   ) {
     parts.push(t("statsUnavailable"));
+  }
+  // 与 rtk 自己对账的那两句排在最后：它们解释的是「本页与 `rtk gain` 会不会对不上」，
+  // 前提是先把「这一屏是什么窗口、数据从哪天开始」说清楚。判据全在 `rtkSelfLinesOf` 里
+  // （只有改写形态、账本可读、且数不为 0 才出）。
+  for (const line of rtkSelfLinesOf(response)) {
+    parts.push(t(line.messageKey, line.values));
   }
   return createElement("p", { className: `${NOTE} rtkc-footnote` }, parts.join(" · "));
 }

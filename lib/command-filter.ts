@@ -40,6 +40,8 @@ export interface PipeEntry {
  *    结果侧再压会命中 `already-rewritten` 让路。留在默认集合里是因为前缀层在某些形态下仍
  *    交不出去（超出闸门、`aws` 那一类 `DENY_TABLE` 命中、命令拼接里有一段不能改），那时
  *    结果侧是唯一的压缩机会。
+ *    让路本身有一条**例外**：改写成 `rtk read <目标>` 而没带切窗参数时，`rtk read` 逐字节
+ *    透传（`--level` 默认 `none`），那时不让路——判据在 `lib/dedup.ts` 的 `isVerbatimRewrite`。
  * 2. **`vitest`**：rtk 对它自己那三层解析在 vitest 5 上全线失败，但本包不再依赖 rtk——
  *    `modeOf("vitest")` 把它导到 `lib/vitest-strip.ts` 的本地删行路径，与 rtk 版本无关。
  *    所以它不再需要用户手动勾选：`pnpm test` / `npm test` / `yarn test` 这三种**前缀层改不动**
@@ -47,6 +49,17 @@ export interface PipeEntry {
  *
  * 其余 8 项仍留给用户按仓库勾选：`cargo-test` / `pytest` / `ctest` / `tsc` / `mypy` /
  * `go-test` / `go-build` / `ruff-*` 都会被前缀层先接手，勾上通常只增 `already-rewritten` 计数。
+ *
+ * 3. **`window`**：不是 rtk 的 filter，是本包自己的头尾窗口（`lib/output-window.ts`）。它服务的是
+ *    `rtk pipe` 一条都覆盖不到的那批命令——`cat` / `journalctl` / `docker logs` / `ps`（真实账本里
+ *    `cat` 独占 35.4% 的 input token，是最大的一块）。默认开着是因为它有一条硬前置：**只对日志类
+ *    目标生效**（`isLogTarget` 判命令 × 扩展名双证据），读源码那条路一个字节都不动。
+ * 4. **`hook`**：也不是 rtk 的 filter，是 `rtk hook claude` 的那条 pipeline 链（ansi / progress /
+ *    dedup，见 `lib/rtk-hook.ts`）。它接管**日志窗口之上**与 `PIPE_TABLE` 之外的两种长输出：
+ *    前者先清色/折进度帧/折重复行再切头尾（792 行构建日志 32,550 B → 9,228 B，只窗口是 10,366 B），
+ *    后者是「`./build.sh` / `make` 这类谁都没接的命令」唯一的压缩机会。代价是每条够长的输出多
+ *    一次 spawn（实测 19~21 ms，与 `rtk pipe` 同量级）；链判断无收益时 `rtk` 回 0 字节，插件按
+ *    「没变」放行。默认开着的意思是「长输出先过一道清理」，而不是「一定压」。
  */
 export const DEFAULT_ENABLED_FILTERS: readonly string[] = [
   "git-log",
@@ -55,9 +68,31 @@ export const DEFAULT_ENABLED_FILTERS: readonly string[] = [
   "grep",
   "find",
   "vitest",
+  "window",
+  "hook",
 ];
 
-/** 表共 18 行；`filter` 取值必须落在 rtk 的已知 filter 名单内（测试交叉核对）。 */
+/**
+ * 本包自己的窗口这一侧用的 filter 名。
+ *
+ * 它**不是** rtk 的 filter（`rtk pipe -f window` 会报 `Unknown filter`），只在本包内部当身份用：
+ * 记进 `dsh_pipe_days.filter`、过 `classOf` 查类（`lib/filter-class.ts` 登记成 `listing`）、
+ * 出现在卡片的启用集合里。用一个具名常量而不是散落的字面量，是因为它同时出现在五处
+ * （`host.ts` 的 `modeOf` 与查表、这里的两张名单、卡片提示、测试）——各写一份字符串时改一处
+ * 另几处不变，而症状只是「勾了没用」。
+ */
+export const WINDOW_FILTER = "window";
+
+/**
+ * 本包给 rtk 清理链用的 filter 名（`lib/rtk-hook.ts`）。
+ *
+ * 与 `WINDOW_FILTER` 同款：rtk 侧没有这个名字（`rtk pipe -f hook` 会报 `Unknown filter`），
+ * 它只在本包的账目、护栏与启用集合里当身份用。**不放进 `PIPE_TABLE`**：它不是由命令形态
+ * 命中的，而是任何一条长输出在过 filter 之前都会先走一遍的前置清理。
+ */
+export const HOOK_FILTER = "hook";
+
+/** 表共 20 行；`filter` 取值必须落在 rtk 的已知 filter 名单内（测试交叉核对）。 */
 export const PIPE_TABLE: readonly PipeEntry[] = [
   {
     id: "cargo test",
@@ -78,6 +113,16 @@ export const PIPE_TABLE: readonly PipeEntry[] = [
   { id: "pnpm test", pattern: /^pnpm\s+test(?:\s|$)/u, filter: "vitest" },
   { id: "npm test", pattern: /^npm\s+test(?:\s|$)/u, filter: "vitest" },
   { id: "yarn test", pattern: /^yarn\s+test(?:\s|$)/u, filter: "vitest" },
+  {
+    id: "phpunit",
+    pattern: /^(?:php\s+)?(?:\.\/)?(?:(?:vendor\/)?bin\/)?phpunit(?:\s|$)/u,
+    filter: "phpunit",
+  },
+  {
+    id: "pest",
+    pattern: /^(?:\.\/)?(?:vendor\/bin\/)?(?:pest|paratest)(?:\s|$)/u,
+    filter: "pest",
+  },
   { id: "go test", pattern: /^go\s+test(?:\s|$)/u, filter: "go-test" },
   { id: "go build", pattern: /^go\s+build(?:\s|$)/u, filter: "go-build" },
   { id: "tsc", pattern: /^(?:tsc|npx\s+tsc)(?:\s|$)/u, filter: "tsc" },
@@ -103,9 +148,16 @@ export const PIPE_TABLE: readonly PipeEntry[] = [
   { id: "find", pattern: /^(?:find|fd)(?:\s|$)/u, filter: "find" },
 ];
 
-/** 卡片提示用：表里出现过的全部 filter 名（去重排序），不是只有默认启用那三项。 */
+/**
+ * 卡片提示用：可以写进 `enabledFilters` 的全部 filter 名（去重排序）。
+ *
+ * 它是**表的并集再加本包自带的两档**，不是「表里去重」：`window` 与 `hook` 都不在
+ * `PIPE_TABLE` 里（它们不由命令形态前缀命中，前者靠 `isLogTarget` 判、后者是任何长输出的
+ * 前置清理），但它们确实能被启用集合开关。早先这里只从表里取，于是卡片提示列不出这两个名字：
+ * 用户取消勾选 `window` 之后再也勾不回来——默认值里有它、可选名单里没有它。
+ */
 export const ALL_FILTERS: readonly string[] = [
-  ...new Set(PIPE_TABLE.map((entry) => entry.filter)),
+  ...new Set([...PIPE_TABLE.map((entry) => entry.filter), WINDOW_FILTER, HOOK_FILTER]),
 ].toSorted();
 
 /** 命中表且该行 filter 已启用才返回 filter 名；否则 `undefined`（这条不做 pipe 压缩）。 */

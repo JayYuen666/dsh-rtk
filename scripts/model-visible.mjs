@@ -269,6 +269,14 @@ async function startListener(options) {
     minBytes: () => 16,
     minGainRatio: () => 0.95,
     stdoutCapBytes: () => 64_000,
+    // 窗口那两位探针不用（它只喂 cargo-test），但 `PipeOptions` 要求给全：缺字段是 tsc 的
+    // 编译错而不是跑出来的假绿——这正是上面那段注释说的事。取值与生产默认同源。
+    windowHeadLines: () => 50,
+    windowTailLines: () => 200,
+    // 清理链那一路（`rtk hook`）在本探针里是关的：它要么 spawn 一次真 rtk，要么得有一份
+    // 建得起来的配置目录。探针只验「压不压」，所以这一位给 `undefined`（= 这条路径不可用），
+    // 行为与接入之前逐字节相同。
+    hook: () => undefined,
     pipeTimeoutMs: 5000,
   };
   /** @type {import("../host.ts").PipeDeps} */
@@ -278,6 +286,13 @@ async function startListener(options) {
       spillSummary: "压缩前的完整输出已存",
       spillLocation: "压缩前的完整输出已存为 {path}。{hint}",
       spillRelaxed: "这一段删掉了 {omitted}；完整原文在 {path}。{hint}",
+      spillCapped: "正文超过 {cap} 字节、省掉 {omitted}；完整原文在 {path}。{hint}",
+      // 常驻摘要与 skill 全文不在这条路径上消费：探针只验压缩，装配期那段
+      // （systemPrompt.section + registerUsageSkill）由 test/apply.test.ts 钉。
+      usageSummary: "",
+      skillDescription: "",
+      skillPointer: "",
+      usageText: "",
     }),
     rewrittenCalls: createRewrittenCalls(8),
     // 定价口径见上面的 `tokenCount`（真装配走 `ctx.tokenMeter`）。

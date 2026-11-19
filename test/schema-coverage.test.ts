@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 // 与 host.test.ts 同一理由改名：`Config` 是大写开头的值，直接调用会撞 `eslint(new-cap)`。
 import { Config as configSchema } from "../host.ts";
 
-/** 卡片可改的九个字段（标了 `.volatile()`）。 */
+/** 卡片可改的十一个字段（标了 `.volatile()`）。 */
 const VOLATILE = [
   "denyCommands",
   "enabled",
@@ -20,6 +20,8 @@ const VOLATILE = [
   "minGainRatio",
   "rewriteHostEnv",
   "stdoutCapBytes",
+  "windowHeadLines",
+  "windowTailLines",
   "warnHint",
 ] as const;
 
@@ -33,16 +35,16 @@ const RESTART_ONLY = [
 ] as const;
 
 describe("volatile 集合", () => {
-  it("两个集合不重叠且并集等于全部十四项", () => {
+  it("两个集合不重叠且并集等于全部十六项", () => {
     const all = [...VOLATILE, ...RESTART_ONLY].toSorted();
-    assert.equal(all.length, 14);
-    assert.equal(new Set(all).size, 14);
+    assert.equal(all.length, 16);
+    assert.equal(new Set(all).size, 16);
     assert.deepEqual(all, Object.keys(configSchema({})).toSorted());
   });
 
-  it("volatile 九项 + 部署级五项 = 十四项（卡片 allowUnbound 的补集恰好是那五项）", () => {
-    // 两边数量相加必须等于 14：多一项要么卡片少一格，要么这门少认一个字段。
-    assert.equal(VOLATILE.length + 5, 14);
+  it("volatile 十一项 + 部署级五项 = 十六项（卡片 allowUnbound 的补集恰好是那五项）", () => {
+    // 两边数量相加必须等于 16：多一项要么卡片少一格，要么这门少认一个字段。
+    assert.equal(VOLATILE.length + 5, 16);
     assert.equal(RESTART_ONLY.length, 5);
   });
 });

@@ -1,4 +1,4 @@
-// test/apply.test.ts —— 总装那一层：六个服务面齐全才装、装配顺序、以及失败不该打掉压缩。
+// test/apply.test.ts —— 总装那一层：五个服务面齐全才装、装配顺序、以及失败不该打掉压缩。
 //
 // 这一层刻意**不复用** `test/integration/host-stack.ts` 的半栈桩：那些桩只造四个服务
 // （`HostContext` 面），而 `apply` 要的是 `HostServices`（多 settings / storageDomain /
@@ -7,12 +7,12 @@
 // 时钟与网络都用替身：`storageDomain.open` 是可控 Promise，`subprocess.spawn` 恒失败
 // （版本探测探不到就是探不到，装配必须照常）。
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { beforeAll, describe, it, onTestFinished } from "vitest";
+import { describe, it, onTestFinished } from "vitest";
 
 // `Config` 是 schemastery 的 schema 对象，但名字大写开头、直接调用会撞 `eslint(new-cap)`
 // （它以为你在不 new 的情况下调构造函数）。导入时改名是零成本的解法。
@@ -33,7 +33,6 @@ import { RTK_STATS_SERVICE_KEY } from "../lib/stats-remote.ts";
 import type { LegacyStatsDomain } from "../lib/stats-store.ts";
 import type { StatsOverview } from "../lib/insights-shape.ts";
 import { unbuildableDir } from "./unbuildable.ts";
-import { forceShadowPlatform } from "./platform/host-platform.ts";
 
 interface Recorded {
   readonly injects: { readonly deps: readonly string[] }[];
@@ -45,6 +44,13 @@ interface Recorded {
   readonly disposers: (() => void)[];
   readonly registered: Map<string, unknown>;
   readonly warns: (readonly unknown[])[];
+  /** systemPrompt 段注册与 skill 注册的轨迹（0.2.2 起两件事都在 `apply` 里发生）。 */
+  readonly sections: { readonly name: string; readonly order: number; readonly text: string }[];
+  readonly skills: {
+    readonly name: string;
+    readonly description: string;
+    readonly content: string;
+  }[];
 }
 
 /** `tools/post-execute` 的事件名（本文件多处断言它挂没挂）。 */
@@ -55,43 +61,13 @@ const FILTER_CARGO = "cargo-test";
 const OPEN_FAILED = "cannot open the stats tables";
 
 const POST_EXECUTE = "tools/post-execute";
+/** hook 用例的输入行：40 个字符，40 行刚好过 `minBytes` 的默认 256。 */
+const LONG_LINE = "line of build output, padded to forty chars\n";
+/** 假 hook 的产出：行数与输入相同（不触发折叠判据）、每行更短（真省了字节）。 */
+const CLEANED = "clean\n".repeat(40);
 
 /** `agent/created` 的事件名（C 形态的判据）。 */
 const AGENT_CREATED = "agent/created";
-
-/**
- * C 形态的装配判据在三个平台都要跑。
- *
- * 产品侧的 `prefixSupportedOn("win32")` 判否不变（rtk 的 Windows 分发面与 pwsh 命令形态都没在
- * 真机验过，而前缀形态把命令写坏是「本来能跑的命令不能跑」），那条由
- * `test/platform/platform.test.ts` 显式注入 win32 断言「整层不装」。但本文件问的是另一个问题：
- * **门禁之后装了什么**。它跟宿主是不是 Windows 无关，所以这里把宿主平台值换成受支持档，
- * 而不是整片 `skipIf` 掉——跳过等于「Windows 上从来没验过装配序」。
- */
-/**
- * C 形态的装配判据在三个平台都要跑。
- *
- * 产品侧的 `prefixSupportedOn("win32")` 判否不变（rtk 的 Windows 分发面与 pwsh 命令形态都没在
- * 真机验过，而前缀形态把命令写坏是「本来能跑的命令不能跑」），那条由
- * `test/platform/platform.test.ts` 显式注入 win32 断言「整层不装」。但本文件问的是另一个问题：
- * **门禁之后装了什么**。它跟宿主是不是 Windows 无关，所以这里把宿主平台值换成受支持档，
- * 而不是整片 `skipIf` 掉——跳过等于「Windows 上从来没验过装配序」。
- *
- * 为什么单独起一个 describe：hook 必须挂在 describe 里（`vitest(require-top-level-describe)`）。
- * 它排在本文件第一个 describe，`beforeAll` 因此早于后面所有用例；副作用是进程级的，后面的
- * describe 照样看得见。不还原——vitest 默认按文件隔离进程，这一改只活在本文件的 worker 里。
- */
-describe("平台值注入", () => {
-  beforeAll(() => {
-    forceShadowPlatform();
-  });
-
-  it("本文件在受支持档上跑：win32 runner 上也不例外", () => {
-    // 判据是「不是 win32」而不是「等于某个具体值」：macOS/Linux runner 上本就不变，
-    // Windows 上被换成 `linux`——两种都该满足，否则下面那些 C 形态用例整片红。
-    assert.notEqual(process.platform, "win32");
-  });
-});
 
 /** 占位实现：只需要「存在且是可调用函数」，不需要任何行为。 */
 function noop(): void {
@@ -220,6 +196,8 @@ function makeHost(
     disposers: [],
     registered: new Map<string, unknown>(),
     warns: [] as (readonly unknown[])[],
+    sections: [],
+    skills: [],
   };
   // `settings.describe()` 交回的是**命名空间的设置对象**，语言偏好在它的 `preference` 字段里
   // （shared 的 `resolveLocalePreference` 就按这个字段读）——不是裸字符串。
@@ -251,6 +229,20 @@ function makeHost(
       rmSync(homeRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     });
   }
+  // 真 profile 里 spillStore 是常驻服务：压缩前原文落库、模型按 locator 取回。没有它时
+  // 新策略会把有损压缩整条放弃，`apply` 那条「走真监听器」的用例就永远到不了换值那一步。
+  // 这里按官方 SaveTextSpill → SpillRef 的形状给一份替身（locator 固定、字节按原文算）。
+  seen.registered.set("spillStore", {
+    saveText: (input: unknown) => {
+      const { content } = input as { content?: unknown };
+      const text = typeof content === "string" ? content : "";
+      return Promise.resolve({
+        locator: "/tmp/dsh-spill/apply-fixture.txt",
+        bytes: Buffer.byteLength(text, "utf8"),
+        retrievalHint: "Use read with offset/limit, or grep this path to search within it.",
+      });
+    },
+  });
   const savedHome = process.env["DSH_HOME"];
   process.env["DSH_HOME"] = homeRoot;
   onTestFinished(() => {
@@ -286,6 +278,17 @@ function makeHost(
         }),
     },
     workingDirectory: { ensure: async (): Promise<string> => process.cwd() },
+    // 常驻摘要段的注册口：收下 name/order/text（`apply` 里那一次），由用例断言。
+    systemPrompt: {
+      section: (section: {
+        readonly name: string;
+        readonly order: number;
+        readonly text: string;
+      }) => {
+        seen.sections.push({ name: section.name, order: section.order, text: section.text });
+        return noop;
+      },
+    },
     // 具名 logger：默认把 warn 收进 `seen.warns`（这是 spec §7.1「探测失败要留一条痕迹」
     // 唯一可断言的面）。`omitLogger` 时整位缺失，走 console 回退那条兼容路径。
     ...(overrides.omitLogger === true
@@ -300,6 +303,22 @@ function makeHost(
     get: (name: string): unknown => {
       if (name === "storageDomain") {
         return storageDomain;
+      }
+      if (name === "skills") {
+        return {
+          register: (skill: {
+            readonly name: string;
+            readonly description: string;
+            readonly content: string;
+          }): (() => void) => {
+            seen.skills.push({
+              name: skill.name,
+              description: skill.description,
+              content: skill.content,
+            });
+            return noop;
+          },
+        };
       }
       return name === "sandboxPolicy" ? overrides.sandboxPolicy : seen.registered.get(name);
     },
@@ -345,9 +364,10 @@ function applyTo(host: HostServices, config: Parameters<typeof plugin.apply>[1])
 /**
  * 让 `findOnPath("rtk")` 在本条用例里命中。
  *
- * C 形态的装配期门禁第三条就是「PATH 上找得到 rtk」。断言「装配动作发生了」的用例若不自己
- * 把 rtk 造出来，判据就变成「跑测那台机器装没装 rtk」：开发机装着、CI runner 上没装，**同一份
- * 代码在两处给出两个结论**。本仓真实踩过这一格（CI 三平台全红、本地全绿）。
+ * C 形态的装配期门禁只剩一条：「PATH 上找得到 rtk」。断言「装配动作发生了」的用例若不自己
+ * 把 rtk 造出来，判据就变成「跑测那台机器装没装 rtk」：同一份代码在两处可能给出两个结论。
+ * 本仓真实踩过这一格（CI 三平台全红、本地全绿）——CI 现在会装 rtk，但夹具仍必须自足，
+ * 不能反过来依赖它。
  *
  * 造的是真可执行文件（`findOnPath` 的 `X_OK` 与 `isFile` 两判都要过），但它不会被 spawn：
  * `makeHost` 的子进程替身恒抛 ENOENT，版本探测自然探不到，与「装了但探不到版本」同形。
@@ -364,7 +384,7 @@ function withRtkOnPath(): void {
 }
 
 describe("apply 的前置校验", () => {
-  it.each(["settings", "tools", "subprocess", "workingDirectory"] as const)(
+  it.each(["settings", "tools", "subprocess", "workingDirectory", "systemPrompt"] as const)(
     "缺 %s 就 fail-fast，不装半套",
     (drop) => {
       const { host } = makeHost();
@@ -486,6 +506,44 @@ describe("apply 的装配动作", () => {
     assert.deepEqual(seen.configure, [{ presentation: { auto: false }, owner: host.fiber }]);
   });
 
+  it("常驻摘要经 systemPrompt.section 注册：段名与 order 各就各位、正文是当前语言的摘要", () => {
+    const { host, seen } = makeHost();
+    applyTo(host, configSchema({}));
+    assert.equal(seen.sections.length, 1, "摘要段只该注册一次");
+    const [section] = seen.sections;
+    assert.ok(section !== undefined, "摘要段没注册上");
+    assert.equal(section.name, "rtk-usage");
+    // order 1565 写死在这里：它落在 zg 1550 / ocr 1555 / lesson-loop 1560 之后、jobs 1600 之前，
+    // 改它要有人显式说一声（撞车不会报错，只会让段落次序变）。
+    assert.equal(section.order, 1565);
+    assert.ok(section.text.includes("rtk bypass"), "摘要正文少了唯一那条逃生写法");
+  });
+
+  it("口径全文注册成 skill `rtk`：正文与目录说明都取自当前语言的字典", () => {
+    const { host, seen } = makeHost();
+    applyTo(host, configSchema({}));
+    assert.equal(seen.skills.length, 1, "全文只该注册一次");
+    const [skill] = seen.skills;
+    assert.ok(skill !== undefined, "skill 没注册上");
+    assert.equal(skill.name, "rtk");
+    assert.ok(skill.content.includes("# dsh-rtk"), "正文不是口径全文");
+    assert.ok(skill.description.length > 0, "目录说明为空会让模型没有加载的理由");
+  });
+
+  it("skill 服务缺席时装配照常：摘要段已注册、skill 一条没有", () => {
+    const { host, seen } = makeHost();
+    // 抹掉 `skills` 服务：精简 profile 就是这个形状。
+    const bare = {
+      ...host,
+      get: (name: string): unknown => (name === "skills" ? undefined : host.get(name)),
+    } as unknown as HostServices;
+    assert.doesNotThrow(() => {
+      applyTo(bare, configSchema({}));
+    });
+    assert.equal(seen.sections.length, 1);
+    assert.deepEqual(seen.skills, []);
+  });
+
   it("同一作用域第二次装配让路：不重复注册、不抛错（market 热挂 + bundle 层双路径）", () => {
     const { host, seen } = makeHost();
     applyTo(host, configSchema({}));
@@ -576,7 +634,7 @@ describe("apply 的装配动作", () => {
     // 版本探测走的是被替身的 subprocess（恒抛），所以版本一律 null。
     assert.equal(status.rtkVersion, null);
     // PATH 上有没有 rtk 取决于这台机器：判据是「要么 null，要么绝对路径」。
-    assert.equal(status.rtkPath === null || status.rtkPath.endsWith("rtk"), true);
+    assert.equal(status.rtkPath === null || path.isAbsolute(status.rtkPath), true);
   });
 
   it("探到版本时 status() 同时交出原文与 supported（两句话才分得开「没装」与「太旧」）", async () => {
@@ -796,7 +854,7 @@ describe("形态常驻与运行期门禁", () => {
 
   it("c 形态常驻：enabledForms 只有 pipe 时也注册 agent/created", () => {
     // 先把 rtk 造出来：不造的话这台机器上「找不到 rtk」会先挡掉装配，测出来的
-    // 就不是「形态不再决定装不装」这条判据。POSIX-only 同前：Windows 平台门禁先挡。
+    // 就不是「形态不再决定装不装」这条判据。三个平台都只剩 rtk 这一道装配门禁。
     withRtkOnPath();
     const { host: base } = makeHost();
     const { host, events } = recording(base);
@@ -816,7 +874,7 @@ describe("形态常驻与运行期门禁", () => {
   });
 });
 /**
- * 九个 volatile 全返空引用的配置。
+ * 十一个 volatile 全返空引用的配置。
  *
  * 官方 `Volatile.get()` 的 d.ts 原文是「including undefined for an absent value」——
  * 条目没被 volatile 投影、或宿主退化时，交回来的就是空引用。那些 `.get()` 后面的 `?? 默认`
@@ -832,6 +890,8 @@ function emptyVolatileConfig(): Parameters<typeof plugin.apply>[1] {
     minBytes: absent,
     minGainRatio: absent,
     stdoutCapBytes: absent,
+    windowHeadLines: absent,
+    windowTailLines: absent,
     warnHint: absent,
     rewriteHostEnv: absent,
     pipeTimeoutMs: 3000,
@@ -861,6 +921,11 @@ function liveConfig(): {
     ["minBytes", 256],
     ["minGainRatio", 0.95],
     ["stdoutCapBytes", 64_000],
+    // 窗口那两位也要在槽里：`liveConfig` 只给列进这张表的键装上 `{get}`，
+    // 漏了它们会退到 `base` 的 `absent`，于是 `set` 写得进去而读取点永远拿兜底值——
+    // 症状正是「改了卡片不生效」，而正常路径上看不出来。
+    ["windowHeadLines", 50],
+    ["windowTailLines", 200],
   ]);
   const base = emptyVolatileConfig() as unknown as Record<string, unknown>;
   const config = {
@@ -878,9 +943,8 @@ function liveConfig(): {
 }
 
 describe("volatile 读到空引用时不崩（宿主的退化态）", () => {
-  it("九个 volatile 全空时装配照常完成：形态退到默认 ['prefix']，两层都常驻", () => {
-    // 同上两条：C 形态的门禁第三条是 PATH 上有 rtk（不造出来这条判据就跟着跑测机器走），
-    // 而平台那一条已由本文件顶部的 `forceShadowPlatform()` 换成受支持档。
+  it("十一个 volatile 全空时装配照常完成：形态退到默认 ['prefix']，两层都常驻", () => {
+    // 装配期门禁只剩 PATH 上有 rtk（不造出来这条判据就跟着跑测机器走）。
     withRtkOnPath();
     const { host: base } = makeHost();
     const { host, events } = recording(base);
@@ -924,7 +988,7 @@ describe("volatile 的取值函数：装配期交出去的是「怎么读」，�
     assert.equal(readers.rewriteHostEnv(), "openclaw");
   });
 
-  it("b 形态的五位：改配置之后取值函数读到的是新值", () => {
+  it("b 形态的七位：改配置之后取值函数读到的是新值", () => {
     const { config, set } = liveConfig();
     const readers = pipeReadersOf(config, () => true);
     assert.equal(readers.enabled(), true);
@@ -932,16 +996,22 @@ describe("volatile 的取值函数：装配期交出去的是「怎么读」，�
     assert.equal(readers.minBytes(), 256);
     assert.equal(readers.minGainRatio(), 0.95);
     assert.equal(readers.stdoutCapBytes(), 64_000);
+    assert.equal(readers.windowHeadLines(), 50);
+    assert.equal(readers.windowTailLines(), 200);
     set("enabled", false);
     set("enabledFilters", ["pytest"]);
     set("minBytes", 1);
     set("minGainRatio", 0.5);
     set("stdoutCapBytes", 100);
+    set("windowHeadLines", 5);
+    set("windowTailLines", 7);
     assert.equal(readers.enabled(), false);
     assert.deepEqual([...readers.enabledFilters()], ["pytest"]);
     assert.equal(readers.minBytes(), 1);
     assert.equal(readers.minGainRatio(), 0.5);
     assert.equal(readers.stdoutCapBytes(), 100);
+    assert.equal(readers.windowHeadLines(), 5);
+    assert.equal(readers.windowTailLines(), 7);
   });
 
   it("退化态（volatile 交回空引用）下 enabled 跟随就绪探测，而不是写死 true", () => {
@@ -958,6 +1028,10 @@ describe("volatile 的取值函数：装配期交出去的是「怎么读」，�
     assert.equal(pipes.minBytes(), 256);
     assert.equal(pipes.minGainRatio(), 0.95);
     assert.equal(pipes.stdoutCapBytes(), 64_000);
+    // 窗口那两位与 rtk `cap` 的 HEAD_LINES / TAIL_LINES 同值：退化态下也要落到同一组数，
+    // 否则「卡片没读到」会静默变成另一种切法。
+    assert.equal(pipes.windowHeadLines(), 50);
+    assert.equal(pipes.windowTailLines(), 200);
   });
 
   it("c/b 两层读同一个 enabled：一处开关不能只作用于其中一层", () => {
@@ -1057,7 +1131,13 @@ describe("b 形态的走线（经 apply 装配之后才拿得到的那一份依�
       }),
     );
     assert.ok(listener !== undefined, "开了 pipe 形态却没挂监听器");
-    const exec = { callId: "call-1", name: "bash", arguments: { command: "cargo test" } };
+    // 会话身份是 spill 的 owner：没有 agent 时没有取回通道，有损压缩会被整条放弃。
+    const exec = {
+      callId: "call-1",
+      name: "bash",
+      arguments: { command: "cargo test" },
+      agent: { id: "apply-session" },
+    };
     const result = {
       isError: false,
       content: [],
@@ -1082,6 +1162,102 @@ describe("b 形态的走线（经 apply 装配之后才拿得到的那一份依�
     assert.equal(accepted.kind, "accept");
     assert.equal(accepted.value?.stdout?.text, "test result: ok. 1 passed; 0 failed");
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * `hook: () => hookEnv` 这一句只在**监听器真的走到「无 filter」那条路**时被求值，所以
+   * 前面所有用例都没碰到它（覆盖率在那一行留着洞）。它同时钉住装配期那一步：
+   * `$DSH_HOME/rtk/config/pipeline.toml` 真的被写出来了，内容是 `pipelineToml()` 那份。
+   */
+  it("装配期写出一份 pipeline.toml，且无 filter 的长输出会真的走 rtk hook", async () => {
+    const hookCalls: string[] = [];
+    const { host } = makeHost({
+      spawn: (spec: SpawnSpec) => {
+        if (spec.argv[1] === "hook") {
+          const { stdin } = spec.stdio;
+          hookCalls.push(typeof stdin === "object" ? (stdin.data ?? "") : "");
+          return {
+            done: Promise.resolve({ exitCode: 0, signal: null }),
+            collected: {
+              stdout: {
+                readFrom: () => ({
+                  // `rtk hook claude` 的回执：清洗后的正文在 `updatedToolOutput.stdout` 里。
+                  // 故意保留同样的行数、只把每行压短：行数不塌缩才是这条用例想验的路径
+                  // （护栏会把「行数塌缩」判成 `folded-entries`，那条需要有 spill 通道才放行，
+                  // 而这里要验的是「换值真的发生了」）。
+                  text: JSON.stringify({
+                    hookSpecificOutput: { updatedToolOutput: { stdout: CLEANED } },
+                  }),
+                  nextOffset: 0,
+                  lossy: false,
+                }),
+              },
+            },
+            terminate: noop,
+          };
+        }
+        return {
+          done: Promise.resolve({ exitCode: 0, signal: null }),
+          collected: {
+            stdout: { readFrom: () => ({ text: "rtk 1.2.0", nextOffset: 9, lossy: false }) },
+          },
+          terminate: noop,
+        };
+      },
+    });
+    let listener:
+      | ((exec: unknown, result: unknown, next: () => Promise<unknown>) => Promise<unknown>)
+      | undefined;
+    applyTo(
+      {
+        ...host,
+        on: (name: string, handler: never): void => {
+          if (name === POST_EXECUTE) {
+            listener = handler as typeof listener;
+          }
+        },
+      } as unknown as HostServices,
+      // 两项都显式列出：它们现在都在默认集合里，但这条用例验的是「这两条路真的接上了」，
+      // 不该随着默认值漂移而变成另一种测法。
+      configSchema({ enabled: true, enabledForms: ["pipe"], enabledFilters: ["hook", "window"] }),
+    );
+    assert.ok(listener !== undefined, "开了 pipe 形态却没挂监听器");
+    // 配置在装配期就写好了：这条路径不许等到第一次调用才建。
+    const toml = readFileSync(
+      path.join(process.env["DSH_HOME"] ?? "", "rtk", "config", "pipeline.toml"),
+      "utf8",
+    );
+    assert.ok(toml.includes('extends = "rtk:posthook"'), toml);
+    assert.ok(toml.includes('name = "dsh-clean"'), toml);
+    // 一条既不在 `PIPE_TABLE` 里、又是日志目标的命令：走「无 filter → hook」那条路。
+    const body = `${LONG_LINE.repeat(40)}[exit code: 0]`;
+    const exec = {
+      callId: "call-hook",
+      name: "bash",
+      arguments: { command: "cat build.log" },
+      agent: { id: "apply-hook-session" },
+    };
+    const result = {
+      isError: false,
+      content: [],
+      value: {
+        kind: "foreground",
+        exitCode: 0,
+        stdout: { text: body, truncated: false },
+        stderr: { text: "" },
+      },
+    };
+    const decision = await listener(exec, result, () => Promise.resolve({ kind: "accept" }));
+    assert.equal(hookCalls.length, 1, "无 filter 的长输出没走清理链");
+    assert.equal(hookCalls[0]?.includes(LONG_LINE.trim()), true, "喂给 hook 的不是正文");
+    const accepted = decision as {
+      readonly kind: string;
+      readonly value?: { readonly stdout?: { readonly text?: string } };
+    };
+    assert.equal(accepted.kind, "accept");
+    // 退出 marker 是**另一段**（`extractBody` 把它从 stdout 里切走），压完之后 `reassemble`
+    // 原样拼回去——所以期望值是「压后的正文 + 换行 + marker」，不是把 marker 也喂给 hook。
+    assert.equal(accepted.value?.stdout?.text, `${CLEANED}\n[exit code: 0]`);
   });
 
   it("path 上没有 rtk 时 status() 的 rtkPath 是 null（不是空串、不是抛错）", () => {

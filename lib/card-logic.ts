@@ -156,7 +156,7 @@ export function formsOf(mode: FormMode): readonly string[] {
   return forms;
 }
 
-/** 卡片渲染的九个字段（= host schema 里全部 volatile 字段）。 */
+/** 卡片渲染的十一个字段（= host schema 里全部 volatile 字段）。 */
 export interface CardFields {
   readonly enabled: boolean;
   readonly forms: FormMode;
@@ -165,11 +165,20 @@ export interface CardFields {
   readonly minBytes: number | undefined;
   readonly minGainRatio: number | undefined;
   readonly stdoutCapBytes: number | undefined;
+  /**
+   * 日志窗口的头尾行数（`lib/output-window.ts`）。
+   *
+   * 与 `minBytes` 那三位同形：`number | undefined`，`undefined` 表示「没读到」——卡片上那一格
+   * 留空、保存时走 unset 恢复默认。区别在语义：那三位是「压不压」的阈值，这两位是
+   * 「留多少给人看」的观察口径，所以 hint 写的是「头 / 尾各留多少行」而不是预算。
+   */
+  readonly windowHeadLines: number | undefined;
+  readonly windowTailLines: number | undefined;
   readonly warnHint: boolean;
   readonly rewriteHostEnv: string;
 }
 
-/** 把草稿层 + 已提交值投影成九个字段。缺值一律给「安全默认」，不抛。 */
+/** 把草稿层 + 已提交值投影成十一个字段。缺值一律给「安全默认」，不抛。 */
 export function draftFields(
   touched: Record<string, unknown>,
   value: Record<string, unknown>,
@@ -187,6 +196,8 @@ export function draftFields(
     minBytes: numberOf(read("minBytes")),
     minGainRatio: numberOf(read("minGainRatio")),
     stdoutCapBytes: numberOf(read("stdoutCapBytes")),
+    windowHeadLines: numberOf(read("windowHeadLines")),
+    windowTailLines: numberOf(read("windowTailLines")),
     // 读不到就当开：warnHint 的默认值是 true，只有显式 false 才关。
     warnHint: read("warnHint") !== false,
     rewriteHostEnv: typeof hostEnv === "string" ? hostEnv : "",

@@ -9,7 +9,6 @@ import assert from "node:assert/strict";
 
 import type { PrefixRecord } from "../lib/insights-shape.ts";
 import { installFakeRtk, makeCleanups, startPrefixHost } from "./integration/host-stack.ts";
-import { forceShadowPlatform } from "./platform/host-platform.ts";
 
 const cleanups = makeCleanups();
 
@@ -54,18 +53,8 @@ function at(records: readonly PrefixRecord[], index: number, kind: string): Pref
   return record;
 }
 
-/**
- * C 形态在 win32 runner 上同样要跑——判据是**逻辑**（埋点顺序与时机），不是平台。
- *
- * 产品侧的 `prefixSupportedOn("win32")` 判否仍然成立（那条由 `test/platform/platform.test.ts`
- * 显式注入 win32 断言「整层不装」），这里只是把宿主平台值换成受支持档，让同一份装配序在三个
- * runner 上都跑一遍。`forceShadowPlatform()` 的边界见该文件的注释。
- */
-const restorePlatform = forceShadowPlatform();
-
 describe("c 形态：统计埋点", () => {
   afterAll(() => {
-    restorePlatform();
     cleanups.drain();
   });
 
@@ -180,10 +169,10 @@ describe("c 形态：统计埋点", () => {
   it("读不到命令串也计一次 bash-call（family 落 unknown），之后原样转调", async () => {
     // 分母不能只收「形状正确」的调用：否则「模型发来的形状不对」这一整类会从覆盖率里消失。
     //
-    // 这条用例验的是**埋点**，不验改写：所以它同样要装假 rtk。装配期门禁第二道是
+    // 这条用例验的是**埋点**，不验改写：所以它同样要装假 rtk。装配期门禁只剩
     // `findOnPath("rtk")`，PATH 上没有 rtk 时整层根本不装（`withAgent()` 直接抛
     // 「遮蔽层没有注册任何工具体」）。早先它没装，只是恰好跑在装了 rtk 的开发机上；
-    // ubuntu / macos 的 CI 机器上没有 rtk，于是这条与下一条在 CI 上红。
+    // 夹具因此必须自足，不能依赖机器或 CI 上那支真 rtk。
     const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 1, stdout: "" }]);
     try {
       const host = await startPrefixHost();

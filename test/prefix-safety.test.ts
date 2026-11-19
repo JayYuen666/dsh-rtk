@@ -34,8 +34,7 @@ function makeBinDir(files: { name: string; mode: number }[]): string {
 /**
  * 本文件加载时的宿主平台。
  *
- * 必须在任何 `forceShadowPlatform()` 之前取：它记的是「真机是什么」，而那个函数改的是
- * 「测试假装是什么」。缺省可执行策略钉的正是前者。
+ * 必须在任何运行期平台改动之前取：它记的是「真机是什么」，缺省可执行策略钉的正是前者。
  */
 const LOAD_TIME_PLATFORM: NodeJS.Platform = process.platform;
 
@@ -255,16 +254,14 @@ describe("findOnPath", () => {
 
   it("缺省可执行策略钉在模块加载时的宿主上，不跟运行期改的平台值走", () => {
     // 这一条钉的是真实缺陷（本轮修掉）：缺省值原先是 `executableOf(process.platform)`，
-    // 读的是**调用那一刻**的平台值。而 `process.platform` 是 configurable 的，
-    // `forceShadowPlatform()` 在 Windows runner 上会把它改成 `linux` 好让 C 形态跑起来——
-    // 于是 Windows 上的 rtk 被 POSIX 的 mode 位判成不可执行，装配期门禁 return、整层不装，
-    // 症状只有「卡片说 rtk 没装」（实测复现：伪造 win32 加载模块、再改成 linux，0644 文件返回
-    // `undefined`）。
+    // 读的是**调用那一刻**的平台值。而 `process.platform` 是 configurable 的，测试里可能
+    // 把它换成另一档；若缺省跟着运行期读，可执行判定就会落到另一个文件系统的语义上
+    // （实测复现：伪造 win32 加载模块、再改成 linux，0644 文件返回 `undefined`）。
     //
     // 判据不能写成「必须等于 POSIX 那条」：在 win32 runner 上缺省策略本来就该是 win32 那条
     // （存在即可），写成固定答案会让这条用例在 Windows 上因为错的原因红。所以期望值由
-    // **本文件加载时**的平台算出来——`forceShadowPlatform()` 尚未动手，那一刻的值就是宿主
-    // 真值。运行期再把平台值换掉，缺省策略必须还是加载时那一条。
+    // **本文件加载时**的平台算出来——那一刻的值就是宿主真值。运行期再把平台值换掉，
+    // 缺省策略必须还是加载时那一条。
     const dir = makeBinDir([{ name: "fakebin", mode: 0o644 }]);
     const saved = process.platform;
     // 换成**与加载时不同**的那一档：与加载时同值时，错实现和正实现会给出同一个答案，

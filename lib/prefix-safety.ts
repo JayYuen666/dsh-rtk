@@ -304,10 +304,9 @@ export function executableOf(platform: NodeJS.Platform): (full: string) => boole
  *
  * `executable` 的缺省读的是**模块加载时**记下的宿主平台（`HOST_EXECUTABLE`），不是调用那一刻的
  * `process.platform`。这一位有真实牙齿：`process.platform` 是 `configurable` 的，测试里
- * （`forceShadowPlatform`）会把它改成 `linux` 好让 Windows runner 也跑 C 形态；若缺省跟着
- * 调用那一刻读，Windows 上的 rtk 就会被 POSIX 的 mode 位判成不可执行——装配期门禁直接 return，
- * 整层不装，而症状只是「卡片说 rtk 没装」。实测复现过：伪造 win32 加载模块、再把平台改成
- * linux，`findOnPath("fakebin")` 对一个 0644 文件返回 `undefined`。
+ * 可能把它改掉；若缺省跟着调用那一刻读，运行期伪造平台就会让可执行判定落到另一个文件系统
+ * 语义上（POSIX 的 mode 位对 NTFS、或反过来），任何一台真机都不会有这个组合。实测复现过：
+ * 伪造 win32 加载模块、再把平台改成 linux，`findOnPath("fakebin")` 对一个 0644 文件返回 `undefined`。
  */
 const HOST_EXECUTABLE: (full: string) => boolean = executableOf(process.platform);
 

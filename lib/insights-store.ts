@@ -1090,7 +1090,7 @@ function prepareStore(db: DatabaseFace, options: OpenInsightsStoreOptions): Insi
  * 确保库文件的父目录存在。
  *
  * **为什么要在这一层做**：目录原本只由 prefix 形态的装配（`prepareLedgerDir`）建，而那条
- * 路径有自己的一串门禁——win32 整层不装、rtk 不在 PATH 时整层不装。于是「只开 pipe 形态」
+ * 路径有自己的一串门禁——rtk 不在 PATH 时整层不装。于是「只开 pipe 形态」
  * 或「跑了 pipe 但没跑过 prefix」的机器上，`$DSH_HOME/rtk/` 从来没被创建过，`openSqlite`
  * 会因为没有父目录而失败：pipe 侧的统计本来能记，却整块报不可用。建目录放在开库之前，
  * 与谁先跑无关。

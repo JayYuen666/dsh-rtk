@@ -1,23 +1,41 @@
-// test/integration/host-stack.ts —— C 形态（遮蔽 bash）的半栈。
+// test/integration/host-stack.ts —— 台架只**脚本化进程执行**这一条边界，其余全真。
 //
-// 只搭「遮蔽层真正拿得到的那几样」：工具注册表、工作目录服务、子进程面、以及一条假 rtk
-// （写进临时目录、注入 PATH）。**不 mock 本包的 runRtkRewrite / createRewriter**——那样测
-// 的是桩，而不是装配序；这里的判据是「spawn 了几次」与「最终转调的是哪条命令」。
-//
-// 子进程面同样是桩（见 `installFakeRtk` 的注释）：`spawn` 的 **argv 形状**由本文件的断言与
-// `test/cli.test.ts` 钉着，真启动由装了真 rtk 的机器上那条人工回路覆盖。这样整套 C 形态用例
-// 在三个平台上跑的是同一份行为，不再依赖「runner 上恰好有 rtk」或「Windows 怎样解析 PATHEXT」。
+// 早先这一层用手搓的假 ctx + 手搓 exec/result，问题在它只复述了本包已经相信的宿主契约：
+// 收据形状、post-execute 的调用位置、工具注册归属全由夹具自己写死，于是「遮蔽体在真流水线里
+// 拿得到吗」「插件交回的 value 还能过 tool-bash 的 output schema 吗」这两类问题在桩里恒真。
+// 现在：真 Cordis Context + 真 SystemPrompt + 真 ToolRuntime + 真 tool-executor-native +
+// 真 dsh-tool-bash；agent 走 dsh-scope 造的真作用域；工具调用走 ctx.tools.execute 整条流水线。
+// 唯一替身是 ShellExecutor（进程执行本来就是允许脚本化的边界，见上游 docs/testing.md），
+// 它把用例给的 legacy 回执映射成官方 ShellRunResult，并记下真 tool-bash 递进来的命令原文。
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { Context as CordisContext } from "@deepseek-ai/cordis";
+import { createScope } from "@deepseek-ai/dsh-scope";
+import { ShellExecutor } from "@deepseek-ai/dsh-shell";
+import type {
+  ShellExecRequest,
+  ShellExecSpec,
+  ShellExecution,
+  ShellRunResult,
+} from "@deepseek-ai/dsh-shell";
+import { apply as applyShellEnv, inject as shellEnvInject } from "@deepseek-ai/dsh-shell-env";
+import { apply as applyToolBash, inject as toolBashInject } from "@deepseek-ai/dsh-tool-bash";
+import {
+  apply as applyNativeExecutor,
+  inject as nativeExecutorInject,
+} from "@deepseek-ai/dsh-tool-executor-native";
+import { LocalSpillStore } from "@deepseek-ai/dsh-spill-local";
+import { ToolRuntime } from "@deepseek-ai/dsh-tools";
+import { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
+
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 
-import type { Messages } from "../../lib/messages.ts";
-import type { PipeRecord, PrefixRecord } from "../../lib/insights-shape.ts";
 import type {
+  HookEnv,
   HostContext,
   PipeDeps,
   PrefixContext,
@@ -28,119 +46,93 @@ import type {
 import { installPostExecuteListener, installPrefixShadow } from "../../host.ts";
 import type { RewrittenCalls } from "../../lib/dedup.ts";
 import { createRewrittenCalls } from "../../lib/dedup.ts";
+import type { PipeRecord, PrefixRecord } from "../../lib/insights-shape.ts";
+import type { Messages } from "../../lib/messages.ts";
 import { createRewriteCache } from "../../lib/rewrite-cache.ts";
 
-/** 假 rtk 的一条回执：退出码 + stdout，可选的人为延迟（用来测改写超时）。 */
+/** 假 rtk 的一条回执：进程产出的原文与退出码。 */
 export interface FakeReply {
   readonly exitCode: number;
   readonly stdout: string;
+  /** 真起进程时要等这么久才吐出回执（模拟冷启动）。 */
   readonly delayMs?: number;
 }
 
-/** 假 bash 定义 + 它收到的命令（**最终转调的那一条**，不是模型最初发的那条）。 */
+/** 脚本化 shell 的记账面：received 是真 tool-bash 递进来的命令原文。 */
 export interface FakeBash {
   readonly definition: Record<string, unknown>;
   readonly received: string[];
 }
 
-/**
- * 假 bash：记录收到的 command，回一条可控的 foreground 结果。
- * 真实 tool-bash 的 `execute` 是 `(args, exec)` 两个参数，这里保持同样的形状。
- */
-export function makeFakeBash(
-  reply: (command: string) => unknown,
-  onExecute?: (command: string) => void,
-): FakeBash {
-  const received: string[] = [];
-  const definition = {
-    name: "bash",
-    description: "fake bash",
-    parameters: { type: "object", properties: { command: { type: "string" } } },
-    output: {
-      schema: { type: "object" },
-      render: (): unknown[] => [{ type: "text", text: "fake" }],
-    },
-    async execute(args: unknown): Promise<unknown> {
-      const { command } = args as { command: string };
-      received.push(command);
-      // 转调那一刻的观察点：C 形态要求「记账先于转调」，判据只能在执行体内部取。
-      onExecute?.(command);
-      return reply(command);
-    },
-  };
-  return { definition, received };
-}
-
-/** 假 rtk 的可观测面。`spawned()` 读的是它自己的计数器。 */
+/** 一份已装进 PATH 的假 rtk：subprocess 是同一份剧本的内存答案，给不走真进程的用例用。 */
 export interface FakeRtk {
   readonly dir: string;
-  readonly spawned: () => number;
-  readonly restore: () => void;
-  /** 这份假 rtk 的子进程面：`startPrefixHost` 不给 `subprocess` 时就用它。 */
+  spawned: () => number;
+  restore: () => void;
   readonly subprocess: SubprocessFace;
 }
 
-/** 当前装着的那份假 rtk（同一条用例内是唯一一份）；`startPrefixHost` 的缺省子进程面从这里取。 */
+/** 一个 agent 作用域里看到的遮蔽体。execute 与宿主同形：(args, exec)。 */
+export interface ShadedTool {
+  execute: (args: unknown, exec: unknown) => Promise<unknown>;
+}
+
+/** 假 rtk 的进程脚本：按 plan.json 里的计数器取剧本，最后一条可重复。 */
+const FAKE_RTK_SCRIPT = [
+  "#!/usr/bin/env node",
+  'const { readFileSync, writeFileSync } = require("node:fs");',
+  'const { join } = require("node:path");',
+  'const plan = JSON.parse(readFileSync(join(__dirname, "plan.json"), "utf8"));',
+  "const index = Math.min(plan.counter, plan.replies.length - 1);",
+  "plan.counter += 1;",
+  'writeFileSync(join(__dirname, "plan.json"), JSON.stringify(plan), "utf8");',
+  "const reply = plan.replies[index];",
+  "setTimeout(() => {",
+  "  if (reply.stdout.length > 0) { process.stdout.write(reply.stdout); }",
+  "  process.exit(reply.exitCode);",
+  "}, reply.delayMs || 0);",
+].join("\n");
+
+const AGENT_CREATED = "agent/created";
+
+/** 模块级「当前那份假 rtk」：startPrefixHost 不显式给 subprocess 时就复用它。 */
 let activeFakeRtk: FakeRtk | undefined;
 
-/**
- * 在临时目录里造一个 `rtk` 并把它加进 PATH，**同时**给出它的子进程面。
- *
- * 两件事分开做，理由各一条：
- *
- * **① PATH 上的那个文件**只为过装配期门禁 `findOnPath("rtk")`。三个平台都写裸名 `rtk`：
- * win32 那一档的候选是 `.exe` / `.cmd` / 裸名，而 `accessSync(path, X_OK)` 在 Windows 上
- * 就退化成「存在且可读」，所以裸名足够（`?.cmd` 只是留给人在 Windows 上手跑，本套件不依赖它）。
- * 早先这里只有 POSIX 的 0755 脚本，于是整片 C 形态用例在 windows CI 上根本没进得去。
- *
- * **② 子进程面是内存桩，不起真进程。** 这一条是被 Windows 逼出来的：`lib/cli.ts` 用
- * `spawn({ argv: ["rtk", …] })` 起进程，而 Windows 的 `CreateProcess` **不做 PATHEXT 解析**
- * ——裸名只找 `.exe`，`.cmd`/`.bat` 必须经 `shell: true` 或 `cmd.exe /c` 才跑得起来。我们
- * 不能为了测试去改产品的 spawn 形状（那会让 Windows 上的真实行为与这里测的东西分叉），
- * 也造不出一个跨平台可执行的假 rtk（`.exe` 需要真的编译）。
- *
- * 代价写清楚：这一层不再验「argv[0] 在目标平台上真的能被启动」。它从来就没验到过——
- * CI runner 上没有装 rtk，起真进程这件事在 CI 里本来就只有 macOS 开发机碰巧成立。
- * argv 的形状由 `test/cli.test.ts` 用同一类桩逐条钉着，真机启动由 `test/e2e-insights.md`
- * 那条回路（人工、装了真 rtk 的机器）覆盖。
- *
- * 保留的语义：按调用顺序消费 `replies`（最后一条可重复）、`delayMs`、`exitCode`/`stdout`、
- * 以及 **abort 语义**（`spec.signal` 一响就结算成 `signal: "SIGTERM"`，`terminate()` 同效）。
- * 改写超时那条用例的判据「不把命令拖满整个超时」因此仍然成立，而且不再依赖真进程的冷启动。
- */
-export function installFakeRtk(cleanups: string[], replies: readonly FakeReply[]): FakeRtk {
+/** 装一份假 rtk 到 PATH 前端，同时给出一份同剧本的内存子进程面。 */
+export function installFakeRtk(
+  cleanups: readonly string[],
+  replies: readonly FakeReply[],
+): FakeRtk {
   const dir = mkdtempSync(path.join(tmpdir(), "rtk-bin-"));
-  cleanups.push(dir);
-  const script = `#!/usr/bin/env node
-const fs = require("node:fs");
-const planPath = require("node:path").join(__dirname, "plan.json");
-const plan = JSON.parse(fs.readFileSync(planPath, "utf8"));
-const reply = plan.replies[Math.min(plan.counter, plan.replies.length - 1)];
-plan.counter += 1;
-fs.writeFileSync(planPath, JSON.stringify(plan));
-const emit = () => { process.stdout.write(reply.stdout); process.exit(reply.exitCode); };
-if (reply.delayMs) { setTimeout(emit, reply.delayMs); } else { emit(); }
-`;
-  writeFileSync(path.join(dir, "rtk"), script, { mode: 0o755 });
-  writeFileSync(path.join(dir, "plan.json"), JSON.stringify({ replies, counter: 0 }));
-  if (process.platform === "win32") {
-    writeFileSync(path.join(dir, "rtk.cmd"), '@echo off\r\nnode "%~dp0rtk" %*\r\n');
+  (cleanups as string[]).push(dir);
+  writeFileSync(path.join(dir, "rtk"), FAKE_RTK_SCRIPT, "utf8");
+  if (process.platform !== "win32") {
+    // POSIX 的门禁看执行位；没有 shebang + 0755 时 `findOnPath` 会漏掉这份夹具，
+    // 测试于是偷偷依赖机器上真正的 rtk——判据跟着跑测环境走，而不是跟着夹具。
+    chmodSync(path.join(dir, "rtk"), 0o755);
   }
-  const saved = process.env["PATH"];
-  process.env["PATH"] = `${dir}${path.delimiter}${saved ?? ""}`;
-
-  let counter = 0;
+  writeFileSync(path.join(dir, "plan.json"), JSON.stringify({ replies, counter: 0 }), "utf8");
+  if (process.platform === "win32") {
+    writeFileSync(
+      path.join(dir, "rtk.cmd"),
+      ["@echo off", 'node "%~dp0rtk" %*', ""].join("\r\n"),
+      "utf8",
+    );
+  }
+  const savedPath = process.env["PATH"];
+  process.env["PATH"] = `${dir}${savedPath === undefined ? "" : `${path.delimiter}${savedPath}`}`;
+  let spawned = 0;
   const subprocess: SubprocessFace = {
-    spawn(spec) {
-      const fallback: FakeReply = { exitCode: 0, stdout: "" };
-      const reply = replies[Math.min(counter, replies.length - 1)] ?? fallback;
-      counter += 1;
+    spawn(spec): never {
+      const index = Math.min(spawned, replies.length - 1);
+      const reply = replies[index]!;
+      spawned += 1;
       const { promise, resolve } = Promise.withResolvers<{
         readonly exitCode: number | null;
         readonly signal: string | null;
       }>();
       let settled = false;
-      let timer: NodeJS.Timeout | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const finish = (exitCode: number | null, signal: string | null): void => {
         if (settled) {
           return;
@@ -159,12 +151,11 @@ if (reply.delayMs) { setTimeout(emit, reply.delayMs); } else { emit(); }
       } else {
         timer = setTimeout(emit, reply.delayMs);
       }
-      // 已经 aborted 的 signal 不会再派发事件，得先看一眼——`cli.ts` 那条
-      // 「调用方 signal 已 abort 就不 spawn」的用法依赖它。
-      if (spec.signal?.aborted === true) {
+      const { signal } = spec;
+      if (signal?.aborted === true) {
         finish(null, "SIGTERM");
       } else {
-        spec.signal?.addEventListener(
+        signal?.addEventListener(
           "abort",
           () => {
             finish(null, "SIGTERM");
@@ -172,56 +163,60 @@ if (reply.delayMs) { setTimeout(emit, reply.delayMs); } else { emit(); }
           { once: true },
         );
       }
-      // `as never` 与同文件另外三处子进程桩一致：`SubprocessHandle` 的完整面（stdin/stderr/
-      // pid/exitCode…）由宿主的真实现给出，这里只交 `lib/cli.ts` 真正读的那三位。
       return {
         done: promise,
-        collected: { stdout: { readFrom: () => ({ text: reply.stdout }) } },
+        collected: {
+          stdout: { readFrom: (): { text: string } => ({ text: reply.stdout }) },
+        },
         terminate: (): void => {
           finish(null, "SIGTERM");
         },
       } as never;
     },
   };
-
   const fake: FakeRtk = {
     dir,
-    spawned: () => counter,
-    subprocess,
-    restore: () => {
-      if (activeFakeRtk === fake) {
-        activeFakeRtk = undefined;
-      }
-      if (saved === undefined) {
+    spawned: (): number => spawned,
+    restore: (): void => {
+      activeFakeRtk = undefined;
+      if (savedPath === undefined) {
         delete process.env["PATH"];
-        return;
+      } else {
+        process.env["PATH"] = savedPath;
       }
-      process.env["PATH"] = saved;
     },
+    subprocess,
   };
   activeFakeRtk = fake;
   return fake;
 }
 
-/**
- * 假子进程面：真的 spawn，并把 `spec.signal` 接到子进程上。
- *
- * **必须接**：改写超时那条用例的判据是「不把命令拖满整个超时」，而 abort 要真的杀掉那个
- * 拖 5s 的假 rtk；忽略 signal 的话 `done` 会一直等到子进程自己退出。
- */
+/** 一次 spawn 的记账（不含 stdout：这一层只验 argv/cwd/env）。 */
+interface RecordedSpawn {
+  readonly cwd: string;
+  readonly argv: readonly string[];
+  readonly env: Record<string, string | undefined>;
+}
+
+/** 真起子进程的子进程面：假 rtk 脚本、真 rtk 二进制都走这条。 */
 export function fakeSubprocess(): SubprocessFace {
   return {
-    spawn(spec) {
-      const child = spawn(spec.argv[0] ?? "", spec.argv.slice(1), {
+    spawn(spec): never {
+      const child = spawn(spec.argv[0]!, spec.argv.slice(1), {
         cwd: spec.cwd,
         env: { ...process.env, ...spec.env },
         stdio: ["ignore", "pipe", "pipe"],
       });
       let stdout = "";
       child.stdout.on("data", (chunk: Buffer) => {
-        stdout += chunk.toString("utf8");
+        stdout += chunk.toString();
       });
       let aborted = false;
+      const { promise, resolve, reject } = Promise.withResolvers<{
+        readonly exitCode: number | null;
+        readonly signal: string | null;
+      }>();
+      child.on("error", reject);
       spec.signal?.addEventListener(
         "abort",
         () => {
@@ -230,19 +225,13 @@ export function fakeSubprocess(): SubprocessFace {
         },
         { once: true },
       );
-      const { promise, resolve } = Promise.withResolvers<{
-        readonly exitCode: number | null;
-        readonly signal: string | null;
-      }>();
-      child.on("close", (exitCode: number | null, signal: NodeJS.Signals | null) => {
-        // 被插件 abort 掉的那一路，子进程的 signal 可能是 SIGTERM；显式标出来，
-        // 免得实现里那条 `outcome.signal === null` 判据靠平台默认行为。
+      child.on("close", (exitCode, signal) => {
         resolve({ exitCode, signal: aborted ? "SIGTERM" : signal });
       });
       return {
         done: promise,
-        collected: { stdout: { readFrom: () => ({ text: stdout }) } },
-        terminate: () => {
+        collected: { stdout: { readFrom: (): { text: string } => ({ text: stdout }) } },
+        terminate: (): void => {
           child.kill();
         },
       } as never;
@@ -250,305 +239,15 @@ export function fakeSubprocess(): SubprocessFace {
   };
 }
 
-/** 被遮蔽的那个 bash 工具体：测试只看 `execute` 这一面。 */
-export interface ShadedTool {
-  execute: (args: unknown, exec: unknown) => Promise<unknown>;
-}
-
-/** 半栈句柄。`withAgent()` 触发一次 `agent/created`，拿到被遮蔽的那个 bash 工具体。 */
-export interface PrefixHost {
-  readonly fake: FakeBash;
-  readonly installed: boolean;
-  readonly deps: PrefixDeps;
-  /** 子进程面：改写用例靠它读「spawn 时用的 cwd 是谁给的」。 */
-  readonly subprocess: SubprocessFace;
-  /** 每次真正注册出去的遮蔽体，按注册顺序；`agentId` 是注册到哪个 agent 上。 */
-  readonly registrations: readonly { readonly agentId: string; readonly definition: ShadedTool }[];
-  readonly withAgent: (id?: string) => ShadedTool;
-  /**
-   * 统计埋点的收件箱：`recordPrefix` 收到的记录，按到达顺序。
-   *
-   * 判据用点：Task 5 的每条用例都在问「哪几条记录、什么顺序、字段对不对」，所以它必须是
-   * 可见的数组而不是一个计数——`bash-call → gate-skip` 与 `bash-call → attempt → outcome`
-   * 的区别只有顺序读得出来。
-   */
-  readonly prefixRecords: readonly PrefixRecord[];
-  /**
-   * 模拟**插件 fiber 卸载**：按逆序跑 `ctx.effect` 收下的全部 disposer。
-   *
-   * 判据用点：卸载后 `agent` 视图里那枚遮蔽体应当消失（`visibleShadows()` 归零）。它是
-   * 「裸 register 把回收权交给了 agent 作用域」这格缺陷的正相判据——不跑这一步，泄漏看不见。
-   */
-  readonly disposeFiber: () => Promise<void>;
-  /** 某个 agent 作用域里现在能看到的遮蔽体（= `scoped` 栈的快照），用来判「卸载后还在不在」。 */
-  readonly visibleShadows: () => readonly ShadedTool[];
-}
-
-/** C 形态半栈：假 ctx 造 `on` / `tools` / `workingDirectory` / `subprocess` / `effect` 五样。 */
-export async function startPrefixHost(
-  overrides: {
-    readonly options?: Partial<PrefixOptions>;
-    readonly reply?: (command: string) => unknown;
-    readonly subprocess?: unknown;
-    /** 工作目录服务的回答；缺省回 `process.cwd()`。 */
-    readonly ensure?: () => Promise<string>;
-    /** 假 bash 转调那一刻的钩子（用来断言「记账先于转调」）。 */
-    readonly onExecute?: (command: string) => void;
-    /**
-     * 覆盖 `ctx.tools.get("bash")` 的返回值。`null` = 该 profile 没装 bash（get 回 undefined）；
-     * 传一个没有 `execute` 的对象 = 装了个不可执行的同名工具。两种情况遮蔽层都该静默跳过。
-     */
-    readonly bash?: unknown;
-    /**
-     * 注入平台值（默认跟随运行平台）。win32 的装配期降级在 POSIX 测试机上走不到，
-     * 而那条分支正是「按平台关掉一层」的唯一判据，必须可测。
-     *
-     * 反过来也成立：这条机器是 win32 时，整套 C 形态用例要**显式传 `"linux"`/`"darwin"`**
-     * 才进得去（产品侧的 `prefixSupportedOn` 对 win32 判否）。两条方向各有一处用它。
-     */
-    readonly platform?: NodeJS.Platform;
-    /** 诊断日志接收口（对应部署开关 `logFilterMode: 'on'`）；不给 = 关。 */
-    readonly log?: (line: string) => void;
-    /**
-     * 故障播报接收口（对应生产里的宿主 logger）。与 `log` 分开：它不受 `logFilterMode`
-     * 影响，默认装配就该有——账本目录建不出来、沙箱不给写权限这两件事必须留下痕迹。
-     */
-    readonly warn?: (line: string) => void;
-    /**
-     * 装配瞬间**已经存在**的 agent id。半栈会按这些 id 造出带 `ctx.tools.register` 的
-     * agent，交成 `agents.list()` 的回答——晚装载那条分支只有从这里进得来。
-     */
-    readonly liveAgentIds?: readonly string[];
-    /**
-     * `agents.list()` 的原样回答（覆盖 `liveAgentIds`）。用来验「元素形状不对时逐个跳过」
-     * 与「服务面判不过就退回只听事件」这两条退路。
-     */
-    readonly listedAgents?: readonly unknown[];
-    /**
-     * `agents.list()` 的**返回值本身**（覆盖 `listedAgents`）：它连「是不是数组」都不保证，
-     * 而那条非数组退路正是 `host.ts` 里唯一的 `Array.isArray` else 分支。
-     */
-    readonly agentsListReply?: unknown;
-    /**
-     * 复刻「`bash` 只在 **agent 作用域**注册」的 profile 形状（web-app 那套预设就是）：
-     * 打开它之后，`ctx.tools.get("bash")` **不带 scope** 回 undefined，带 scope 才回 bash。
-     *
-     * 这一位是为那格真机缺陷留的回归判据：遮蔽层早先在 `installOn` 里漏传 scope，
-     * 于是每个 agent 都「看不到」bash、整层静默不装，而所有单测（替身不看 scope）全绿。
-     */
-    readonly bashNeedsScope?: boolean;
-    /**
-     * `ctx.get("sandboxPolicy")` 的回答：`undefined` = 服务不在（只读沙箱、老宿主）。
-     * 给一个真策略才能验「账本目录被登记成可写根」这条路径。
-     */
-    readonly sandboxPolicy?: unknown;
-    /**
-     * 换掉统计记账号（缺省是堆进 `prefixRecords` 的真收件箱）。给一个会抛的实现，
-     * 才能验「统计写坏了不让工具调用失败」那条边界。
-     */
-    readonly insights?: PrefixDeps["insights"];
-  } = {},
-): Promise<PrefixHost> {
-  const fake = makeFakeBash(
-    overrides.reply ?? (() => ({ kind: "foreground", exitCode: 0, stdout: { text: "ok" } })),
-    overrides.onExecute,
-  );
-  const scoped: ShadedTool[] = [];
-  const registrations: { readonly agentId: string; readonly definition: ShadedTool }[] = [];
-  const handlers = new Map<string, (payload: { agent: unknown }) => void>();
-  // 缺省子进程面跟着「当前装着的那份假 rtk」走：`installFakeRtk` 既铺 PATH（过装配期门禁）
-  // 又给出回执（`rtk rewrite` 交回什么）。不给假 rtk 时退回真 spawn 的那一份——那些用例
-  // 自己断言 spawn 形状，不关心回执内容。
-  const subprocess = (overrides.subprocess ??
-    activeFakeRtk?.subprocess ??
-    fakeSubprocess()) as SubprocessFace;
-  /**
-   * `get("bash")` 该回什么。两个解构点都要用，所以先算出来——`overrides.bash ?? fake.definition`
-   * 那种写法在 `get` 内部重复一次就是两份口径。
-   */
-  const bash: unknown = overrides.bash === undefined ? fake.definition : overrides.bash;
-  /**
-   * `ctx.effect` 收下的 disposer，按注册顺序；`disposeFiber()` 按**逆序**跑（cordis 的卸载序）。
-   *
-   * 半栈必须演这一位：`host.ts` 把 `agent.ctx.tools.register()` 的执行包进工厂交给插件 fiber，
-   * 回收权因此从 agent 作用域转到了插件手里。替身若不真跑工厂、也不真跑兜出来的 disposer，
-   * 「插件卸载后遮蔽体仍留在 agent 视图里」那一格就永远绿——而它正是真机报错的起点。
-   */
-  const disposers: (() => void | Promise<void>)[] = [];
-  const disposeFiber = async (): Promise<void> => {
-    // 逆序（cordis 的卸载序）。串成一条链而不是 `Promise.all`：那样顺序就没了，而「逆序 +
-    // 逐条等完」正是这里要演的东西；链式写法还顺带避开 `no-await-in-loop`（那规则拦的是
-    // 「本该并行却在循环里逐条等」——这里恰恰相反，必须逐条、必须有序）。
-    const pending = disposers.toReversed();
-    disposers.length = 0;
-    for (const disposer of pending) {
-      // oxlint-disable-next-line no-await-in-loop -- 逆序串行是契约，本就没有可并行的独立工作
-      await disposer();
-    }
-  };
-  const makeAgent = (id: string): { readonly id: string; readonly ctx: unknown } => ({
-    id,
-    ctx: {
-      tools: {
-        register: (definition: unknown): (() => void) => {
-          const shaded = definition as ShadedTool;
-          scoped.push(shaded);
-          registrations.push({ agentId: id, definition: shaded });
-          return () => {
-            scoped.pop();
-          };
-        },
-      },
-    },
-  });
-  /** `agents.list()` 的回答：显式给的原样用，只给 id 的按 id 造出真 agent。 */
-  const liveAgents: unknown =
-    overrides.agentsListReply ??
-    overrides.listedAgents ??
-    (overrides.liveAgentIds ?? []).map((id: string): unknown => makeAgent(id));
-
-  const ctx = {
-    subprocess,
-    workingDirectory: { ensure: overrides.ensure ?? (async (): Promise<string> => process.cwd()) },
-    /**
-     * `ctx.effect` 的替身：**立刻跑工厂**、收下它返回的清理函数，卸载时按逆序跑。
-     *
-     * 与宿主一致到「同步工厂 + 返回值若为 thenable 就等它」这两位：`host.ts` 用它把
-     * `agent.ctx.tools.register()` 的回收权从 agent 作用域转到插件 fiber，替身不跑工厂
-     * 就等于那次转手没发生。
-     */
-    effect: ((execute: () => unknown, ...rest: unknown[]): (() => void) => {
-      void rest;
-      const produced = execute();
-      if (typeof produced === "function") {
-        disposers.push(produced as () => void | Promise<void>);
-      }
-      return () => {
-        void disposeFiber();
-      };
-    }) as unknown as PrefixContext["effect"],
-    /** 插件 fiber 的替身：`host.ts` 只把它原样交给 `settings.configure`，这里给个可辨的标记。 */
-    fiber: { id: "rtk-test-fiber" },
-    tools: {
-      // **替身必须复刻宿主的 scope 语义**，否则「忘了传 scope」这一格在单测里永远是绿的。
-      //
-      // 宿主 `ToolsService.get(name, scope)`：`scope` 缺省 = 只看**全局视图**；给了 scope
-      // 才把 agent 作用域那几层（`chainLayers(scope)` 与 own 层）并进来。真实 profile 里
-      // `bash` 正是由 **agent preset** 注册的（全局 `include:tool-bash` 是 disabled），
-      // 所以「传不传 scope」不是风格问题而是取不取得到的问题。
-      //
-      // `bashNeedsScope` 那一位就是那个形状的替身：给了它，无 scope 的 `get` 回 undefined
-      // （= 全局层没有 bash），带 scope 的 `get` 才回 bash。
-      //
-      // 单出口：`consistent-return` 把 `unknown` 返回类型当成「可以什么都不回」，
-      // 于是 `return undefined` 与 `return 值` 混在一支函数里就判红。
-      get: (name: string, scope?: unknown): unknown =>
-        name === "bash" &&
-        bash !== null &&
-        (scope !== undefined || overrides.bashNeedsScope !== true)
-          ? bash
-          : undefined,
-    },
-    on: (name: string, handler: (payload: { agent: unknown }) => void): void => {
-      handlers.set(name, handler);
-    },
-    // `agents` 服务面：晚装载时补装已存在的 agent 唯一入口。默认**不给**（= 服务不在），
-    // 因为绝大多数用例走的是 `agent/created`，凭空给一个空表只会让「到底走没走晚装载那条路」更难读。
-    get: (name: string): unknown => {
-      if (name === "agents") {
-        return { list: () => liveAgents };
-      }
-      return name === "sandboxPolicy" ? overrides.sandboxPolicy : undefined;
-    },
-  };
-  /**
-   * 统计埋点的收件箱：`recordPrefix` 的记录按到达顺序堆在这里。
-   *
-   * 用**真收件箱**而不是空实现：Task 5 的判据就是「哪几条记录、以什么顺序到达」，
-   * 而空实现会让「一条都没记」与「记错了」看起来一模一样。默认值可在 overrides 里换掉
-   * （验「记账号抛错时不影响工具执行」那条用例需要一个会炸的 sink）。
-   */
-  const prefixRecords: PrefixRecord[] = [];
-  const insights: PrefixDeps["insights"] = overrides.insights ?? {
-    recordPrefix: (input) => {
-      prefixRecords.push(input);
-    },
-  };
-  const deps: PrefixDeps = {
-    messages: () => ({
-      cargoTestWarnHint: "cargo build / cargo check",
-      spillSummary: "",
-      spillLocation: "{path} {hint}",
-      spillRelaxed: "{omitted} {path} {hint}",
-    }),
-    rewriteCache: createRewriteCache(16),
-    rewrittenCalls: createRewrittenCalls(16),
-    insights,
-  };
-  installPrefixShadow(
-    ctx as unknown as PrefixContext,
-    {
-      enabled: () => true,
-      forms: () => ["prefix"],
-      // 诊断日志：默认关（只有专门验它的用例显式打开），否则每条用例都会往控制台写一行。
-      log: overrides.log,
-      // 故障播报：默认也关（用例里显式收），但它**不跟 logFilterMode 走**——生产装配里
-      // 这一口接的是宿主 logger，默认就该能看见。
-      warn: overrides.warn,
-      supported: overrides.options?.supported ?? (() => true),
-      // 五处 volatile 都给取值函数：与生产装配同一口径，用例才能验「改了值下一次调用就生效」。
-      denyCommands: () => [],
-      vitestMaxMajor: 5,
-      // 半栈的假 rtk 是一次真的 node 启动（冷启动 100~400ms），预算必须宽到不会误伤；
-      // 「改写超时」那条用例自己把这个值压到 300ms。
-      rewriteTimeoutMs: 5000,
-      warnHint: () => true,
-      rewriteHostEnv: () => "",
-      // 半栈不落真账本：空串 = 不注入 `RTK_DB_PATH`，转调命令因此保持 `rtk cargo test` 原形，
-      // 那 20 多条形状断言才不用为路径前缀写一遍。真注入的行为由 `test/rtk-paths.test.ts`
-      // 的 `withRtkDbPath` 段单独验。
-      trackingDbPath: "",
-      ...overrides.options,
-    },
-    deps,
-    overrides.platform,
-  );
-
-  const withAgent = (id = "s1"): ShadedTool => {
-    const agent = makeAgent(id);
-    handlers.get("agent/created")?.({ agent });
-    const registered = scoped.at(-1);
-    if (registered === undefined) {
-      throw new Error("遮蔽层没有注册任何工具体");
-    }
-    return registered;
-  };
-  return {
-    fake,
-    installed: handlers.has("agent/created"),
-    deps,
-    subprocess,
-    registrations,
-    withAgent,
-    prefixRecords,
-    disposeFiber,
-    visibleShadows: () => [...scoped],
-  };
-}
-
-/**
- * 记账用的子进程面：只记录每次 spawn 的 `cwd` / argv / env，回 rc=1（= 这条不压）。
- * 用来断言「改写用的是宿主 ensure 给的那个目录」与「rewrite 带的 env 是哪一套」。
- */
+/** 只记账、不执行：给「命令跑在哪、带了什么 env」这类判据用。 */
 export function recordingSubprocess(): SubprocessFace & {
-  readonly calls: { cwd: string; argv: readonly string[]; env: Record<string, string> }[];
+  readonly calls: readonly RecordedSpawn[];
 } {
-  const calls: { cwd: string; argv: readonly string[]; env: Record<string, string> }[] = [];
+  const calls: RecordedSpawn[] = [];
   return {
     calls,
-    spawn(spec) {
-      // 宿主把 `env` 与擦除过的父环境合并；这里只留显式传的那几枚，正是断言要看的面。
-      const env: Record<string, string> = {};
+    spawn(spec): never {
+      const env: Record<string, string | undefined> = {};
       for (const [key, value] of Object.entries(spec.env ?? {})) {
         if (value !== undefined) {
           env[key] = value;
@@ -562,20 +261,138 @@ export function recordingSubprocess(): SubprocessFace & {
       resolve({ exitCode: 1, signal: null });
       return {
         done: promise,
-        collected: { stdout: { readFrom: () => ({ text: "" }) } },
+        collected: { stdout: { readFrom: (): { text: string } => ({ text: "" }) } },
         terminate: (): void => {
-          // 记账桩不真的起进程，也就没有可终止的东西。
+          // 记账桩不起进程。
         },
       } as never;
     },
   };
 }
 
-/** 清掉临时目录（每个测试文件各自 `afterAll` 一次）。 */
+// ----------------------------------------------------------------------------
+// 真实 rtk CLI 回路：环境变量控制，默认 `auto`（装了就真跑，没装就跳过）。
+// ----------------------------------------------------------------------------
+
+/** 真实 CLI 回路的开关变量。`real` = 必须有真 rtk（缺了当场红）；`fake` = 一律用假 rtk。 */
+export const RTK_TEST_MODE_ENV = "DSH_RTK_TEST_MODE";
+
+export type RtkTestMode = "real" | "fake" | "auto";
+
+/** 读开关。缺省与非法值一律按 `auto`（本地装了就真跑、没装就跳过；CI 显式安装 rtk 并以 `real` 跑）。 */
+export function rtkTestMode(env: NodeJS.ProcessEnv = process.env): RtkTestMode {
+  const raw = (env[RTK_TEST_MODE_ENV] ?? "").trim().toLowerCase();
+  return raw === "real" || raw === "fake" ? raw : "auto";
+}
+
+/**
+ * 本机 PATH 上那支真 rtk 的自述版本；没有就 undefined（探针自己就起一次真进程）。
+ *
+ * `error` 必须接住：二进制缺席时只监听 `close` 会让 ENOENT 变成未捕获的 error 事件，
+ * 而探针若在模块顶层 await，vitest 收集阶段会静默挂死。超时是第二道保险：PATH 上
+ * 若有一支会卡住的 `rtk`，探针也不能把整个文件拖到 hookTimeout。
+ */
+export async function probeRealRtk(): Promise<string | undefined> {
+  const { promise, resolve } = Promise.withResolvers<string | undefined>();
+  const child = spawn("rtk", ["--version"], { stdio: ["ignore", "pipe", "ignore"] });
+  let stdout = "";
+  const timer = setTimeout(() => {
+    child.kill("SIGTERM");
+    resolve(undefined);
+  }, 5000);
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString();
+  });
+  child.on("error", () => {
+    clearTimeout(timer);
+    resolve(undefined);
+  });
+  child.on("close", (code) => {
+    clearTimeout(timer);
+    resolve(code === 0 && stdout.trim() !== "" ? stdout.trim() : undefined);
+  });
+  return promise;
+}
+
+/** 真子进程面：真起 `rtk`，把 stdout/stderr 收进 `collected`（形状照官方 SubprocessHandle）。 */
+export function realSubprocess(): SubprocessFace & { readonly spawns: readonly RecordedSpawn[] } {
+  const spawns: RecordedSpawn[] = [];
+  return {
+    spawns,
+    spawn(spec): never {
+      const env: Record<string, string | undefined> = {};
+      for (const [key, value] of Object.entries(spec.env ?? {})) {
+        if (value !== undefined) {
+          env[key] = value;
+        }
+      }
+      spawns.push({ cwd: spec.cwd, argv: [...spec.argv], env });
+      const child = spawn(spec.argv[0]!, spec.argv.slice(1), {
+        cwd: spec.cwd,
+        env: { ...process.env, ...spec.env },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const stream = spec.stdio.stdin;
+      child.stdin.end(typeof stream === "object" && "data" in stream ? stream.data : undefined);
+      child.stdin.on("error", () => {
+        // 子进程可能不读 stdin 就退出（EPIPE）；判据看 done 与 stdout，不看这条流。
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      let aborted = false;
+      const { promise, resolve, reject } = Promise.withResolvers<{
+        readonly exitCode: number | null;
+        readonly signal: string | null;
+      }>();
+      child.on("error", reject);
+      spec.signal?.addEventListener(
+        "abort",
+        () => {
+          aborted = true;
+          child.kill("SIGTERM");
+        },
+        { once: true },
+      );
+      child.on("close", (exitCode, signal) => {
+        resolve({ exitCode, signal: aborted ? "SIGTERM" : signal });
+      });
+      return {
+        done: promise,
+        collected: {
+          stdout: {
+            readFrom: (): { text: string; lossy: boolean; truncated: boolean } => ({
+              text: stdout,
+              lossy: false,
+              truncated: false,
+            }),
+          },
+          stderr: {
+            readFrom: (): { text: string; lossy: boolean; truncated: boolean } => ({
+              text: stderr,
+              lossy: false,
+              truncated: false,
+            }),
+          },
+        },
+        terminate: (): void => {
+          child.kill();
+        },
+      } as never;
+    },
+  };
+}
+
+/** 临时目录的去重账本：每个用例组各自推自己的目录，组结束时一次清掉。 */
 export function makeCleanups(): {
   readonly dirs: string[];
-  readonly push: (dir: string) => void;
-  readonly drain: () => void;
+  push: (dir: string) => void;
+  drain: () => void;
 } {
   const dirs: string[] = [];
   return {
@@ -592,80 +409,607 @@ export function makeCleanups(): {
   };
 }
 
-/** `startPipeHost` 的开关。`pipe` 是假 `rtk pipe` 的回执；其余几项分别关掉/打开某一条判据。 */
-export interface PipeHostOptions {
-  /** 收插件 warn 的数组（原文落库失败时那一条）。 */
-  readonly warns?: string[];
-  /** 收插件 info 的数组（诊断行）。 */
-  readonly infos?: string[];
-  readonly pipe?: { readonly exitCode: number; readonly stdout: string };
-  /** 形态读取函数；传函数才能在用例里中途切换形态，验证热更新。 */
-  readonly forms?: () => readonly string[];
-  /** 总开关。默认 `() => true`（本半栈只测 B 形态，装配已由 `forms` 控制）。 */
-  readonly enabled?: () => boolean;
-  /** 版本门：默认 `() => true`；给 `() => false` 模拟「探到 rtk 低于下限」。 */
-  readonly supported?: () => boolean | undefined;
-  /**
-   * 让监听器在**结果侧**抛一次，用来验 `decide` 的兜底。
-   *
-   * 抛出点选 `stdoutCapBytes()`：它在 `finishCompressed` 里紧接「压成功」那行诊断之后被读，
-   * 所以用例能同时看到「先记压成了、再记它随后抛了」。埋点自身抛错走的是另一条路——
-   * `safeRecordPipe` 会就地吃掉只 warn，不再到达这里。
-   */
-  readonly throwInListener?: boolean;
-  /** 参与 pipe 的 filter 名单（默认只开 cargo-test / pytest；vitest 那两条用例自己加）。 */
-  readonly filters?: readonly string[];
-  /**
-   * 三处数值阈值与 filter 名单都可注入**取值函数**（不是值）：`apply` 只跑一次，而它们标了
-   * volatile —— 「卡片改完下一次调用即生效」这件事只有靠「消费点现读」才成立，所以半栈也要能
-   * 在用例里中途改值、再断言下一次 `run` 用了新值。不给时用固定值。
-   */
-  readonly minBytes?: () => number;
-  readonly minGainRatio?: () => number;
-  readonly stdoutCapBytes?: () => number;
-  readonly filtersOf?: () => readonly string[];
-  /** 装一份假 spill 存储；不给时 `ctx.get` 读不到服务，走「不带全文提示」那一支。 */
-  readonly spillStore?: SpillStoreStub;
-  /** 诊断日志接收口（对应部署开关 `logFilterMode: 'on'`）；不给 = 关。 */
-  readonly log?: (line: string) => void;
-  /** 覆盖消息字典（默认用真字典的那几句）；用来逼「模板缺席」这类降级分支。 */
-  readonly messages?: () => Messages;
-  /** 换掉统计收件箱（默认收进 `PipeHost.pipeRecords`）。 */
-  readonly insights?: PipeDeps["insights"];
+/** 脚本化 shell 的配置：用例给的那份 legacy 回执与一个「命令已到达」的观察钩子。 */
+interface ScriptedShellConfig {
+  readonly reply?: ((command: string) => unknown) | undefined;
+  readonly onExecute?: ((command: string) => void) | undefined;
 }
 
-/** 假 spill 存储：记下每次落库的原文，回一句固定的取回提示。 */
+/** 一条命令的脚本化结果（官方 ShellRunResult 之外只需要这三样）。 */
+interface ScriptedOutcome {
+  readonly exitCode: number;
+  readonly signal: NodeJS.Signals | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/**
+ * 真真 read 的 ShellExecutor：进程执行是本层唯一允许脚本化的边界。
+ *
+ * 它所在的装配是真的（tool-bash 用官方的 OneOf 收据 schema、真流水线做 schema 校验与渲染），
+ * 于是插件交回的 value 一旦偏离官方形状就会当场变 isError，而不是被夹具悄悄接受。
+ */
+export class ScriptedShell extends ShellExecutor {
+  public readonly received: string[] = [];
+  /**
+   * 用普通字段而不是 `#private`：宿主交来的是 cordis 的服务代理，方法体里的 `this` 是那层
+   * 代理——读私有成员会当场抛 `Cannot read private member … from an object whose class did not
+   * declare it`，真流水线里第一次改写就整条变 isError（实测）。公开字段经代理转发，行为不变。
+   */
+  public readonly replyOf: (command: string) => unknown;
+  public readonly observed: ((command: string) => void) | undefined;
+
+  public constructor(ctx: CordisContext, config: ScriptedShellConfig = {}) {
+    super(ctx);
+    this.replyOf = config.reply ?? ((): undefined => undefined);
+    this.observed = config.onExecute;
+  }
+
+  /** 把用例给的 legacy 回执（{kind:'foreground', exitCode, stdout:{text}}）折成官方结果。 */
+  public outcomeOf(command: string): ScriptedOutcome {
+    const reply = this.replyOf(command);
+    const record = isRecord(reply) ? reply : {};
+    const stdoutOf = record["stdout"];
+    const stderrOf = record["stderr"];
+    const stdout =
+      isRecord(stdoutOf) && typeof stdoutOf["text"] === "string" ? stdoutOf["text"] : "";
+    const stderr =
+      isRecord(stderrOf) && typeof stderrOf["text"] === "string" ? stderrOf["text"] : "";
+    const exitCode = typeof record["exitCode"] === "number" ? record["exitCode"] : 0;
+    return { exitCode, signal: null, stdout, stderr };
+  }
+
+  // oxlint-disable-next-line eslint/class-methods-use-this -- resolve 只读进程事实，不持实例状态；静态化会破覆写契约
+  public override resolve(request: ShellExecRequest): ShellExecSpec {
+    return {
+      command: request.command,
+      workdir: request.workdir ?? process.cwd(),
+      timeoutMs: request.timeoutMs ?? 20_000,
+      onExpiry: request.onExpiry ?? "none",
+      stdoutMaxBytes: request.stdoutMaxBytes ?? 64_000,
+      sandboxPolicy: request.sandboxPolicy,
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
+      ...(request.stdin === undefined ? {} : { stdin: request.stdin }),
+      ...(request.env === undefined ? {} : { env: request.env }),
+      ...(request.dshEnv === undefined ? {} : { dshEnv: request.dshEnv }),
+    };
+  }
+
+  public override async execute(spec: ShellExecSpec): Promise<ShellExecution> {
+    this.received.push(spec.command);
+    this.observed?.(spec.command);
+    const outcome = this.outcomeOf(spec.command);
+    const stdout = { text: outcome.stdout, truncated: false };
+    const stderr = { text: outcome.stderr, truncated: false };
+    const run: ShellRunResult = {
+      exitCode: outcome.exitCode,
+      signal: outcome.signal,
+      timedOut: false,
+      aborted: false,
+      timeoutMs: spec.timeoutMs,
+      stdout,
+      stderr,
+    };
+    return {
+      status: "completed",
+      exitCode: outcome.exitCode,
+      signal: outcome.signal,
+      done: Promise.resolve(),
+      observed: {
+        stdout: { readFrom: () => ({ text: outcome.stdout, lossy: false }) },
+        stderr: { readFrom: () => ({ text: outcome.stderr, lossy: false }) },
+      },
+      readOutput: () => ({ stdout, stderr }),
+      kill: (): boolean => false,
+      result: async (): Promise<ShellRunResult> => run,
+    } as unknown as ShellExecution;
+  }
+}
+
+/** 会话头里的 cwd（真实宿主一定带着它；是 `workingDirectory.ensure` 的兜底读数）。 */
+function sessionCwdOf(agent: unknown): string | undefined {
+  const session = isRecord(agent) ? agent["session"] : undefined;
+  const header = isRecord(session) ? session["header"] : undefined;
+  const cwd = isRecord(header) ? header["cwd"] : undefined;
+  return typeof cwd === "string" ? cwd : undefined;
+}
+
+/** 真 agent 的最省形状判据，与 `host.ts` 的 `isAgent`（对象 + 字符串 id）同口径。 */
+function isAgentLike(value: unknown): boolean {
+  return isRecord(value) && typeof value["id"] === "string";
+}
+
+/** 把用例给的 legacy 回执（`{kind:'foreground', exitCode, stdout:{text}}`）当结构化值用。 */
+function asReceipt(value: unknown): Record<string, unknown> {
+  if (isRecord(value)) {
+    return value;
+  }
+  return typeof value === "string"
+    ? { kind: "foreground", exitCode: 0, stdout: { text: value } }
+    : {};
+}
+
+/**
+ * 给只带 `command` 的调用补一份 `description`。
+ *
+ * 真 tool-bash 的作者面参数表要求 description 非空（模型调用时必然带）；夹具里那些只给 command
+ * 的用例在这里补一份同形的建模事实，否则真参数校验会先把调用判成 isError。
+ */
+function prepareArgs(args: unknown): unknown {
+  if (!isRecord(args) || typeof args["command"] !== "string") {
+    return args ?? {};
+  }
+  if (typeof args["description"] === "string") {
+    return args;
+  }
+  return { ...args, description: "fixture bash call" };
+}
+
+/**
+ * 临时把宿主交来的会话头 cwd 盖到本 agent 的 header 上，跑完还原。
+ *
+ * scope key 就是这同一个对象（`createScope` 按引用认作用域），所以不能换新对象；而
+ * `tool-bash` 的 cwd 取自 `workingDirectory.ensure(exec.agent)`，与插件那条同源。
+ */
+async function withSessionCwd<Result>(
+  agent: Record<string, unknown>,
+  cwd: string | undefined,
+  action: () => Promise<Result>,
+): Promise<Result> {
+  const session = isRecord(agent["session"]) ? agent["session"] : undefined;
+  const header =
+    session !== undefined && isRecord(session["header"]) ? session["header"] : undefined;
+  if (cwd === undefined || header === undefined) {
+    return action();
+  }
+  const previous = header["cwd"];
+  header["cwd"] = cwd;
+  try {
+    return await action();
+  } finally {
+    header["cwd"] = previous;
+  }
+}
+
+/** 真外壳装配的输入：子进程面、工作目录答案、命令剧本。 */
+interface ShellRigOptions {
+  readonly subprocess: SubprocessFace;
+  readonly ensure: (agent?: unknown) => Promise<string>;
+  readonly reply: (command: string) => unknown;
+  readonly onExecute?: ((command: string) => void) | undefined;
+  readonly sandboxPolicy?: unknown;
+}
+
+/** 真外壳装配的产物：根上下文、带 inject 的子上下文、脚本化 shell。 */
+interface ShellRig {
+  readonly root: CordisContext;
+  readonly inner: CordisContext;
+  readonly shell: ScriptedShell;
+}
+
+/**
+ * 起重最小真装配：SystemPrompt → ToolRuntime → 原生执行器 → shellEnv → 脚本化 shell → 真 tool-bash。
+ *
+ * 这套顺序来自官方 `packages/core/tools/tests/tools.spec.ts` 的最小组合；少挂任何一位，
+ * tool-bash 的 apply 就会在 `ctx.shell` / `ctx.shellEnv` 上取空。
+ */
+async function mountShellRig(options: ShellRigOptions): Promise<ShellRig> {
+  const root = new CordisContext();
+  await root.plugin(SystemPrompt);
+  await root.plugin(ToolRuntime);
+  await root.plugin({ inject: nativeExecutorInject, apply: applyNativeExecutor });
+  await root.plugin({ inject: shellEnvInject, apply: applyShellEnv });
+  root.provide("subprocess", options.subprocess);
+  root.provide("workingDirectory", {
+    ensure: (agent?: unknown): Promise<string> => options.ensure(agent),
+    get: (): string => process.cwd(),
+    change: async (): Promise<string> => process.cwd(),
+  });
+  if (options.sandboxPolicy !== undefined) {
+    root.provide("sandboxPolicy", options.sandboxPolicy);
+  }
+  await root.plugin(
+    ScriptedShell,
+    options.onExecute === undefined
+      ? { reply: options.reply }
+      : { reply: options.reply, onExecute: options.onExecute },
+  );
+  const shell = root.get("shell");
+  if (shell === undefined) {
+    throw new Error("真装配没有装上 shell 服务");
+  }
+  await root.plugin({ inject: toolBashInject, apply: applyToolBash });
+  const innerRef: { current?: CordisContext | undefined } = {};
+  await root.plugin(
+    Object.assign(
+      (ctx: CordisContext, _config: unknown) => {
+        innerRef.current = ctx;
+      },
+      { inject: ["tools", "subprocess", "workingDirectory", "shellEnv"] },
+    ) as never,
+    {} as never,
+  );
+  const inner = innerRef.current;
+  if (inner === undefined) {
+    throw new Error("真装配没有造出带 inject 的子上下文");
+  }
+  return { root, inner, shell: shell as ScriptedShell };
+}
+
+/** startPrefixHost 的开关（语义见各字段注释；与旧夹具逐条对齐）。 */
+interface PrefixHostOverrides {
+  /** 插件自身的 options；与本层开关重名时后者优先（supported / forms）。 */
+  readonly options?: Partial<PrefixOptions> | undefined;
+  /** 命令 → legacy 回执。默认 {`kind:'foreground'`, exitCode 0, stdout 'ok'}。 */
+  readonly reply?: ((command: string) => unknown) | undefined;
+  /** 子进程面；缺省复用 installFakeRtk 那份，再缺省用真 spawn。 */
+  readonly subprocess?: SubprocessFace | undefined;
+  /** workingDirectory.ensure 的答案；缺省 process.cwd()。 */
+  readonly ensure?: (() => Promise<string>) | undefined;
+  /** 每次命令到达 shell 时先调一次（记账先于转调）。 */
+  readonly onExecute?: ((command: string) => void) | undefined;
+  /** 该 profile 的 bash 定义：null = 没装；对象 = 用它替代全局那份。 */
+  readonly bash?: unknown;
+  readonly log?: ((line: string) => void) | undefined;
+  readonly warn?: ((line: string) => void) | undefined;
+  /** 装配瞬间就存在的 agent（走真 agent/created 之前的那条 readLiveAgents 路）。 */
+  readonly liveAgentIds?: readonly string[] | undefined;
+  /** agents.list 的回答（形状不保证，给非数组用）。 */
+  readonly listedAgents?: readonly unknown[] | undefined;
+  /** 连数组都不保证的服务面替身：原样交给插件，验它的守卫。 */
+  readonly agentsListReply?: unknown;
+  /** bash 只在 agent 作用域注册（全局视图取不到）。 */
+  readonly bashNeedsScope?: boolean | undefined;
+  readonly sandboxPolicy?: unknown;
+  /** 统计收件箱；缺省记进 prefixRecords。 */
+  readonly insights?: PrefixDeps["insights"] | undefined;
+}
+
+/** 半栈对外的那一份：fake 是记账面，withAgent 是「真 agent 作用域里的遮蔽体」。 */
+export interface PrefixHost {
+  readonly fake: FakeBash;
+  readonly installed: boolean;
+  readonly deps: PrefixDeps;
+  readonly subprocess: SubprocessFace;
+  readonly registrations: readonly { readonly agentId: string; readonly definition: ShadedTool }[];
+  withAgent: (id?: string) => ShadedTool;
+  readonly prefixRecords: readonly PrefixRecord[];
+  disposeFiber: () => Promise<void>;
+  visibleShadows: () => readonly ShadedTool[];
+}
+
+/**
+ * 真装配下的 prefix 台架：真 ctx + 真 tool-bash，agent 是真 dsh-scope 作用域。
+ *
+ * 与旧夹具的差别全在「谁定义契约」：旧版自己造 tools.get 与 exec/result，本版让
+ * `ctx.tools.execute` 走完整流水线，插件看到的 exec/result 由宿主产出。
+ */
+export async function startPrefixHost(overrides: PrefixHostOverrides = {}): Promise<PrefixHost> {
+  const subprocess = overrides.subprocess ?? activeFakeRtk?.subprocess ?? fakeSubprocess();
+  /**
+   * 会话工作目录的答案：真 agent 形状问用例给的 `ensure`（缺省读会话头、再缺省 process.cwd()），
+   * 非 agent 形状退到会话头——与 `lib/rewrite-gate.ts` 的 `resolveWorkdir` 两级同源，这样插件算出来
+   * 的 cwd 与 `tool-bash` 实际跑命令的那个目录一致。
+   */
+  const ensure = (agent?: unknown): Promise<string> => {
+    if (isAgentLike(agent) && overrides.ensure !== undefined) {
+      return overrides.ensure();
+    }
+    return Promise.resolve(sessionCwdOf(agent) ?? process.cwd());
+  };
+  const reply =
+    overrides.reply ??
+    ((): unknown => ({ kind: "foreground", exitCode: 0, stdout: { text: "ok" } }));
+  const rig = await mountShellRig({
+    subprocess,
+    ensure,
+    reply,
+    ...(overrides.onExecute === undefined ? {} : { onExecute: overrides.onExecute }),
+    ...(overrides.sandboxPolicy === undefined ? {} : { sandboxPolicy: overrides.sandboxPolicy }),
+  });
+  const prefixRecords: PrefixRecord[] = [];
+  const scopes: { dispose?: () => Promise<void>; rawDispose: () => void | Promise<void> }[] = [];
+  const scopesById = new Map<
+    string,
+    { ctx: CordisContext; rawDispose: () => void | Promise<void> }
+  >();
+  const agentsById = new Map<string, Record<string, unknown>>();
+  const makeAgent = (id: string): Record<string, unknown> => {
+    const key: Record<string, unknown> = { id };
+    const scope = createScope(rig.inner, key);
+    key["ctx"] = scope.ctx;
+    key["session"] = { id: `sess-${id}`, header: { cwd: process.cwd() } };
+    agentsById.set(id, key);
+    scopesById.set(id, { ctx: scope.ctx, rawDispose: scope.rawDispose });
+    scopes.push({ rawDispose: scope.rawDispose });
+    return key;
+  };
+  const liveAgents = (overrides.liveAgentIds ?? []).map((id) => makeAgent(id));
+  /** 插件读到的那份 `agents.list()`：用例可以整表替换（形状不保证的那几条靠它）。 */
+  const listedForPlugin: readonly unknown[] = overrides.listedAgents ?? liveAgents;
+  rig.root.provide("agents", {
+    list: (): unknown => overrides.agentsListReply ?? listedForPlugin,
+  });
+  const messages: Messages = {
+    cargoTestWarnHint: "cargo build / cargo check",
+    spillSummary: "",
+    spillLocation: "{path} {hint}",
+    spillRelaxed: "{omitted} {path} {hint}",
+    spillCapped: "{cap} {omitted} {path} {hint}",
+    usageSummary: "",
+    skillDescription: "",
+    skillPointer: "",
+    usageText: "",
+  };
+  const deps: PrefixDeps = {
+    messages: (): Messages => messages,
+    rewriteCache: createRewriteCache(16),
+    rewrittenCalls: createRewrittenCalls(16),
+    insights: overrides.insights ?? {
+      recordPrefix: (input: PrefixRecord) => {
+        prefixRecords.push(input);
+      },
+    },
+  };
+  const pluginOptions = {
+    enabled: (): boolean => true,
+    forms: (): readonly string[] => ["prefix"],
+    log: overrides.log,
+    warn: overrides.warn,
+    supported: (): boolean => true,
+    denyCommands: (): readonly string[] => [],
+    vitestMaxMajor: 5,
+    rewriteTimeoutMs: 5000,
+    warnHint: (): boolean => true,
+    rewriteHostEnv: (): string => "",
+    ledgerPaths: { historyDb: "", recallDb: "" },
+    ...overrides.options,
+  } as unknown as PrefixOptions;
+  const getTool = (name: string, scope?: unknown): unknown =>
+    (rig.inner.tools.get as unknown as (toolName: string, toolScope?: unknown) => unknown)(
+      name,
+      scope,
+    );
+  const toolsGet = (name: string, scope?: unknown): unknown => {
+    if (name !== "bash") {
+      return getTool(name, scope);
+    }
+    // 「这个 profile 没有 bash」的两种形状（显式 null、只在 agent 作用域注册）都靠查一个
+    // 不存在的名字表达：返回字面量 undefined 会让 consistent-return 把整条函数读成无返回值。
+    if (overrides.bash === null || (overrides.bashNeedsScope === true && scope === undefined)) {
+      return getTool("__rtk:no-bash", scope);
+    }
+    return overrides.bash ?? getTool(name, scope);
+  };
+  const baseline = toolsGet("bash");
+  const registrations: { readonly agentId: string; readonly definition: ShadedTool }[] = [];
+  const listenerNames: string[] = [];
+  let agentCreated: ((payload: { agent: unknown }) => void) | undefined;
+  const facadeOf = (child: CordisContext): PrefixContext =>
+    ({
+      tools: { get: toolsGet },
+      subprocess,
+      workingDirectory: {
+        ensure,
+        get: (): string => process.cwd(),
+        change: (): Promise<string> => Promise.resolve(process.cwd()),
+      },
+      get: (name: string): unknown => rig.root.get(name),
+      on: (name: string, listener: never): void => {
+        listenerNames.push(name);
+        if (name === AGENT_CREATED) {
+          agentCreated = listener as (payload: { agent: unknown }) => void;
+        }
+        child.on(name as never, listener);
+      },
+      effect: ((execute: () => unknown, label?: string) =>
+        child.effect(execute as never, label)) as never,
+      fiber: child.fiber,
+      logger: undefined,
+    }) as unknown as PrefixContext;
+  const prefixFiber = rig.inner.plugin(
+    Object.assign(
+      (child: CordisContext) => {
+        installPrefixShadow(facadeOf(child), pluginOptions, deps);
+      },
+      { inject: ["tools", "subprocess", "workingDirectory", "shellEnv"] },
+    ) as never,
+    {} as never,
+  ) as unknown as { dispose: () => Promise<void> } & PromiseLike<unknown>;
+  // 等装载完成：插件体（installPrefixShadow）是在 inject 满足之后才跑的，不等就会读到
+  // 一个还没挂好监听器的 ctx，「装没装」这类判据也就变成时序问题。
+  await prefixFiber;
+  // 装配期补装（`readLiveAgents` 那一路）不经过 `withAgent`，所以这里按「agent 视图里的 bash
+  // 已经不是装配前那份」反推一份注册账：真 registry 不会告诉我们谁被注册了。
+  for (const listed of liveAgents) {
+    if (isRecord(listed) && typeof listed["id"] === "string") {
+      const { id } = listed;
+      const tool = toolsGet("bash", listed);
+      if (
+        tool !== undefined &&
+        tool !== baseline &&
+        !registrations.some((entry) => entry.agentId === id)
+      ) {
+        registrations.push({ agentId: id, definition: tool as unknown as ShadedTool });
+      }
+    }
+  }
+  const executeBatch = async (
+    input: unknown,
+  ): Promise<{
+    readonly results: readonly {
+      readonly result: { readonly isError: boolean; readonly value?: unknown };
+    }[];
+  }> =>
+    (
+      rig.inner.tools.execute as unknown as (input: unknown) => Promise<{
+        readonly results: readonly {
+          readonly result: { readonly isError: boolean; readonly value?: unknown };
+        }[];
+      }>
+    )(input);
+  const runThroughPipeline = async (
+    agent: Record<string, unknown>,
+    args: unknown,
+    exec: unknown,
+  ): Promise<unknown> => {
+    const extra = isRecord(exec) ? exec : {};
+    const callId = typeof extra["callId"] === "string" ? extra["callId"] : "call-x";
+    const name = typeof extra["name"] === "string" ? extra["name"] : "bash";
+    const signal =
+      extra["signal"] instanceof AbortSignal ? extra["signal"] : new AbortController().signal;
+    const incoming = isRecord(exec) && isRecord(exec["agent"]) ? exec["agent"] : undefined;
+    const batch = await withSessionCwd(agent, sessionCwdOf(incoming), async () =>
+      executeBatch({
+        calls: [
+          { type: "tool-call", id: callId, name, arguments: JSON.stringify(prepareArgs(args)) },
+        ],
+        signal,
+        agent,
+      }),
+    );
+    const [first] = batch.results;
+    if (first === undefined) {
+      throw new Error("真流水线没有交回结果");
+    }
+    return first.result.isError ? first.result : first.result.value;
+  };
+  const withAgent = (id = "s1"): ShadedTool => {
+    const agent = agentsById.get(id) ?? makeAgent(id);
+    const scope = scopesById.get(id);
+    const before = toolsGet("bash", agent);
+    if (scope === undefined) {
+      throw new Error("真装配没有为 agent 留下作用域");
+    }
+    (scope.ctx.emit as unknown as (name: string, payload: unknown) => void)(AGENT_CREATED, {
+      agent,
+    });
+    let resolved = toolsGet("bash", agent);
+    if (resolved === before && before === baseline) {
+      // cordis 的事件本轮已进 waterfall 链，但监听器可能因为门禁没注册；直调那份补一刀，
+      // 这样「该装却没装」只会表现为「没有工具体」，不会静默变成「原生 bash 也能跑」。
+      agentCreated?.({ agent });
+      resolved = toolsGet("bash", agent);
+    }
+    // 判据是「这一格看到的已经不是装配前那份原生 bash」。让路那条用例把遮蔽体本身当
+    // `baseline` 传进来，于是这里仍判成「没注册」——与插件自己的让路分支同一口径。
+    if (resolved === undefined || resolved === baseline) {
+      throw new Error("遮蔽层没有注册任何工具体");
+    }
+    const tool = resolved as ShadedTool & Record<string, unknown>;
+    if (!registrations.some((entry) => entry.agentId === id)) {
+      registrations.push({ agentId: id, definition: tool });
+    }
+    // 返回一份**字段齐全**的视图（name/description/parameters/output 逐字段来自宿主注册的那份）：
+    // 用例要拿它验「继承而不是手抄」，而执行仍走真流水线。
+    return {
+      ...tool,
+      execute: (args: unknown, exec: unknown): Promise<unknown> =>
+        runThroughPipeline(agent, args, exec),
+    };
+  };
+  let disposed = false;
+  const disposeFiber = async (): Promise<void> => {
+    if (disposed) {
+      return;
+    }
+    disposed = true;
+    await prefixFiber.dispose();
+    await Promise.all(
+      scopes.map(async (scope) => {
+        await scope.rawDispose();
+      }),
+    );
+    await rig.root.fiber.dispose();
+  };
+  return {
+    fake: { definition: baseline as Record<string, unknown>, received: rig.shell.received },
+    installed: listenerNames.includes(AGENT_CREATED),
+    deps,
+    subprocess,
+    registrations,
+    withAgent,
+    prefixRecords,
+    disposeFiber,
+    visibleShadows: (): readonly ShadedTool[] => registrations.map((entry) => entry.definition),
+  };
+}
+
+/** 假 spill 存储：记下写进来的原文，回一句固定取回提示（形状与已发布的 dsh-spill-local 同）。 */
 export interface SpillStoreStub {
-  readonly saved: string[];
-  readonly saveText: (input: unknown) => Promise<{
+  readonly saved?: readonly string[];
+  saveText: (input: unknown) => Promise<{
     readonly locator: string;
     readonly bytes: number;
     readonly retrievalHint: string;
   }>;
 }
 
-/** `run` 的第二参：逐字段覆盖回执形状，用来把监听器逼进某一条分支。 */
+/** 造一份 spill 存储替身：记下原文，回固定取回句（locator/bytes/retrievalHint 三件与官方同形）。 */
+export function spillStub(): SpillStoreStub {
+  const saved: string[] = [];
+  return {
+    saved,
+    saveText: (input: unknown) => {
+      const { content } = input as { content?: unknown };
+      const text = typeof content === "string" ? content : "";
+      saved.push(text);
+      return Promise.resolve({
+        locator: `/tmp/dsh-spill/stub/result-${String(saved.length)}.txt`,
+        bytes: Buffer.byteLength(text, "utf8"),
+        retrievalHint: "Use read with offset/limit, or grep this path to search within it.",
+      });
+    },
+  };
+}
+
+/** startPipeHost 的开关。pipe 是假 rtk pipe 的回执；其余几项分别关掉/打开某一条判据。 */
+export interface PipeHostOptions {
+  readonly warns?: string[];
+  readonly infos?: string[];
+  readonly pipe?: { readonly exitCode: number; readonly stdout: string };
+  /** 覆盖 pipe/hook 的子进程面：传 `realSubprocess()` 就让真 `rtk` 去跑（真实 CLI 回路靠这一位）。 */
+  readonly subprocess?: SubprocessFace;
+  readonly forms?: () => readonly string[];
+  readonly enabled?: () => boolean;
+  readonly supported?: () => boolean | undefined;
+  readonly throwInListener?: boolean;
+  readonly filters?: readonly string[];
+  readonly minBytes?: () => number;
+  readonly minGainRatio?: () => number;
+  readonly stdoutCapBytes?: () => number;
+  /** pipe/hook 子进程的期限。缺省 300ms：假回执的测试用它保持秒级；真 rtk 回路必须放宽。 */
+  readonly pipeTimeoutMs?: number;
+  readonly windowHeadLines?: () => number;
+  readonly windowTailLines?: () => number;
+  readonly hook?: () => HookEnv | undefined;
+  readonly hookReply?: string;
+  readonly filtersOf?: () => readonly string[];
+  readonly spillStore?: SpillStoreStub;
+  /** 传这个目录就让官方 LocalSpillStore 真落盘（不传则 spill 面缺席）。 */
+  readonly spillRoot?: string;
+  readonly log?: (line: string) => void;
+  readonly messages?: () => Messages;
+  readonly insights?: PipeDeps["insights"];
+}
+
+/** 单次调用的形状开关：模拟「结果不是本插件产出的」那几种情况。 */
 export interface PipeRunOverrides {
   readonly isError?: boolean;
-  /** 工具名（默认 `bash`；用来钉「别的工具不归本层管」）。 */
   readonly name?: string;
-  /** 覆盖整个 `exec.arguments`（默认 `{command}`；`null` = 这次调用根本没有参数）。 */
   readonly args?: unknown;
   readonly callId?: string;
   readonly command?: string;
   readonly cwd?: string;
   readonly truncated?: boolean;
   readonly spillPath?: string;
-  /** 覆盖 `exec.agent`（默认给一个 `{id:'s1'}` 的 agent 形状；`null` = 这次调用没有会话身份）。 */
   readonly agent?: unknown;
   readonly next?: () => unknown;
-  /** 把 `value` 当**裸字符串回执**（persistent bash 的形状）直接用，不包成 foreground 结构化回执。 */
   readonly bareString?: boolean;
 }
 
-/** B 形态半栈。 */
 export interface PipeHost {
-  readonly run: (
+  run: (
     value: unknown,
     over?: PipeRunOverrides,
   ) => Promise<{
@@ -675,98 +1019,137 @@ export interface PipeHost {
     readonly cwd: string;
   }>;
   readonly rewrittenCalls: RewrittenCalls;
-  /** 本半栈收到的每一条 pipe 记录（`PipeDeps.insights.recordPipe` 的原样入参）。 */
   readonly pipeRecords: readonly PipeRecord[];
-  readonly dispose: () => void;
+  hookCalls: () => number;
+  hookStdin: () => string;
+  hookEnv: () => Record<string, string | undefined>;
+  dispose: () => void;
 }
 
-type PipeHandler = (
-  exec: unknown,
-  result: unknown,
-  next: () => Promise<unknown>,
-) => Promise<unknown>;
+/** B 形态的真装配：只挂流水线需要的三位，工具由夹具定义（它模拟的是「别的工具产出的结果」）。 */
+interface PipeRig {
+  readonly inner: CordisContext;
+  execute: (input: unknown) => Promise<unknown>;
+  dispose: () => Promise<void>;
+}
 
-/**
- * B 形态半栈：只搭 `tools/post-execute` 这一条瀑布。
- *
- * `run(value, over)` 直调监听器，回 `{decision, stdin, piped}`——`stdin` 是喂给假 pipe 的内容
- * （判「压的是全文还是截断头」），`piped` 是 pipe 被 spawn 的次数（判「哪一条前置判据拦住了」）。
- * **不 mock 本包的 `runRtkPipe`/`guardCompressed`**：那样测的是桩，测不出「谁先判、谁后判」。
- */
-/**
- * 裸字符串按 foreground 回执处理：真 bash 的结构化回执就是
- * `{kind:'foreground', stdout:{text}}`，而持久 shell 的裸字符串形状另有 marker
- * （`[Command finished with exit code N]`）。半栈统一走结构化这一支，
- * 测试才能拿一段自然语言式的输出直接喂。
- */
-const asReceipt = (value: unknown): Record<string, unknown> => {
-  if (isRecord(value)) {
-    return value;
+async function mountPipeRig(
+  subprocess: SubprocessFace,
+  defineFixture: (name: string) => Record<string, unknown>,
+): Promise<PipeRig> {
+  const root = new CordisContext();
+  await root.plugin(SystemPrompt);
+  await root.plugin(ToolRuntime);
+  await root.plugin({ inject: nativeExecutorInject, apply: applyNativeExecutor });
+  root.provide("subprocess", subprocess);
+  root.provide("workingDirectory", {
+    ensure: async (): Promise<string> => process.cwd(),
+    get: (): string => process.cwd(),
+    change: async (): Promise<string> => process.cwd(),
+  });
+  const innerRef: { current?: CordisContext | undefined } = {};
+  await root.plugin(
+    Object.assign(
+      (ctx: CordisContext, _config: unknown) => {
+        innerRef.current = ctx;
+      },
+      { inject: ["tools", "subprocess", "workingDirectory"] },
+    ) as never,
+    {} as never,
+  );
+  const inner = innerRef.current;
+  if (inner === undefined) {
+    throw new Error("真装配没有造出带 inject 的子上下文");
   }
-  return typeof value === "string"
-    ? { kind: "foreground", exitCode: 0, stdout: { text: value } }
-    : {};
-};
+  for (const name of ["bash", "read"]) {
+    inner.tools.register(defineFixture(name) as never);
+  }
+  const { tools } = inner;
+  const execute = async (input: unknown): Promise<unknown> =>
+    (tools.execute as unknown as (input: unknown) => Promise<unknown>)(input);
+  return {
+    inner,
+    execute,
+    dispose: async (): Promise<void> => {
+      await root.fiber.dispose();
+    },
+  };
+}
 
+/** 真流水线下的 B 形态台架：工具走官方执行链，post-execute 由真 waterfall 派发。 */
 export function startPipeHost(options: PipeHostOptions = {}): PipeHost {
   const pipe = options.pipe ?? { exitCode: 0, stdout: "" };
   let stdin = "";
   let piped = 0;
   let spawnCwd = "";
-  const handlers = new Map<string, PipeHandler>();
-  const subprocess: SubprocessFace = {
+  let hookStdout = "";
+  let hookCalls = 0;
+  let hookEnv: Record<string, string | undefined> = {};
+  /** 记账盒：包在任何子进程面外面，把「谁被调了几次、喂了什么」这两件事全记下来。 */
+  const observed = (inner2: SubprocessFace): SubprocessFace => ({
     spawn(spec): never {
-      piped += 1;
-      spawnCwd = spec.cwd;
+      const isHook = spec.argv[1] === "hook";
+      if (isHook) {
+        hookCalls += 1;
+        hookEnv = spec.env ?? {};
+      } else {
+        piped += 1;
+        spawnCwd = spec.cwd;
+      }
       const stream = spec.stdio.stdin;
-      // `SubprocessStdinMode` 有三支，这一层只认「给定字节」那一支（另两支没有正文可记）；
-      // `'data' in stream` 已经把 union 收窄到唯一带 data 的分支，无需再判 null。
-      stdin = typeof stream === "object" && "data" in stream ? stream.data : "";
+      const written = typeof stream === "object" && "data" in stream ? stream.data : "";
+      if (isHook) {
+        hookStdout = written;
+      } else {
+        stdin = written;
+      }
+      return inner2.spawn(spec) as never;
+    },
+  });
+  /** 假 rtk：按 `pipe` / `hookReply` 回执，不真起进程。 */
+  const scriptedSubprocess: SubprocessFace = {
+    spawn(spec): never {
+      const isHook = spec.argv[1] === "hook";
       const { promise, resolve } = Promise.withResolvers<{
         readonly exitCode: number | null;
         readonly signal: string | null;
       }>();
-      resolve({ exitCode: pipe.exitCode, signal: null });
+      resolve({ exitCode: isHook ? 0 : pipe.exitCode, signal: null });
+      const text = isHook ? (options.hookReply ?? "") : pipe.stdout;
       return {
         done: promise,
-        collected: { stdout: { readFrom: () => ({ text: pipe.stdout }) } },
+        collected: { stdout: { readFrom: (): { text: string } => ({ text }) } },
         terminate: (): void => {
           // 假 pipe 不真的起进程。
         },
       } as never;
     },
   };
-  const ctx: HostContext = {
-    tools: { get: (): undefined => undefined },
-    subprocess,
-    workingDirectory: { ensure: (): Promise<string> => Promise.resolve(process.cwd()) },
-    get: (name: string): unknown => (name === "spillStore" ? options.spillStore : undefined),
-    on: (name: string, listener: never): void => {
-      handlers.set(name, listener);
-    },
-  } as never;
+  const subprocess = observed(options.subprocess ?? scriptedSubprocess);
   const rewrittenCalls = createRewrittenCalls(16);
   const pipeRecords: PipeRecord[] = [];
   const pipeInsights: PipeDeps["insights"] = options.insights ?? {
-    recordPipe: (input) => {
+    recordPipe: (input: PipeRecord) => {
       pipeRecords.push(input);
     },
   };
   const defaultMessages: Messages = {
     cargoTestWarnHint: "",
     spillSummary: "压缩前的完整输出已另存为文件",
-    // 用真字典里的同一句模板：这里若换一句自造文案，测出来的就不是生产会发的那句。
     spillLocation: "压缩前的完整输出已存为 {path}。{hint}",
     spillRelaxed: "这一段删掉了 {omitted}；完整原文在 {path}。{hint}",
+    spillCapped:
+      "[rtk] 正文超过 {cap} 字节、已省掉 {omitted}（只留尾部）；完整原文在 {path}。{hint}",
+    usageSummary: "",
+    skillDescription: "",
+    skillPointer: "",
+    usageText: "",
   };
   const deps: PipeDeps = {
-    messages: options.messages ?? (() => defaultMessages),
+    messages: options.messages ?? ((): Messages => defaultMessages),
     rewrittenCalls,
-    // 定价口径在夹具里是确定的：`ceil(字节 / 4)`，与宿主 `CHARS_PER_TOKEN = 4` 同密度。
-    // 真装配用的是 `ctx.tokenMeter`（见 lib/tokens.ts），两者只在密度上一致、实现无关。
     tokensOf: (text: string): number => Math.ceil(Buffer.byteLength(text, "utf8") / 4),
-    fs: { readFile: (target) => readFile(target, "utf8") },
-    // 原文没落成库时插件要 warn：桩里收进 `options.warns`，默认丢弃（与真装配的 console 回退同形状）。
+    fs: { readFile: (target: string) => readFile(target, "utf8") },
     log: {
       info: (...line: unknown[]): void => {
         options.infos?.push(line.map(String).join(" "));
@@ -777,28 +1160,94 @@ export function startPipeHost(options: PipeHostOptions = {}): PipeHost {
     },
     insights: pipeInsights,
   };
-  installPostExecuteListener(
-    ctx,
-    {
-      enabled: options.enabled ?? ((): boolean => true),
-      forms: options.forms ?? (() => ["pipe"]),
-      log: options.log,
-      supported: options.supported ?? ((): boolean | undefined => true),
-      // 四处 volatile 都给取值函数：中途改值必须影响下一次 `run`，这是被测的行为本身。
-      enabledFilters: () => options.filtersOf?.() ?? options.filters ?? ["cargo-test", "pytest"],
-      minBytes: () => options.minBytes?.() ?? 16,
-      minGainRatio: () => options.minGainRatio?.() ?? 0.95,
-      stdoutCapBytes: (): number => {
-        if (options.throwInListener === true) {
-          throw new Error("stub-listener-boom");
-        }
-        return options.stdoutCapBytes?.() ?? 64_000;
-      },
-      pipeTimeoutMs: 300,
+  // 真工具脚本：每次调用按 run 刚设的那一格交回 value；失败支靠 throw 造出 isError 结果。
+  const script: { value: unknown; fail: boolean } = { value: undefined, fail: false };
+  const defineFixture = (name: string): Record<string, unknown> => ({
+    name,
+    description: `fixture ${name}`,
+    parameters: { type: "object", properties: {}, additionalProperties: true },
+    output: {
+      schema: {},
+      render: (): { readonly type: "text"; readonly text: string }[] => [
+        { type: "text", text: "fixture" },
+      ],
     },
-    deps,
-  );
-
+    execute: async (): Promise<unknown> => {
+      if (script.fail) {
+        throw new Error("fixture-result-error");
+      }
+      return script.value;
+    },
+  });
+  let captured: unknown;
+  let capturedCallId = "";
+  let downstreamNext: (() => unknown) | undefined;
+  let executeTool: ((input: unknown) => Promise<unknown>) | undefined;
+  let disposeRig: (() => Promise<void>) | undefined;
+  const ready = (async (): Promise<void> => {
+    const rig = await mountPipeRig(subprocess, defineFixture);
+    executeTool = (input: unknown): Promise<unknown> => rig.execute(input);
+    disposeRig = (): Promise<void> => rig.dispose();
+    // 观察者必须在插件之前注册：waterfall 先注册者在外层，才能看到插件最终交回的那一份。
+    rig.inner.on("tools/post-execute", (async (
+      exec: unknown,
+      _result: unknown,
+      next: () => Promise<unknown>,
+    ): Promise<unknown> => {
+      // oxlint-disable-next-line node/callback-return -- async 监听器必须把 next() 的决定原样交回
+      const decision = await next();
+      if (isRecord(exec) && exec["callId"] === capturedCallId) {
+        captured = decision;
+      }
+      return decision;
+    }) as never);
+    const spillStore =
+      options.spillStore ??
+      (options.spillRoot === undefined
+        ? undefined
+        : new LocalSpillStore(rig.inner, { root: options.spillRoot }));
+    installPostExecuteListener(
+      {
+        tools: { get: (): undefined => undefined },
+        subprocess,
+        workingDirectory: { ensure: (): Promise<string> => Promise.resolve(process.cwd()) },
+        get: (name: string): unknown => (name === "spillStore" ? spillStore : undefined),
+        on: (name: never, listener: never): void => {
+          rig.inner.on(name, listener);
+        },
+      } as unknown as HostContext,
+      {
+        enabled: options.enabled ?? ((): boolean => true),
+        forms: options.forms ?? (() => ["pipe"]),
+        log: options.log,
+        supported: options.supported ?? ((): boolean | undefined => true),
+        enabledFilters: () => options.filtersOf?.() ?? options.filters ?? ["cargo-test", "pytest"],
+        minBytes: () => options.minBytes?.() ?? 16,
+        minGainRatio: () => options.minGainRatio?.() ?? 0.95,
+        stdoutCapBytes: (): number => {
+          if (options.throwInListener === true) {
+            throw new Error("stub-listener-boom");
+          }
+          return options.stdoutCapBytes?.() ?? 64_000;
+        },
+        windowHeadLines: () => options.windowHeadLines?.() ?? 50,
+        windowTailLines: () => options.windowTailLines?.() ?? 200,
+        pipeTimeoutMs: options.pipeTimeoutMs ?? 300,
+        hook: () => options.hook?.(),
+      },
+      deps,
+    );
+    rig.inner.on("tools/post-execute", (async (
+      _exec: unknown,
+      _result: unknown,
+      next: () => Promise<unknown>,
+    ): Promise<unknown> => {
+      if (downstreamNext === undefined) {
+        return next();
+      }
+      return downstreamNext();
+    }) as never);
+  })();
   const run = async (
     value: unknown,
     over: PipeRunOverrides = {},
@@ -808,8 +1257,11 @@ export function startPipeHost(options: PipeHostOptions = {}): PipeHost {
     readonly piped: number;
     readonly cwd: string;
   }> => {
+    await ready;
+    if (executeTool === undefined) {
+      throw new Error("真流水线未装配完成");
+    }
     const bare = over.bareString === true && typeof value === "string";
-    const bareValue: unknown = value;
     const base = bare ? {} : asReceipt(value);
     const original = isRecord(base["stdout"]) ? base["stdout"] : {};
     const stdout: Record<string, unknown> = { ...original };
@@ -819,40 +1271,47 @@ export function startPipeHost(options: PipeHostOptions = {}): PipeHost {
     if (over.spillPath !== undefined) {
       stdout["spillPath"] = over.spillPath;
     }
-    const exec: Record<string, unknown> = {
-      callId: over.callId ?? "call-x",
-      name: over.name ?? "bash",
-      arguments:
-        over.args === null ? undefined : (over.args ?? { command: over.command ?? "cargo test" }),
-      agent: over.agent === null ? undefined : (over.agent ?? { id: "s1" }),
+    script.value = bare ? value : { ...base, stdout };
+    script.fail = over.isError === true;
+    const agent: Record<string, unknown> | undefined =
+      over.agent === null
+        ? undefined
+        : ((over.agent as Record<string, unknown> | undefined) ?? { id: "s1" });
+    // `over.cwd` 造的是「会话头里有 cwd」这一态：没有 agent 身份时交出去的也只是一份
+    // 带 `session.header.cwd` 的对象（不带 id），插件那两级兜底才会退到第二级——真宿主里
+    // 也会有这种只有会话头的 exec（例如派发方自己没把 agent 挂上来）。
+    const execAgent: Record<string, unknown> | undefined =
+      over.cwd === undefined ? agent : { ...agent, session: { header: { cwd: over.cwd } } };
+    captured = undefined;
+    capturedCallId = over.callId ?? "call-x";
+    downstreamNext = over.next;
+    const args = over.args === null ? {} : (over.args ?? { command: over.command ?? "cargo test" });
+    await executeTool({
+      calls: [
+        {
+          type: "tool-call",
+          id: capturedCallId,
+          name: over.name ?? "bash",
+          arguments: JSON.stringify(args),
+        },
+      ],
       signal: new AbortController().signal,
-    };
-    // `session.header.cwd` 挂在 **agent** 上（`Agent.session.header`），不是 exec 上：
-    // `resolveWorkdir` 的兜底读的是 `agent.session.header.cwd`。
-    if (over.cwd !== undefined) {
-      exec["agent"] = {
-        ...(exec["agent"] as Record<string, unknown>),
-        session: { header: { cwd: over.cwd } },
-      };
-    }
-    // 裸字符串形状（persistent bash）必须原样以字符串交出去：`extractBody` 的字符串分支
-    // 只认 `typeof value === "string"`，包成对象就变成走结构化那一支了。
-    const result = {
-      isError: over.isError ?? false,
-      value: bare ? bareValue : { ...base, stdout },
-    };
-    const next = async (): Promise<unknown> =>
-      over.next === undefined ? { kind: "accept" } : over.next();
-    const handler = handlers.get("tools/post-execute");
-    const decision = handler === undefined ? undefined : await handler(exec, result, next);
-    return { decision, stdin, piped, cwd: spawnCwd };
+      ...(execAgent === undefined ? {} : { agent: execAgent }),
+    });
+    return { decision: captured, stdin, piped, cwd: spawnCwd };
   };
   return {
     run,
     rewrittenCalls,
     pipeRecords,
+    hookCalls: (): number => hookCalls,
+    hookStdin: (): string => hookStdout,
+    hookEnv: (): Record<string, string | undefined> => hookEnv,
     dispose: (): void => {
-      handlers.clear();
+      void (async (): Promise<void> => {
+        await ready;
+        await disposeRig?.();
+      })();
     },
   };
 }

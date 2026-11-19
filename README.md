@@ -39,6 +39,7 @@
 - [ What it does not provide](#-what-it-does-not-provide)
 - [ Enabling it in dsh](#-enabling-it-in-dsh)
 - [ The two shapes](#-the-two-shapes)
+- [ What the model is told](#-what-the-model-is-told)
 - [ Settings](#-settings)
 - [ Insights](#-insights)
 - [ Support surface](#-support-surface)
@@ -104,9 +105,19 @@ Remove with `dsh plugin --profile web remove @jayyuen66/dsh-rtk`. The package is
 | What the model sees | the compressed output of the rewritten command | the compressed output, original markers and exit code preserved |
 | Failure mode | rewrite rejected → original command runs | filter unusable → original text delivered |
 | Compound commands | rewritten segment by segment: only the output-bearing segment changes | the whole command's output is compressed together |
-| Default | on when `enabled` is on | off (waiting for rtk to cover more shapes) |
+| Default | on when `enabled` is on | off — it changes what the model sees, so it is turned on deliberately |
 
 Compound handling under `prefix` deserves its own paragraph: rtk already rewrites segment by segment (`rewrite_compound` in `discover/registry.rs`), and `cd /tmp && cargo test` measurably becomes `cd /tmp && rtk cargo test`. The plugin splits both the original command and the product into segments, requires the **separator sequence to match one for one**, and runs P1–P4 on **each** segment (a segment that was not touched must be byte-identical; the touched one may only gain a leading `rtk `). Anything else is rejected and the original command runs.
+
+## <img src="https://api.iconify.design/lucide/message-square-text.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> What the model is told
+
+Compression that the model cannot reason about is a trap: an output with its middle cut looks exactly like a short output. So the plugin registers two things when it loads.
+
+**A resident summary** (`rtk-usage`, order 1565) goes into the system prompt. It only carries the three facts that change a decision: reading commands are never compressed, whatever was dropped can be retrieved, and `rtk bypass <cmd>` is the one clean way to keep a command verbatim.
+
+**The full rules** — both compression layers, the exact "never touched" predicate (`isReadingTarget`: a reading command whose operands carry no log extension), the four retrieval markers, and where the data lives — are registered as the virtual skill `rtk`. It shows up in the skill catalog from the first step of every session, so the model can load it by name (`skill({ name: "rtk" })`) when it needs to judge whether an output is an excerpt. The body is not pushed into the context by default; the resident summary plus the catalog line is what every turn pays for.
+
+Both are optional in the same way: `@deepseek-ai/dsh-skill` and `@deepseek-ai/dsh-system-prompt` live in `devDependencies` only (they are host-provided at runtime, and the packages are peers-free because of it). If the skill service is not loaded, only the loadable body is missing — the resident summary still describes the rules.
 
 ## <img src="https://api.iconify.design/lucide/settings.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Settings
 
@@ -115,10 +126,12 @@ Compound handling under `prefix` deserves its own paragraph: rtk already rewrite
 | `enabled` | unset | master switch; until set, on only when a supported rtk is detected |
 | `enabledForms` | `['prefix']` | which shapes may act; takes effect on the next tool call |
 | `denyCommands` | `[]` | extra command patterns never rewritten |
-| `enabledFilters` | `['git-log','git-diff','git-status','grep','find','vitest']` | pipe filters that may act. `git-log`/`git-diff`/`git-status`/`grep`/`find` are the ones command rewriting still hands back in some shapes, so filtering is the only chance left. `vitest` covers `vitest run` and the `pnpm test`/`npm test`/`yarn test` forms **that rtk cannot rewrite** (its rules require an explicit `run`); that path does not call rtk at all — the plugin drops the passing lines itself (`✓`), because rtk's vitest parser yields nothing usable on vitest 5. `cargo-test`/`pytest`/`ctest` stay off by default: they get rewritten to `rtk <cmd>`, so filtering them again would only hit "already rewritten" |
+| `enabledFilters` | `['git-log','git-diff','git-status','grep','find','vitest','window','hook']` | pipe filters that may act. `git-log`/`git-diff`/`git-status`/`grep`/`find` are the ones command rewriting still hands back in some shapes, so filtering is the only chance left. `vitest` covers `vitest run` and the `pnpm test`/`npm test`/`yarn test` forms **that rtk cannot rewrite** (its rules require an explicit `run`); that path does not call rtk at all — the plugin drops the passing lines itself (`✓`), because rtk's vitest parser yields nothing usable on vitest 5. `cargo-test`/`pytest`/`ctest` stay off by default: they get rewritten to `rtk <cmd>`, so filtering them again would only hit "already rewritten". `window` is not an rtk filter either — it is this plugin's own log window: output of `cat <log file>` / `tail` / `journalctl` / `docker logs` / `ps` keeps the first 50 and last 200 lines, the middle goes to spill and the first body line names the retrieval path; `cat src/app.ts`, `head -1000 lib/guard.ts` and `cat notes.txt` are never touched — `.txt` is deliberately not a log extension, because those rows in a real ledger are reports and prose. It is on by default because `cat` accounts for 35.4% of the input tokens in a real ledger, while `rtk read` defaults to `--level none` (byte-for-byte passthrough) and `rtk pipe` has no `cat` tier at all. `hook` is not an rtk filter either: it is `rtk hook claude`'s cleanup chain (ansi / progress / dedup), whose config this plugin generates at `$DSH_HOME/rtk/config/pipeline.toml`. It takes the long outputs above the log window and those nothing else claims (`./build.sh`, `make`), cleaning before windowing (792-line build log 32,550 B → 9,228 B, vs 10,366 B for the window alone); when the chain finds no gain rtk emits zero bytes and the plugin passes the original through, so "on by default" does not mean "always compresses" |
 | `minBytes` | `256` | outputs smaller than this are never compressed |
 | `minGainRatio` | `0.95` | a compression that keeps ≥95% of the bytes is discarded |
-| `stdoutCapBytes` | `64000` | cap on what the filter returns: the compressed body is tail-truncated to this many bytes (the exit marker is kept) |
+| `stdoutCapBytes` | `64000` | hard cap on the compressed body: it is tail-truncated to this many bytes (the exit marker and the truncation notice are kept; without a spill path the compression is dropped rather than emitting an unmarked fragment) |
+| `windowHeadLines` | `50` | Head lines kept by the log window; applies to log-shaped targets only, the same default as rtk `cap`'s `HEAD_LINES` |
+| `windowTailLines` | `200` | Tail lines kept by the log window; failures sit in the last screens, the same default as rtk `cap`'s `TAIL_LINES` |
 | `warnHint` | `true` | append the compile-warning hint after `cargo test` |
 | `rewriteHostEnv` | `''` | value for `RTK_REWRITE_HOST`; empty leaves it unset |
 | `pipeTimeoutMs` | `3000` | restart-only |
@@ -127,7 +140,7 @@ Compound handling under `prefix` deserves its own paragraph: rtk already rewrite
 | `vitestMaxMajor` | `5` | restart-only; command rewriting skips vitest at or above this major (`enabledFilters`' `vitest` path is unaffected — it never calls rtk, so no version gate applies there) |
 | `logFilterMode` | `'off'` | restart-only |
 
-The config schema has 14 fields; 13 of them carry built-in defaults, while `enabled` follows rtk readiness until you set it explicitly. 9 of them volatile — the settings card writes those and they take effect on the next tool call, `enabledForms` included. The remaining **non-volatile deployment values**, 5 of them, are read once at assembly, so changing them needs a restart.
+The config schema has 16 fields; 15 of them carry built-in defaults, while `enabled` follows rtk readiness until you set it explicitly. 11 of them volatile — the settings card writes those and they take effect on the next tool call, `enabledForms` included. The remaining **non-volatile deployment values**, 5 of them, are read once at assembly, so changing them needs a restart.
 
 ## <img src="https://api.iconify.design/lucide/chart-column.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Insights
 
@@ -136,7 +149,7 @@ The left sidebar gains an rtk page. **The two shapes are reported separately and
 - **Tabs**: rewrite (prefix) / compression (pipe).
 - **Window and granularity**: 7 / 30 / 90 days, day / week / month. Empty buckets inside the window are zero-filled, so the x-axis is a stable time axis rather than "the days that happened to have data".
 - **KPI row**: calls, attempts, successes, coverage (pipe) or success rate (prefix), tokens saved, savings rate.
-- **Combination chart**: bars are tokens saved per bucket, the line is the savings or coverage rate on a second axis. **Under three days it falls back to bars** — a line through two points is not a trend, it is a misreading.
+- **Combination chart**: bars are tokens saved per bucket, the line is the savings or coverage rate on a second axis. **Under three buckets with savings it falls back to bars, and says so** — a line through two points is not a trend, it is a misreading. The rate is not lost in that mode: it is in the KPI row and the tables, and the note under the chart points there.
 - **Why this one was not compressed**: the latest event plus the top reasons in the window.
 - **Detail tables**: prefix by the command families of the segments that were actually rewritten, plus working directory; pipe by filter, command family and working directory. A compound command only counts the segments that really got the `rtk` prefix — rtk's own ledger is one row per segment, so `cd x && rtk git diff && rtk cargo test` lands as two rows (`git diff`, `cargo test`) and `cd x` has none.
 - **Suggestions**: low-yield filters, enabled-but-never-hit filters, disabled-but-clearly-compressible filters, low-yield command families.
@@ -148,14 +161,16 @@ Charts use [Apache ECharts](https://echarts.apache.org/) 6.1, **loaded on demand
 
 `engines.dsh` and the `@deepseek-ai/dsh*` peers are `^0.2.2-rc.2` (one line, no union); `@deepseek-ai/schemastery` peer is `^3.19.0`; `engines.node` is `>=24.9.0`.
 
+The test suite and the real rtk circuits run on macOS, Linux and Windows; the `prefix` shape assembles wherever `rtk` is on `PATH`. CI installs rtk 1.2.0 on all three runners from the official release assets (sha256 checked) and runs the real CLI circuits with `DSH_RTK_TEST_MODE=real`.
+
 ## <img src="https://api.iconify.design/lucide/cpu.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> External dependency
 
-rtk 1.2.0 was the version every claim in this repository was measured against. The plugin requires `>= 1.0.0`; below that it reports the version it found and does nothing.
+rtk 1.2.0 was the version every claim in this repository was measured against. The plugin requires `>= 1.0.0`; below that it reports the version it found and does nothing. CI pins 1.2.0 exactly (official release assets, sha256 checked) and runs the real CLI circuits against it.
 
 ## <img src="https://api.iconify.design/lucide/lock.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Data and privacy
 
 - **Command text leaves the host process only as an argv to your own `rtk` binary.** No network call is made by this plugin.
-- **One dataset, and only dsh sessions land in it.** The ledger lives in dsh's own directory: `$DSH_HOME/rtk/history.db` (default `~/.dsh/rtk/history.db`, with `$DSH_HOME` resolved the same way the host resolves it). The plugin prefixes every rewritten `rtk` segment with `RTK_DB_PATH` pointing at that file, so rtk books its rows there and nowhere else — **the rtk you run in your own terminal, and `rtk gain`, are neither affected nor counted here**. Pipe compression counters and the per-event detail of both shapes live in `dsh_*` tables in the same database (SQLite via `node:sqlite`; if it cannot be opened only the statistics are lost, compression is unaffected). rtk never reads those tables and never drops them; kept for 90 days, no lifetime total.
+- **One dataset, and only dsh sessions land in it.** The ledger lives in dsh's own directory: `$DSH_HOME/rtk/history.db` (default `~/.dsh/rtk/history.db`, with `$DSH_HOME` resolved the same way the host resolves it). The plugin prefixes every rewritten `rtk` segment with `RTK_DB_PATH` pointing at that file, so rtk books its rows there and nowhere else. The same prefix carries `RTK_RECALL_DB` at `$DSH_HOME/rtk/recall.db`: rtk folds long output and keeps the elided middle there, so the `[+N hidden: rtk recall <hash>]` pointers in a compressed line resolve inside dsh instead of the global `recall.db` your terminal uses (without the variable rtk writes to that global file — measured: a single `rtk ls -la` under a clean `HOME` creates it). The Insights footer reports how many entries that store holds and how much disk it takes — **the rtk you run in your own terminal, and `rtk gain`, are neither affected nor counted here**. Pipe compression counters and the per-event detail of both shapes live in `dsh_*` tables in the same database (SQLite via `node:sqlite`; if it cannot be opened only the statistics are lost, compression is unaffected). rtk never reads those tables and never drops them; kept for 90 days, no lifetime total.
 - **The plugin's own tables and the page never store full commands, arguments or output.** Only the command family (a template-level name like `cargo test` or `git status`), the working directory, the filter name, the reason and the counters. rtk's tables in that ledger do hold `original_cmd`; the plugin only reads it, and only ever shows its command family — the raw text never reaches the page or the statistics.
 - **Tokens are estimated by the host's `tokenMeter`** (falling back to `bytes / 4` when the service is absent — the same density as rtk's own `estimate_tokens_from_len`). The pipe form measures both ends, so its saving is measured; what prefix saves is the book rtk keeps for "original vs rewritten command", which the plugin only reads rather than estimates itself.
 - **The three sandbox modes differ.** Under `read-only` the prefix savings cannot be read (the ledger is not writable, so the page says so plainly while the rewrite counters stay visible) and pipe statistics keep working; under `workspace-write` the plugin registers `$DSH_HOME/rtk/` as a session-scoped writable root (through its physical path, so a symlinked `/tmp` still lands) and both faces work normally; `danger-full-access` adds no further restriction.
@@ -170,6 +185,7 @@ rtk 1.2.0 was the version every claim in this repository was measured against. T
 - **Approvals see the command you asked for, not the rewritten one.** The shadow rewrites `args.command` inside `execute`, which runs *after* the pipeline's `tools/pre-execute` stage. General command approval (auto-review, danger-guard, Claude-Code-style hooks) therefore evaluates the frozen original arguments (`cargo test`) while the rewritten form (`rtk cargo test`) is what actually runs. Sandbox escalation approval is *inside* `orig.execute` and is preserved untouched, because the plugin never spawns the command itself. The plugin's own safety net in front of that gap is three subtractions — the deny table (only `aws`, where rewriting changes the exit code: a missing `aws` gives 127 natively and 1 through rtk), the P1–P4 rewrite checks (only a prefix may be stripped, no script-runner word may disappear), and the vitest major gate. Danger commands (`rm -rf`, `git push --force`) are not in rtk's rewrite surface at all, so they run unchanged and are reviewed unchanged — danger-guard is not bypassed.
 - **A segment that fails the gate is restored, the rest still gets rewritten.** `cd x && aws s3 ls && cargo test` becomes `cd x && aws s3 ls && rtk cargo test`: rtk rewrites every segment it recognizes, so the plugin puts the gated ones back verbatim instead of handing the whole line back. The gate is evaluated **per segment**, because `cd x && git diff` starts with `cd` — evaluating the whole string would disable the entire table. What the gate no longer does is refuse a command because its output would merely get shorter: `git diff` / `git log` / `ls` / `find` / `grep` are rewritten like anything else, and the compression shapes own the "output got shorter" question.
 - **`rtk pipe` on a failing pytest run keeps the failure names but not always the assertion body.** The guard checks for a success claim and for the failing line; a filter output that passes both but still loses detail is a known limit of the filter, not of the guard. The vitest path avoids that limit by not calling rtk at all (see `enabledFilters` above).
+- **On Windows, rtk's hook state directory is isolated on a best-effort basis.** The plugin sets `HOME` / `USERPROFILE` / `APPDATA` / `LOCALAPPDATA` for `rtk hook`, but rtk resolves its data directory through the Known Folder API, so those variables may be ignored; the pipeline config stays pinned through `RTK_CONFIG_DIR`. The status-file redirect has not been verified on a real Windows machine.
 
 ## <img src="https://api.iconify.design/lucide/wrench.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Development
 
@@ -179,6 +195,8 @@ pnpm run check          # typecheck + lint + build + test + fmt:check
 ```
 
 `pnpm run smoke @jayyuen66/dsh-rtk` from the umbrella workspace mounts the package into a sandbox `DSH_HOME`; the accepted signal is the `--dump-config` layer line.
+
+The integration tests spawn the real `rtk` when it is on `PATH`. Set `DSH_RTK_TEST_MODE=fake` to skip those circuits, or `real` to make a missing rtk a failure; the default `auto` runs them when present and skips them otherwise.
 
 ## Feedback
 

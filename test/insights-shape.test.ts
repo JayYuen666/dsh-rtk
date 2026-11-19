@@ -103,6 +103,7 @@ function response(): Response {
     ],
     legacy: null,
     dataStart: DAY,
+    rtkSelf: { parseFailures: 0, recovered: 0, oversized: 0, recallEntries: 0, recallBytes: 0 },
   };
 }
 

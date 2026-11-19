@@ -26,7 +26,7 @@ export interface Extracted {
 }
 
 /** 前景 bash 回执的末尾 marker；四种形态与 `render.ts` 的 markers 一一对应。 */
-const TOOL_BASH_MARKER =
+export const TOOL_BASH_MARKER =
   /(?:^|\n)(?<marker>\[(?:exit code: -?\d+|killed by signal: [^\]\n]+|timed out after \d+ms|stopped: [^\]\n]+)\])\s*$/u;
 
 /** 持久 shell 回执的末尾 marker（`appendStatusMarker` 拼的那一条）。 */

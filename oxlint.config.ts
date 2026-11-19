@@ -19,6 +19,10 @@ export default definePluginConfig({
     // （是链接时 `$DSH_HOME` 下这份账本其实落在别处，而 reset 会照着它删）——两者都是一次
     // O(1) 元数据操作，不读文件内容。
     { files: ["lib/rtk-ledger.ts"], apis: ["mkdirSync", "lstatSync"] },
+    // lib/rtk-paths.ts 的 prepareHookConfig：装配期把 `pipeline.toml` 写出来，紧接着就要决定
+    // 「清理链开不开」——异步版本会让那条判据跟着一个 Promise 走，而 `apply` 是同步的。
+    // 三个调用都是一次性的小写（一份几百字节的配置 + 两个目录），不读文件内容。
+    { files: ["lib/rtk-paths.ts"], apis: ["mkdirSync", "writeFileSync"] },
   ],
   // 标题前缀免检（`vitest/prefer-lowercase-title` 的 allowedPrefixes）：P1~P4 是
   // 本仓四条后置校验判据的正式编号，不是随手的大写。除此之外只留真正的技术缩写。

@@ -205,6 +205,22 @@ export function formatPct(value: number): string {
   return Number.isInteger(rounded) ? `${String(rounded)}%` : `${rounded.toFixed(1)}%`;
 }
 
+/**
+ * 字节数的短写：`512 B` / `1.2 KB` / `3.4 MB`。
+ *
+ * 用 1024 进制而不是 `formatTokens` 的 1000：这里说的是磁盘上的那份文件，而文件大小在
+ * 界面上与 `ls -lh`、Finder 的读法一致才有意义。`KB` 只保留一位小数、`B` 不带小数。
+ */
+export function formatBytes(value: number): string {
+  if (value >= 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (value >= 1024) {
+    return `${(value / 1024).toFixed(1)} KB`;
+  }
+  return `${String(Math.round(value))} B`;
+}
+
 /** 耗时：一秒钟以下按毫秒，以上按秒并保留一位小数。 */
 export function formatDuration(ms: number): string {
   return ms < 1000 ? `${String(Math.round(ms))} ms` : `${(ms / 1000).toFixed(1)} s`;

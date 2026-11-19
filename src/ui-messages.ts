@@ -58,6 +58,10 @@ export interface UiMessages {
   readonly minGainHint: string;
   readonly stdoutCapLabel: string;
   readonly stdoutCapHint: string;
+  readonly windowHeadLabel: string;
+  readonly windowHeadHint: string;
+  readonly windowTailLabel: string;
+  readonly windowTailHint: string;
   readonly warnHintLabel: string;
   readonly warnHintHint: string;
   readonly hostEnvLabel: string;
@@ -113,7 +117,13 @@ export interface UiMessages {
   readonly emptyWindow: string;
   readonly chartTitle: string;
   readonly chartEmpty: string;
-  /** 有节省的天少于 3 天时那句说明：只在退柱时出现。 */
+  /**
+   * 有节省的桶少于 3 个时那句说明：只在退柱时出现。
+   *
+   * 它必须**同时回答两个问题**：为什么没有折线，以及「节省率去哪了」。第一版只说了前半句，
+   * 于是在真实数据上（有节省的天只有 1~2 天）读者看到柱子却没有比率，第一反应是「比率没画出来」。
+   * 改文案的人不要把它缩回成一句「只画柱子」。
+   */
   readonly chartSparseNote: string;
   /** 「最近一次」那一块的标题：两种形态问的不是同一个问题。 */
   readonly recentTitlePrefix: string;
@@ -168,6 +178,12 @@ export interface UiMessages {
   readonly availPrefixUnreadable: string;
   readonly availPrefixSchema: string;
   readonly availPipeUnavailable: string;
+  /** rtk 自己那本账的对账信号（只在改写形态、账本可读、且数不为 0 时出现）。
+   *  `{failures}`/`{recovered}`/`{rate}` 是解析失败数与回收率；`{oversized}` 是被 `rtk gain`
+   *  排除在汇总之外的大行数；`{entries}`/`{size}` 是取回库的条数与磁盘占用。 */
+  readonly rtkSelfFailures: string;
+  readonly rtkSelfOversized: string;
+  readonly rtkSelfRecall: string;
 }
 
 /** 本包的 locale 命名空间。必须与 `cordis.patch.yml` 的 `id` 一致（`rtk`）。 */
@@ -210,7 +226,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
       "未手动设置时，检测到受支持的 rtk 才默认开启；手动切换会固定选择。打开后按所选形态处理：改写命令，或在结果侧压缩输出；不可用或收益不足时原样放行。",
     formsLabel: "启用的形态",
     formsHint:
-      "prefix = 改写命令（主路径，会 spawn `rtk rewrite`，受 rewriteTimeoutMs 管；Windows 上不装配 prefix）；prefix+pipe = 额外在结果侧按 filter 压缩（B 形态）；pipe = 只压结果、不改命令（绕过拦截 bash 的护栏工具时用）。改完下一次工具调用即生效。",
+      "prefix = 改写命令（主路径，会 spawn `rtk rewrite`，受 rewriteTimeoutMs 管）；prefix+pipe = 额外在结果侧按 filter 压缩（B 形态）；pipe = 只压结果、不改命令（绕过拦截 bash 的护栏工具时用）。改完下一次工具调用即生效。",
     formPrefix: "仅改写命令",
     formPrefixAndPipe: "改写 + 结果压缩",
     formPipeOnly: "仅结果压缩",
@@ -227,6 +243,12 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     minGainHint: "0~1。压缩后必须小于输入的这一比例才采用，否则原样。",
     stdoutCapLabel: "输出上限字节",
     stdoutCapHint: "压缩结果的硬上限，超出按字节截尾。",
+    windowHeadLabel: "日志保留头行数",
+    windowHeadHint:
+      "只对日志类输出（cat 日志文件 / tail / journalctl / docker logs / ps）生效，读源码不动。默认 50 行，与 rtk 的 cap 同值。",
+    windowTailLabel: "日志保留尾行数",
+    windowTailHint:
+      "同上。尾部默认留 200 行——错误几乎总压在最后几屏。省掉的中段会落进 spill，正文首行写出取回路径。",
     warnHintLabel: "cargo test 警告提示",
     warnHintHint:
       "rtk cargo test 不保留编译警告；开着会追加一行提示，指向 cargo build / cargo check。",
@@ -274,7 +296,8 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     emptyWindow: "近 {days} 天没有{form}记录。换一个时间范围，或先跑几条命令。",
     chartTitle: "节省量与比率",
     chartEmpty: "窗口内还没有数据。跑几条命令再回来。",
-    chartSparseNote: "有节省的时间段不足 3 段：只画柱子，不连折线（连起来会像趋势）。",
+    chartSparseNote:
+      "有节省的桶不足 3 个，所以只画柱子、不连折线（两个点连出来的线不是趋势，会当成走势读）。节省率没有丢：上面 KPI 行与下面的明细表里都有，只是没画成线。",
     recentTitlePrefix: "最近一次改写",
     recentTitlePipe: "最近一次压缩",
     whyNone: "窗口内还没有任何一次尝试。",
@@ -324,6 +347,12 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     availPrefixSchema: "dsh 的 rtk 账本形状不认识（rtk 大版本变了？）。",
     availPipeUnavailable:
       "统计库打不开（node:sqlite 不可用或文件损坏）：压缩统计不可用，压缩本身不受影响。",
+    rtkSelfFailures:
+      "rtk 自己解析失败 {failures} 次，其中 {recovered} 次回落到原命令跑成了（回收率 {rate}）。",
+    rtkSelfOversized:
+      "另有 {oversized} 次输入超过 rtk 的汇总上限（7500 token），`rtk gain` 会把这些整行排除在本页之外；本页不排除。",
+    rtkSelfRecall:
+      "被折叠的输出另存了 {entries} 条在 dsh 自己的 recall 库里（占 {size}），尾部指针指向那里。",
   },
   en: {
     cardTitle: "rtk output compression",
@@ -352,7 +381,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
       "Until set explicitly, this follows rtk readiness: on only when a supported rtk is detected; a manual toggle pins the choice. When on, the selected form rewrites commands and/or compresses their output; unavailable or low-gain results pass through unchanged.",
     formsLabel: "Enabled forms",
     formsHint:
-      "prefix = rewrite the command (main path; spawns `rtk rewrite`, bounded by rewriteTimeoutMs, not assembled on Windows); prefix+pipe = also compress output by filter (form B); pipe = compress output only, never rewrite (for setups that block command rewriting). A change takes effect on the next tool call.",
+      "prefix = rewrite the command (main path; spawns `rtk rewrite`, bounded by rewriteTimeoutMs); prefix+pipe = also compress output by filter (form B); pipe = compress output only, never rewrite (for setups that block command rewriting). A change takes effect on the next tool call.",
     formPrefix: "Rewrite only",
     formPrefixAndPipe: "Rewrite + output compression",
     formPipeOnly: "Output compression only",
@@ -371,6 +400,12 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
       "0-1. The compressed result must be below this fraction of the input, else the original is kept.",
     stdoutCapLabel: "Output cap bytes",
     stdoutCapHint: "Hard cap on the compressed result; overflow is trimmed from the tail by bytes.",
+    windowHeadLabel: "Log head lines kept",
+    windowHeadHint:
+      "Applies to log-shaped output only (cat of a log file / tail / journalctl / docker logs / ps); reading source files is never touched. Default 50, the same value rtk's cap uses.",
+    windowTailLabel: "Log tail lines kept",
+    windowTailHint:
+      "Same scope. The tail defaults to 200 lines because failures almost always sit in the last few screens. The omitted middle goes to spill and the first body line names the retrieval path.",
     warnHintLabel: "cargo test warning hint",
     warnHintHint:
       "rtk cargo test drops compile warnings; when on, one hint line points at cargo build / cargo check.",
@@ -423,7 +458,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     chartTitle: "Tokens saved and rate",
     chartEmpty: "No data in this window yet. Run a few commands and come back.",
     chartSparseNote:
-      "Fewer than 3 buckets with savings: bars only, no line (a line would imply a trend that is not there).",
+      "Fewer than 3 buckets have savings, so this is bars only — a line through two points reads as a trend that is not there. The rate is not missing: it is in the KPI row above and in the tables below, just not drawn as a line.",
     recentTitlePrefix: "Latest rewrite",
     recentTitlePipe: "Latest compression",
     whyNone: "No attempt in this window yet.",
@@ -476,5 +511,11 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     availPrefixSchema: "The rtk ledger for dsh has an unrecognised shape (did rtk change majors?).",
     availPipeUnavailable:
       "The stats database cannot be opened (node:sqlite missing or file corrupt): compression stats are unavailable, compression itself is unaffected.",
+    rtkSelfFailures:
+      "rtk itself failed to parse {failures} commands and fell back to running {recovered} of them as-is (recovery rate {rate}).",
+    rtkSelfOversized:
+      "Another {oversized} calls had inputs above rtk's summary cap (7500 tokens); `rtk gain` excludes those rows entirely, this page does not.",
+    rtkSelfRecall:
+      "Folded output is kept in dsh's own recall database: {entries} entries, {size} on disk. The trailing pointers refer to it.",
   },
 };

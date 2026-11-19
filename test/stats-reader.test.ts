@@ -128,7 +128,7 @@ function filterOf(name: string, savedTokens: number): Record<string, unknown> {
   };
 }
 
-/** 一份形状完整的 Insights 回执（十四个字段，含两个可空位）。 */
+/** 一份形状完整的 Insights 回执（十六个字段，含两个可空位与 `rtkSelf` 那三个数）。 */
 function insightsOf(request: InsightsRequest): Record<string, unknown> {
   const today = todayOf(1);
   return {
@@ -159,6 +159,7 @@ function insightsOf(request: InsightsRequest): Record<string, unknown> {
     suggestions: [],
     legacy: null,
     dataStart: null,
+    rtkSelf: { parseFailures: 0, recovered: 0, oversized: 0, recallEntries: 0, recallBytes: 0 },
   };
 }
 

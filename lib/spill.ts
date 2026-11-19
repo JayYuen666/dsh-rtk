@@ -18,10 +18,32 @@ import type { SpillLocator, SpillRef } from "@deepseek-ai/dsh-spill";
  * 逐字节回退与「不切出半个多字节字符」都在 `TextRetainer` 里（含 0 预算、
  * emoji 代理对、中文三字节三档），本函数不重复实现那套宽度表。
  */
-export function capCompressed(text: string, cap: number): string {
+/** 落帽之后还要带回「是否真的切了」与「切掉多少」。 */
+export interface CappedText {
+  readonly text: string;
+  readonly truncated: boolean;
+  readonly omittedBytes: number;
+}
+
+export function capCompressed(text: string, cap: number): CappedText {
   const retainer = new TextRetainer({ kind: "tail", maxBytes: cap });
   retainer.push(text);
-  return retainer.finish().text;
+  const retained = retainer.finish();
+  let textOut = retained.text;
+  const omittedBytes = retained.omittedBytes.kind === "exact" ? retained.omittedBytes.count : 0;
+  // 尾部落帽的起点常常落在某一行的中间。模型看到半行会把它当成完整的一行读，
+  // 而那一行剩下的部分又不在正文里——把首个残行整行丢掉，省下的字节并进 omitted。
+  if (retained.truncated && textOut !== "") {
+    const start = text.length - textOut.length;
+    const startsMidLine = start > 0 && text[start - 1] !== "\n";
+    const firstNewline = textOut.indexOf("\n");
+    if (startsMidLine && firstNewline !== -1) {
+      const dropped = Buffer.byteLength(textOut.slice(0, firstNewline + 1), "utf8");
+      textOut = textOut.slice(firstNewline + 1);
+      return { text: textOut, truncated: true, omittedBytes: omittedBytes + dropped };
+    }
+  }
+  return { text: textOut, truncated: retained.truncated, omittedBytes };
 }
 
 /** 落库结果：宿主 SpillRef 的三个字段，没有别的可取的东西。 */

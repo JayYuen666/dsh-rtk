@@ -38,6 +38,7 @@ import {
   rangeKeyOf,
   recentTitleKeyOf,
   requestOf,
+  rtkSelfLinesOf,
   savedValuesOf,
   savingsValuesOf,
   suggestionLineOf,
@@ -370,6 +371,151 @@ describe("可用性与数据起始", () => {
 
   it("解析不了的值原样透出，不吞成空白", () => {
     assert.equal(dataStartOf({ dataStart: "not-a-date" }), "not-a-date");
+  });
+});
+
+/** 页脚对账用例的最小回执：只带形态、可用性与那三个数。
+ *
+ *  放在模块作用域（而不是 describe 里）：写进 describe 会被
+ *  `unicorn(consistent-function-scoping)` 要求提出去——它没捕获任何外层变量。 */
+function selfOf(
+  form: "prefix" | "pipe",
+  rtkSelf: {
+    readonly parseFailures: number;
+    readonly recovered: number;
+    readonly oversized: number;
+    readonly recallEntries?: number;
+    readonly recallBytes?: number;
+  },
+  prefix: Availability["prefix"] = "ok",
+): {
+  form: "prefix" | "pipe";
+  availability: Availability;
+  rtkSelf: {
+    readonly parseFailures: number;
+    readonly recovered: number;
+    readonly oversized: number;
+    readonly recallEntries: number;
+    readonly recallBytes: number;
+  };
+} {
+  return {
+    form,
+    availability: { ...OK_AVAILABILITY, prefix },
+    rtkSelf: { recallEntries: 0, recallBytes: 0, ...rtkSelf },
+  };
+}
+
+describe("页脚的 rtk 自账对账", () => {
+  it("改写形态：解析失败数与回收率按比值算，两条都出", () => {
+    // 3 次里救回 2 次 → 66.7%；期望值写死，不从 `formatPct` 反推。
+    const lines = rtkSelfLinesOf(
+      selfOf("prefix", { parseFailures: 3, recovered: 2, oversized: 4 }),
+    );
+    assert.deepEqual(
+      lines.map((line) => line.messageKey),
+      ["rtkSelfFailures", "rtkSelfOversized"],
+    );
+    assert.deepEqual(lines[0]?.values, { failures: "3", recovered: "2", rate: "66.7%" });
+    assert.deepEqual(lines[1]?.values, { oversized: "4" });
+  });
+
+  it("两个数都是 0 时一句话都不出（页脚不该被「0 次」撑长）", () => {
+    assert.deepEqual(
+      rtkSelfLinesOf(selfOf("prefix", { parseFailures: 0, recovered: 0, oversized: 0 })),
+      [],
+    );
+  });
+
+  it("只有超限行时只出那一条", () => {
+    const lines = rtkSelfLinesOf(
+      selfOf("prefix", { parseFailures: 0, recovered: 0, oversized: 7 }),
+    );
+    assert.deepEqual(
+      lines.map((line) => line.messageKey),
+      ["rtkSelfOversized"],
+    );
+  });
+
+  it("压缩形态不问这两句：它的分子分母来自插件自己的表", () => {
+    // 给非 0 的数也不许出——这一条正是「口径混起来」的守门人。
+    assert.deepEqual(
+      rtkSelfLinesOf(selfOf("pipe", { parseFailures: 3, recovered: 2, oversized: 4 })),
+      [],
+    );
+  });
+
+  it("账本不可用时不问：读不到不是「一次都没失败」", () => {
+    assert.deepEqual(
+      rtkSelfLinesOf(selfOf("prefix", { parseFailures: 3, recovered: 2, oversized: 4 }, "missing")),
+      [],
+    );
+    assert.deepEqual(
+      rtkSelfLinesOf(
+        selfOf("prefix", { parseFailures: 3, recovered: 2, oversized: 4 }, "readonly"),
+      ),
+      [],
+    );
+  });
+
+  it("recall 那条按条数与磁盘占用出，字节走 1024 进制", () => {
+    // 期望串写死：`2048 B` 必须是 `2.0 KB` 而不是 `2 KB`——`formatBytes` 只在字节档不带小数，
+    // 其余两档都保留一位，否则同一列里 `1 KB` 与 `1.5 KB` 对齐不了。
+    const lines = rtkSelfLinesOf(
+      selfOf("prefix", {
+        parseFailures: 0,
+        recovered: 0,
+        oversized: 0,
+        recallEntries: 12,
+        recallBytes: 2048,
+      }),
+    );
+    assert.deepEqual(
+      lines.map((line) => line.messageKey),
+      ["rtkSelfRecall"],
+    );
+    assert.deepEqual(lines[0]?.values, { entries: "12", size: "2.0 KB" });
+  });
+
+  it("recall 库里一条都没有时不提它（还没折过东西）", () => {
+    // 与上面两条的判据不同：它不看窗口，所以「0 条」是「这个功能还没用过」而不是
+    // 「这一屏没有」——页脚多一句「0 条」只会让人以为漏了配置。
+    assert.deepEqual(
+      rtkSelfLinesOf(
+        selfOf("prefix", {
+          parseFailures: 0,
+          recovered: 0,
+          oversized: 0,
+          recallEntries: 0,
+          recallBytes: 4096,
+        }),
+      ),
+      [],
+    );
+  });
+
+  it("三种信号同时存在时按失败、超限、recall 的次序排", () => {
+    const lines = rtkSelfLinesOf(
+      selfOf("prefix", {
+        parseFailures: 1,
+        recovered: 1,
+        oversized: 2,
+        recallEntries: 3,
+        recallBytes: 1024,
+      }),
+    );
+    assert.deepEqual(
+      lines.map((line) => line.messageKey),
+      ["rtkSelfFailures", "rtkSelfOversized", "rtkSelfRecall"],
+    );
+  });
+
+  it("全部救回时回收率是 100%，不是空串", () => {
+    // `formatPct` 对整数不补小数位（`100` → `100%`），所以这里写 `100%` 而不是 `100.0%`。
+    const lines = rtkSelfLinesOf(
+      selfOf("prefix", { parseFailures: 2, recovered: 2, oversized: 0 }),
+    );
+    assert.deepEqual(lines[0]?.values, { failures: "2", recovered: "2", rate: "100%" });
   });
 });
 

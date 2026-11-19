@@ -17,41 +17,95 @@ const REF = {
 };
 
 describe("capCompressed", () => {
-  it("不超帽时原样返回", () => {
-    assert.equal(capCompressed("abc", 10), "abc");
+  it("不超帽时原样返回，并报告没有截断", () => {
+    assert.deepEqual(capCompressed("abc", 10), {
+      text: "abc",
+      truncated: false,
+      omittedBytes: 0,
+    });
   });
 
-  it("超帽时保留尾部（与 bash 截断语义一致）", () => {
-    assert.equal(capCompressed("abcdef", 3), "def");
+  it("超帽时保留尾部（与 bash 截断语义一致），并记下切掉的字节", () => {
+    assert.deepEqual(capCompressed("abcdef", 3), {
+      text: "def",
+      truncated: true,
+      omittedBytes: 3,
+    });
   });
 
   it("按字节判帽：中文不按字符数算", () => {
     // 「测试测试」= 12 字节；帽 6 字节装得下两个汉字 → 留住末尾的「测试」。
-    assert.equal(capCompressed("测试测试", 6), "测试");
+    assert.deepEqual(capCompressed("测试测试", 6), {
+      text: "测试",
+      truncated: true,
+      omittedBytes: 6,
+    });
   });
 
-  it("帽为 0 时返回空串", () => {
-    assert.equal(capCompressed("abc", 0), "");
+  it("帽为 0 时正文为空，但把原文全记进 omitted", () => {
+    assert.deepEqual(capCompressed("abc", 0), {
+      text: "",
+      truncated: true,
+      omittedBytes: 3,
+    });
   });
 
-  it("空输入返回空串", () => {
-    assert.equal(capCompressed("", 10), "");
+  it("空输入不算截断", () => {
+    assert.deepEqual(capCompressed("", 10), {
+      text: "",
+      truncated: false,
+      omittedBytes: 0,
+    });
   });
 
   it("emoji 不切坏代理对", () => {
     // 每个 emoji 是 4 字节 UTF-8 / 2 个 UTF-16 码元；帽 8 只能装两个。
-    assert.equal(capCompressed("😀😀😀", 8), "😀😀");
+    assert.deepEqual(capCompressed("😀😀😀", 8), {
+      text: "😀😀",
+      truncated: true,
+      omittedBytes: 4,
+    });
   });
 
   it("帽落在字符中间时整个字符都不留（不产出半个字符）", () => {
     // 「测」是 3 字节；帽 2 装不下任何一个完整字符。
-    assert.equal(capCompressed("测", 2), "");
+    assert.deepEqual(capCompressed("测", 2), {
+      text: "",
+      truncated: true,
+      omittedBytes: 3,
+    });
   });
 
   it("一字节与两字节字符的宽度各自算对", () => {
     // 「é」是 U+00E9，UTF-8 占 2 字节；「a」占 1 字节。
-    assert.equal(capCompressed("aé", 3), "aé");
-    assert.equal(capCompressed("aé", 2), "é");
+    assert.deepEqual(capCompressed("aé", 3), {
+      text: "aé",
+      truncated: false,
+      omittedBytes: 0,
+    });
+    assert.deepEqual(capCompressed("aé", 2), {
+      text: "é",
+      truncated: true,
+      omittedBytes: 1,
+    });
+  });
+
+  it("起点落在行中间时，把首个残行整行丢掉（模型不会把半行当整行读）", () => {
+    // 19 字节；帽 12 的尾部是「ravo\ncharlie」，起点在 bravo 中间。
+    assert.deepEqual(capCompressed("alpha\nbravo\ncharlie", 12), {
+      text: "charlie",
+      truncated: true,
+      omittedBytes: 12,
+    });
+  });
+
+  it("起点正好是行首时，不白丢一整行", () => {
+    // 帽 13 的尾部从 bravo 的行首开始（bravo\ncharlie），第一行是完整的，保留。
+    assert.deepEqual(capCompressed("alpha\nbravo\ncharlie", 13), {
+      text: "bravo\ncharlie",
+      truncated: true,
+      omittedBytes: 6,
+    });
   });
 });
 

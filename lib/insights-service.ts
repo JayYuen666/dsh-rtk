@@ -25,6 +25,7 @@ import type {
   InsightsResponse,
   LastEvent,
   LegacySnapshot,
+  RtkSelf,
   SeriesPoint,
   StatsOverview,
   Suggestion,
@@ -131,8 +132,32 @@ export interface InsightsService {
 
 /** 空账本回执：四种非 ok 态共用同一份骨架。 */
 function emptyLedger(availability: PrefixLedgerResult["availability"]): PrefixLedgerResult {
-  return { availability, days: [], commands: [], workdirs: [], dataStart: null };
+  return {
+    availability,
+    days: [],
+    commands: [],
+    workdirs: [],
+    dataStart: null,
+    failures: { total: 0, recovered: 0 },
+    oversized: 0,
+    recall: { entries: 0, bytes: 0 },
+  };
 }
+
+/**
+ * pipe 形态的那一格：**整页不读 rtk 的汇总**。
+ *
+ * 不是「读不到」而是「口径不同」：结果压缩的分子分母来自插件自己的 `dsh_pipe_*` 表，
+ * rtk 那句「本页比 `rtk gain` 多算了 N 行」说的是 `commands` 表，与这一屏无关。给 0 而不是
+ * 省掉这一格，是为了让契约只有一种形状（客户端不必按形态分支判断字段在不在）。
+ */
+const NO_RTK_SELF: RtkSelf = {
+  parseFailures: 0,
+  recovered: 0,
+  oversized: 0,
+  recallEntries: 0,
+  recallBytes: 0,
+};
 
 /** 账本读面的结果：空回执 + 「是不是因为只读才空」。 */
 interface LedgerRead {
@@ -724,6 +749,7 @@ function pipeResponseOf(shared: SharedRead): InsightsResponse {
     ],
     legacy,
     dataStart: store === undefined ? null : pipeDataStart(store),
+    rtkSelf: NO_RTK_SELF,
   };
 }
 
@@ -760,6 +786,13 @@ function prefixResponseOf(shared: SharedRead): InsightsResponse {
     suggestions: prefixCommandSuggestions(families, request.rangeDays),
     legacy,
     dataStart: ledger.dataStart,
+    rtkSelf: {
+      parseFailures: ledger.failures.total,
+      recovered: ledger.failures.recovered,
+      oversized: ledger.oversized,
+      recallEntries: ledger.recall.entries,
+      recallBytes: ledger.recall.bytes,
+    },
   };
 }
 

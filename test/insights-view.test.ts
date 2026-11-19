@@ -8,6 +8,7 @@ import type { SeriesPoint } from "../lib/insights-shape.ts";
 import {
   bucketLabel,
   chartGeometry,
+  formatBytes,
   formatDuration,
   formatPct,
   formatTokens,
@@ -266,6 +267,17 @@ describe("格式化", () => {
     assert.equal(formatPct(75), "75%");
     assert.equal(formatPct(62.5), "62.5%");
     assert.equal(formatPct(33.333), "33.3%");
+  });
+
+  it("字节：1024 进制，B 不带小数、KB/MB 各留一位", () => {
+    // 与 `formatTokens` 的 1000 进制故意不同：这里说的是磁盘上的文件，读法要与 `ls -lh` 一致。
+    assert.equal(formatBytes(0), "0 B");
+    assert.equal(formatBytes(512), "512 B");
+    assert.equal(formatBytes(1023), "1023 B");
+    assert.equal(formatBytes(1024), "1.0 KB");
+    assert.equal(formatBytes(1536), "1.5 KB");
+    assert.equal(formatBytes(1024 * 1024), "1.0 MB");
+    assert.equal(formatBytes(3.4 * 1024 * 1024), "3.4 MB");
   });
 
   it("耗时：一秒以下按毫秒取整，以上按秒留一位", () => {

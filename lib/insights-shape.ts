@@ -237,6 +237,30 @@ export const LegacySnapshotSchema = z
   .nullable();
 export type LegacySnapshot = z.infer<typeof LegacySnapshotSchema>;
 
+/**
+ * rtk 自己那本账的对账信号（页脚用）。
+ *
+ * 只挂在 prefix 形态上：另外两种形态的分子分母来自插件自己的表，与 rtk 的汇总无关。
+ *
+ * - `parseFailures` / `recovered`：rtk 没认出命令、退回原样执行的那本账
+ *   （`parse_failures` 表）。rtk 自己的 `rtk gain -F` 报的也是这两个数 + 一个回收率。
+ * - `oversized`：窗口内 input 超 rtk 展示上限（7,500 tokens）的行数。**本页不排除这类行**
+ *   （它是全量汇总），而 `rtk gain` 会整行排除，于是同一天可能出现两个不同的节省率——
+ *   这一位存在的唯一目的就是让页脚说清「差在哪几行」，而不是让读者去猜。
+ * - `recallEntries` / `recallBytes`：`recall.db` 的体检数（不是窗口内的，那个库由 rtk 按
+ *   保留天数与条数上限整库淘汰）。它是**取回通道**：被折叠的中段存在那里，输出尾巴留
+ *   `[+N hidden: rtk recall <hash>]`。显示它只为一件事——让人知道有个库在悄悄长大、去哪个
+ *   目录找它。字节数取文件大小，不是 `SUM(byte_size)`（后者是压缩前长度）。
+ */
+export const RtkSelfSchema = z.object({
+  parseFailures: z.int().nonnegative(),
+  recovered: z.int().nonnegative(),
+  oversized: z.int().nonnegative(),
+  recallEntries: z.int().nonnegative(),
+  recallBytes: z.int().nonnegative(),
+});
+export type RtkSelf = z.infer<typeof RtkSelfSchema>;
+
 /** 页面回执。 */
 export const InsightsResponseSchema = z.object({
   form: InsightsFormSchema,
@@ -255,6 +279,8 @@ export const InsightsResponseSchema = z.object({
   legacy: LegacySnapshotSchema,
   /** 数据覆盖的起始日；空库时 `null`。 */
   dataStart: z.string().nullable(),
+  /** rtk 那本账的对账信号；pipe 形态恒给全 0（它那两档不读 rtk 的汇总）。 */
+  rtkSelf: RtkSelfSchema,
 });
 export type InsightsResponse = z.infer<typeof InsightsResponseSchema>;
 

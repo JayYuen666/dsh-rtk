@@ -1,4 +1,4 @@
-// host.ts 的配置面与默认导出：十四项终表、解析语义、依赖清单与「不做」清单。
+// host.ts 的配置面与默认导出：十六项终表、解析语义、依赖清单与「不做」清单。
 //
 // 期望值全部写死在这里，不从 `configSchema({})` 反推——从实现派生的期望值在实现与期望
 // 一起改错时仍会全绿，那就不是门禁了。
@@ -18,20 +18,32 @@ import assert from "node:assert/strict";
 import type { HostContext } from "../host.ts";
 import plugin, { Config as configSchema, sandboxModeOf } from "../host.ts";
 
-/** spec 的十四项终表（九个 volatile + 五个部署级）。 */
+/** 十六项终表（十一个 volatile + 五个部署级）。 */
 const DEFAULTS = {
   enabled: true,
   // 数组与联合字面量都写显式类型：schema 的输入面要的是可变数组与那条联合，
   // 而 `as const` 交出来的是只读元组（类型上装不进去，运行期却没有区别）。
   enabledForms: ["prefix"] as ("prefix" | "pipe")[],
   denyCommands: [] as string[],
-  // 默认集合是「前缀层交不出去的那几条」+ `vitest`：前三项会被 C 形态先改写成 `rtk <cmd>`，
-  // 结果侧再压只会命中 `already-rewritten`；而 `vitest` 的三种 test 形态（`pnpm/npm/yarn test`）
-  // 是 rtk 的规则**改不动**的（它要求显式 `run`，实测 rc=1），压缩由本包在内存里删 `✓` 行完成。
-  enabledFilters: ["git-log", "git-diff", "git-status", "grep", "find", "vitest"] as string[],
+  // 默认集合是「前缀层交不出去的那几条」+ `vitest` + `window` + `hook`：前三项会被 C 形态先改写成
+  // `rtk <cmd>`，结果侧再压只会命中 `already-rewritten`；`vitest` 的三种 test 形态
+  // （`pnpm/npm/yarn test`）是 rtk 的规则**改不动**的（它要求显式 `run`，实测 rc=1），压缩由本包
+  // 在内存里删 `✓` 行完成；`window` 与 `hook` 则分别接管日志类目标与「谁都没接的长输出」。
+  enabledFilters: [
+    "git-log",
+    "git-diff",
+    "git-status",
+    "grep",
+    "find",
+    "vitest",
+    "window",
+    "hook",
+  ] as string[],
   minBytes: 256,
   minGainRatio: 0.95,
   stdoutCapBytes: 64_000,
+  windowHeadLines: 50,
+  windowTailLines: 200,
   warnHint: true,
   rewriteHostEnv: "",
   pipeTimeoutMs: 3000,
@@ -41,7 +53,7 @@ const DEFAULTS = {
   logFilterMode: "off" as "off" | "on",
 };
 
-/** 九个 volatile 字段名（卡片可改的那一批）。 */
+/** 十一个 volatile 字段名（卡片可改的那一批）。 */
 const VOLATILE_KEYS = [
   "enabled",
   "enabledForms",
@@ -50,6 +62,8 @@ const VOLATILE_KEYS = [
   "minBytes",
   "minGainRatio",
   "stdoutCapBytes",
+  "windowHeadLines",
+  "windowTailLines",
   "warnHint",
   "rewriteHostEnv",
 ] as const;
@@ -69,7 +83,7 @@ function readField(parsed: Record<string, unknown>, key: string): unknown {
 }
 
 describe("config 默认值", () => {
-  it("十四项逐项等于终表", () => {
+  it("十六项逐项等于终表", () => {
     const parsed = configSchema(DEFAULTS) as unknown as Record<string, unknown>;
     for (const [key, want] of Object.entries(DEFAULTS)) {
       assert.deepEqual(readField(parsed, key), want, key);
@@ -87,6 +101,8 @@ describe("config 默认值", () => {
       "grep",
       "find",
       "vitest",
+      "window",
+      "hook",
     ]);
     assert.equal(readField(parsed, "rewriteHostEnv"), "");
     assert.equal(readField(parsed, "vitestMaxMajor"), 5);
@@ -217,7 +233,9 @@ describe("默认导出", () => {
       plugin.inject.toSorted(),
       // `storageDomain` 不在其中：Insights 之后统计落在两本自有账本上，宿主的 storage domain
       // 只用来读一次旧累计账本做迁移，读不到就跳过——它缺席不该让整层装不起来。
-      ["settings", "subprocess", "tools", "workingDirectory"].toSorted(),
+      // `systemPrompt` 在 0.2.2 加入：常驻摘要段（`rtk-usage`，order 1565）经它注册。
+      // `skills` **不在**其中：skill 只是全文的载体，服务缺席时摘要段照旧生效。
+      ["settings", "subprocess", "tools", "workingDirectory", "systemPrompt"].toSorted(),
     );
   });
 
@@ -225,9 +243,10 @@ describe("默认导出", () => {
     assert.equal(plugin.Config, configSchema);
   });
 
-  it("不注册模型工具、不注入 systemPrompt、不挂 guard（spec 的「不做」清单）", () => {
+  it("不注册模型工具、不挂 guard（spec 的「不做」清单）", () => {
+    // `systemPrompt` 已不在「不做」里：0.2.2 起本包注册一段常驻摘要（见 `lib/skill.ts`），
+    // 但那一位是**插件成员**（宿主读它来注入服务），不是「注册模型工具」。
     assert.equal(Object.hasOwn(plugin, "tools"), false);
-    assert.equal(Object.hasOwn(plugin, "systemPrompt"), false);
     assert.equal(Object.hasOwn(plugin, "guard"), false);
   });
 

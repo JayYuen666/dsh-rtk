@@ -4,11 +4,28 @@
 // 压缩结果的取舍留给上层护栏——所以这里的判据都落在「进程怎么起、回执怎么折」上。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
-import { RTK_PIPE_ENV, RTK_REWRITE_ENV, runRtkPipe, runRtkRewrite } from "../lib/cli.ts";
+import {
+  RTK_PIPE_ENV,
+  RTK_REWRITE_ENV,
+  runRtkHook,
+  runRtkPipe,
+  runRtkRewrite,
+} from "../lib/cli.ts";
 import type { SubprocessFace, SubprocessFaceHandle } from "../lib/cli.ts";
 import type { SubprocessSpawnSpec } from "@deepseek-ai/dsh-subprocess";
 
 const CARGO_TEST = "cargo test";
+const PAYLOAD = '{"hook_event_name":"PostToolUse"}';
+const WRAPPED_OUTPUT =
+  '{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":{"stdout":"x"}}}';
+const HOOK_ENV = {
+  RTK_CONFIG_DIR: "/tmp/cfg",
+  RTK_DB_PATH: "/tmp/hook.db",
+  RTK_RECALL_DB: "/tmp/recall.db",
+  HOME: "/tmp/home",
+  USERPROFILE: "/tmp/home",
+  RTK_TELEMETRY_DISABLED: "1",
+} as const;
 const RTK_CARGO_TEST = "rtk cargo test";
 const TMP = "/tmp";
 
@@ -109,6 +126,66 @@ function rewriteOpts(
   };
 }
 
+function hookOpts(face: SubprocessFace, timeoutMs = 3000): Parameters<typeof runRtkHook>[0] {
+  return { subprocess: face, stdin: PAYLOAD, cwd: TMP, timeoutMs, env: HOOK_ENV };
+}
+
+describe("runRtkHook", () => {
+  it("argv 是 rtk hook claude，环境只交调用方给的那几个键", async () => {
+    const fake = fakeFace({ exitCode: 0, signal: null }, WRAPPED_OUTPUT);
+
+    const result = await runRtkHook(hookOpts(fake.face));
+
+    assert.deepEqual(result, { ok: true, stdout: WRAPPED_OUTPUT });
+    const [spec] = fake.calls;
+    assert.ok(spec !== undefined);
+    assert.deepEqual(spec.argv, ["rtk", "hook", "claude"]);
+    // 环境**整份**由调用方算好（`hookEnvOf`）：这一层不再自己拼 pipe/rewrite 那两套，
+    // 否则「哪几个变量生效」会散在两个文件里。
+    assert.deepEqual(spec.env, HOOK_ENV);
+    assert.deepEqual(spec.stdio.stdin, { data: PAYLOAD });
+    assert.equal(spec.graceMs, 3000);
+  });
+
+  it("空 stdout 判失败：那是「没东西可改」，不是「压成了空」", async () => {
+    // 这一条是承重的。把空串当成功会让整段输出从模型眼前消失——而 rtk 在最常见的两种
+    // 情况下正是零字节：`never_worse` 判无收益、`min_size` 没过。
+    const fake = fakeFace({ exitCode: 0, signal: null }, "");
+
+    assert.deepEqual(await runRtkHook(hookOpts(fake.face)), { ok: false, stdout: "" });
+  });
+
+  it("只有空白也判失败", async () => {
+    const fake = fakeFace({ exitCode: 0, signal: null }, "  \n\t\n");
+
+    assert.deepEqual(await runRtkHook(hookOpts(fake.face)), { ok: false, stdout: "" });
+  });
+
+  it("退出码非 0 判失败（配置写坏时 rtk 仍可能回 0，但别的错要判出来）", async () => {
+    const fake = fakeFace({ exitCode: 2, signal: null }, WRAPPED_OUTPUT);
+
+    assert.deepEqual(await runRtkHook(hookOpts(fake.face)), { ok: false, stdout: "" });
+  });
+
+  it("被信号杀掉判失败", async () => {
+    const fake = fakeFace({ exitCode: null, signal: "SIGTERM" }, WRAPPED_OUTPUT);
+
+    assert.deepEqual(await runRtkHook(hookOpts(fake.face)), { ok: false, stdout: "" });
+  });
+
+  it("spawn reject（rtk 没装）判失败", async () => {
+    const face = brokenFace();
+
+    assert.deepEqual(await runRtkHook(hookOpts(face)), { ok: false, stdout: "" });
+  });
+
+  it("超时 abort 判失败", async () => {
+    const result = await runRtkHook(hookOpts(stalledFace(), 5));
+
+    assert.equal(result.ok, false);
+  });
+});
+
 describe("runRtkPipe", () => {
   it("argv / env 四枚 / stdin / graceMs", async () => {
     const fake = fakeFace({ exitCode: 0, signal: null }, "cargo test: 1 passed");
@@ -194,6 +271,7 @@ describe("runRtkRewrite", () => {
       RTK_REWRITE_HOST: "openclaw",
       RTK_DB_PATH: undefined,
       DSH_RTK_DB_PATH: undefined,
+      RTK_RECALL_DB: undefined,
     });
   });
 

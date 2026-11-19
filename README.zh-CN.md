@@ -39,6 +39,7 @@
 - [它不提供什么](#-它不提供什么)
 - [在 dsh 里启用](#-在-dsh-里启用)
 - [两种形态](#-两种形态)
+- [模型看到什么说明](#-模型看到什么说明)
 - [设置项](#-设置项)
 - [洞察页](#-洞察页)
 - [支持面](#-支持面)
@@ -51,7 +52,7 @@
 
 ## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 它做什么
 
-- **两种压缩形态；总开关跟随 rtk 就绪状态。** `prefix` 按 agent 遮蔽 `bash`、先过一遍 `rtk rewrite`；`pipe` 把已完成的 shell 结果喂给 `rtk pipe -f <filter>`，只替换模型可见的那段文本。未显式设置 `enabled` 时，检测到受支持的 rtk 才默认开启；`prefix` 是默认形态，`pipe` 需要显式打开。
+- **两种压缩形态；总开关跟随 rtk 就绪状态。** `prefix` 按 agent 遮蔽 `bash`、先过一遍 `rtk rewrite`；`pipe` 把已完成的 shell 结果喂给 `rtk pipe -f <filter>`，只替换模型可见的那段文本。未显式设置 `enabled` 时，检测到受支持的 rtk 才默认开启；`prefix` 是默认形态；`pipe` 改的是模型看到的输出，所以需要显式打开。
 - **复合命令逐段改写。** `cd <仓库> && cargo test` 这种多仓开发时最常见的形状会被拆成独立段，只换掉承载输出的那一段（`cd <仓库> && rtk cargo test`）；拆不开的构造（命令替换、重定向、后台 `&`、引号不配对）仍然整条原样执行。
 - **不值得压的一律不压。** 小于 `minBytes`（256）的输出、压缩率不足 `minGainRatio`（0.95）的改写，全部原样放行。插件不报它没做到的节省。
 - **失败用例保住原文。** 护栏会拒绝任何丢掉失败断言、file:line 或退出码 marker 的压缩——一条看不出为什么挂的失败比不压缩更糟。
@@ -104,9 +105,19 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 | 模型看到什么 | 改写后命令的压缩输出 | 压缩输出，原始 marker 与退出码保持不变 |
 | 失败形态 | 改写被拒 → 原命令执行 | filter 不可用 → 原文送达 |
 | 复合命令 | 逐段改写：只换承载输出的那一段 | 整条命令的输出一起压 |
-| 默认 | `enabled` 打开时启用 | 关闭（等 rtk 覆盖更多形态） |
+| 默认 | `enabled` 打开时启用 | 关闭——它改的是模型看到的输出，交给人显式打开 |
 
 `prefix` 的复合命令处理值得单独说一句：rtk 自己就是逐段改写的（`discover/registry.rs` 的 `rewrite_compound`），实测 `cd /tmp && cargo test` 的产物是 `cd /tmp && rtk cargo test`。插件把原命令与产物各拆成若干段，要求**分隔符序列逐一相同**、并让每一段各自通过 P1~P4 校验（没被动过的段逐字符不变，被动过的那段只允许「在开头多一个 `rtk `」）。改成别的形状一律拒绝、原命令执行。
+
+## <img src="https://api.iconify.design/lucide/message-square-text.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 模型看到什么说明
+
+压了却不告诉模型，就是给它下套：中段被切掉的输出，看起来与「本来就短」的输出一模一样。所以插件装载时会注册两样东西。
+
+**一段常驻摘要**（`rtk-usage`，order 1565）进 system prompt。它只带三条会改变判断的事实：读文件的命令从不被压、被压掉的东西都取回得到、`rtk bypass <cmd>` 是唯一干净的保留写法。
+
+**口径全文**——两档压缩各做什么、「一律不碰」的确切判据（`isReadingTarget`：读文件的命令 + 操作数不带日志扩展名）、四行取回标记、数据落在哪——注册成虚拟 skill `rtk`。它从会话第一步就出现在 skill 目录里，模型判断「这份输出是不是残件」时可按名加载（`skill({ name: "rtk" })`）。正文不会被默认塞进上下文：每轮付的只是常驻摘要那一小段与目录里的一行。
+
+两者各自可选：`@deepseek-ai/dsh-skill` 与 `@deepseek-ai/dsh-system-prompt` 只进 `devDependencies`（运行期由宿主提供，因而不进 peer）。skill 服务没装载时只是少一份可加载的正文，常驻摘要照旧把规则说清。
 
 ## <img src="https://api.iconify.design/lucide/settings.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 设置项
 
@@ -115,10 +126,12 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 | `enabled` | 未设置 | 总开关；未设置时检测到受支持的 rtk 才默认开启 |
 | `enabledForms` | `['prefix']` | 允许生效的形态；下一次工具调用即生效 |
 | `denyCommands` | `[]` | 额外永不被改写的命令模式 |
-| `enabledFilters` | `['git-log','git-diff','git-status','grep','find','vitest']` | 允许生效的 pipe filter。`git-log`/`git-diff`/`git-status`/`grep`/`find` 是命令改写仍有形态交不回来的那几条，结果压缩是唯一机会。`vitest` 覆盖 `vitest run` 与 **rtk 改不动**的 `pnpm test`/`npm test`/`yarn test`（rtk 的规则要求显式 `run`）；这一路完全不调 rtk——由插件自己删掉通过行（`✓`），因为 rtk 的 vitest 解析器在 vitest 5 上拿不到可用结果。`cargo-test`/`pytest`/`ctest` 默认关闭：它们会被改写成 `rtk <cmd>`，再让 pipe 压一遍只会命中「已被改写过」 |
+| `enabledFilters` | `['git-log','git-diff','git-status','grep','find','vitest','window','hook']` | 允许生效的 pipe filter。`git-log`/`git-diff`/`git-status`/`grep`/`find` 是命令改写仍有形态交不回来的那几条，结果压缩是唯一机会。`vitest` 覆盖 `vitest run` 与 **rtk 改不动**的 `pnpm test`/`npm test`/`yarn test`（rtk 的规则要求显式 `run`）；这一路完全不调 rtk——由插件自己删掉通过行（`✓`），因为 rtk 的 vitest 解析器在 vitest 5 上拿不到可用结果。`cargo-test`/`pytest`/`ctest` 默认关闭：它们会被改写成 `rtk <cmd>`，再让 pipe 压一遍只会命中「已被改写过」。`window` 也不是 rtk 的 filter，而是本包自己的日志窗口：`cat 日志文件` / `tail` / `journalctl` / `docker logs` / `ps` 这类输出留头 50 行 + 尾 200 行，中段落进 spill、正文首行写出取回路径；`cat src/app.ts`、`head -1000 lib/guard.ts`、`cat notes.txt` 一律不动——`.txt` 故意不算日志扩展名，真实账本里那些 `.txt` 是报告与正文。选它的理由是 `cat` 在真实账本里占 35.4% 的输入 token，而 `rtk read` 默认 `--level none` 是逐字节透传、`rtk pipe` 根本没有 `cat` 这一档。`hook` 同样不是 rtk filter，而是 `rtk hook claude` 的那条清理链（ansi 清色 / progress 折进度帧 / dedup 折重复行），配置由本包生成在 `$DSH_HOME/rtk/config/pipeline.toml`：它接管「日志窗口之上」与「谁都没接的长输出」（`./build.sh`、`make` 这类），先清理再切头尾（792 行构建日志 32,550 B → 9,228 B，只切窗口是 10,366 B）；链判断无收益时 rtk 回 0 字节，插件按「没变」放行，所以默认开着不等于默认会压 |
 | `minBytes` | `256` | 小于它的输出永不压缩 |
 | `minGainRatio` | `0.95` | 压缩后仍占 ≥95% 字节的，丢弃 |
-| `stdoutCapBytes` | `64000` | filter 回执的字节上限：压缩后的正文截尾到这个字节数（退出标记保留） |
+| `stdoutCapBytes` | `64000` | 压缩正文的硬上界：截尾到这个字节数（退出标记与截断提示都保留；没有 spill 取回通道时整条放弃，不交无标记残件） |
+| `windowHeadLines` | `50` | 日志窗口保留的头行数；只对日志类目标生效，默认与 rtk `cap` 的 `HEAD_LINES` 同值 |
+| `windowTailLines` | `200` | 日志窗口保留的尾行数；错误几乎总压在最后几屏，默认与 rtk `cap` 的 `TAIL_LINES` 同值 |
 | `warnHint` | `true` | `cargo test` 之后追加编译警告提示行 |
 | `rewriteHostEnv` | `''` | 写进 `RTK_REWRITE_HOST` 的值；空串表示不设 |
 | `pipeTimeoutMs` | `3000` | 重启生效 |
@@ -127,7 +140,7 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 | `vitestMaxMajor` | `5` | 重启生效；命令改写侧达到该主版本就不改写 vitest（`enabledFilters` 里的 `vitest` 那一路不受它管——它不调 rtk，没有版本门） |
 | `logFilterMode` | `'off'` | 重启生效 |
 
-配置 schema 共 14 个字段；其中 13 个带内置默认值，`enabled` 在显式设置前跟随 rtk 就绪状态。其中卡上那 9 枚是 volatile —— 设置卡写它们，下一次工具调用就生效，`enabledForms` 也在其中。剩下的**非 volatile 部署值**，共 5 枚，在装配时读一次，改完要重启。
+配置 schema 共 16 个字段；其中 15 个带内置默认值，`enabled` 在显式设置前跟随 rtk 就绪状态。其中卡上那 11 枚是 volatile —— 设置卡写它们，下一次工具调用就生效，`enabledForms` 也在其中。剩下的**非 volatile 部署值**，共 5 枚，在装配时读一次，改完要重启。
 
 ## <img src="https://api.iconify.design/lucide/chart-column.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 洞察页
 
@@ -136,7 +149,7 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 - **页签**：改写（prefix）/ 压缩（pipe）。
 - **窗口与粒度**：7 / 30 / 90 天，日 / 周 / 月。窗口内的空桶补零，所以横轴是稳定的时间轴，不是「有数据的那些天」。
 - **KPI 行**：调用、尝试、成功、覆盖率（pipe）或成功率（prefix）、节省 token、节省率。
-- **组合图**：柱是每桶省下的 token，折线是节省率或覆盖率，双轴。**不足三天退回柱状图**——两个点连出来的线不是趋势，是误导。
+- **组合图**：柱是每桶省下的 token，折线是节省率或覆盖率，双轴。**有节省的桶不足 3 个就退回柱状图，并明确说出来**——两个点连出来的线不是趋势，是误导。退柱时比率并没有丢：它在 KPI 行与明细表里，图下面那一行会指给读者看。
 - **为什么这次没压**：最近一条事件 + 窗口内的原因 Top。
 - **明细表**：prefix 按被改写的那几段折出的命令家族与工作目录，pipe 按 filter、命令家族与工作目录。复合命令只算真的被加过 `rtk` 的段——rtk 的账本本身就是一段一行，`cd x && rtk git diff && rtk cargo test` 落成 `git diff` 与 `cargo test` 两行，`cd x` 没有行。
 - **建议区**：低收益 filter、已启用却从没命中、没启用但明显可压、低收益命令家族。
@@ -148,14 +161,16 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 
 `engines.dsh` 与 `@deepseek-ai/dsh*` peer 是 `^0.2.2-rc.2`（单条线，无并集）；`@deepseek-ai/schemastery` peer 是 `^3.19.0`；`engines.node` 是 `>=24.9.0`。
 
+测试套件与真实 rtk 回路在 macOS、Linux、Windows 三平台运行；只要 `rtk` 在 `PATH` 上，`prefix` 形态就会装配。CI 在三个 runner 上从官方 release 资产安装 rtk 1.2.0（sha256 校验）并以 `DSH_RTK_TEST_MODE=real` 跑真实 CLI 回路。
+
 ## <img src="https://api.iconify.design/lucide/cpu.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 外部依赖
 
-本仓里每一条结论都是在 rtk 1.2.0 上量出来的。插件要求 `>= 1.0.0`；低于它时插件报出读到的版本，什么都不做。
+本仓里每一条结论都是在 rtk 1.2.0 上量出来的。插件要求 `>= 1.0.0`；低于它时插件报出读到的版本，什么都不做。CI 精确钉住 1.2.0（官方 release 资产，sha256 校验）并对着它跑真实 CLI 回路。
 
 ## <img src="https://api.iconify.design/lucide/lock.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 数据与隐私
 
 - **命令文本只以 argv 的形式离开宿主进程，交给你自己那个 `rtk` 二进制。** 本插件不发起任何网络请求。
-- **一套数据，只记 dsh 会话。** 账本放在 dsh 自己的目录下：`$DSH_HOME/rtk/history.db`（默认 `~/.dsh/rtk/history.db`，`$DSH_HOME` 按宿主同一档解析）。插件给改写后的每段 `rtk` 注入 `RTK_DB_PATH` 指向这个文件，rtk 因此只往这里记账——**你在自己终端里跑的 rtk 与 `rtk gain` 不受影响，也不计入这里**。pipe 的压缩计数与两者的明细记在同一个库的 `dsh_*` 表里（SQLite，`node:sqlite`；打不开只丢统计，压缩照常），rtk 不认这些表、也从不会删它们；保留 90 天、没有 lifetime 累计。
+- **一套数据，只记 dsh 会话。** 账本放在 dsh 自己的目录下：`$DSH_HOME/rtk/history.db`（默认 `~/.dsh/rtk/history.db`，`$DSH_HOME` 按宿主同一档解析）。插件给改写后的每段 `rtk` 注入 `RTK_DB_PATH` 指向这个文件，rtk 因此只往这里记账。同一段前缀还带 `RTK_RECALL_DB`，指向 `$DSH_HOME/rtk/recall.db`：rtk 折叠长输出时把被省掉的中段存在这里，于是压缩行尾那串 `[+N hidden: rtk recall <hash>]` 指向的是 dsh 自己的库，而不是你终端在用的全局 `recall.db`（不给这个变量，rtk 会写进那份全局文件——实测干净 `HOME` 下跑一次 `rtk ls -la` 就会把它建出来）。洞察页脚会报出这个库存了多少条、占多少磁盘——**你在自己终端里跑的 rtk 与 `rtk gain` 不受影响，也不计入这里**。pipe 的压缩计数与两者的明细记在同一个库的 `dsh_*` 表里（SQLite，`node:sqlite`；打不开只丢统计，压缩照常），rtk 不认这些表、也从不会删它们；保留 90 天、没有 lifetime 累计。
 - **插件自己的表与页面上不存完整命令、参数或输出。** 只留命令家族（`cargo test`、`git status` 这种模板级名字）、工作目录、filter 名、原因与计数。账本里 rtk 那几张表存着 `original_cmd` 原文，插件只读它、且只展示它的命令家族，从不把原文回显到页面或统计里。
 - **token 由宿主的 `tokenMeter` 估算**（服务缺席时按 `bytes / 4`，与 rtk 官方 `estimate_tokens_from_len` 同一口径）。pipe 的两端都量得到，所以它的节省量是实测；prefix 省下的是「原文 vs 改写后命令」在 rtk 那边记的账，插件只读账本、不自己估。
 - **沙箱三档行为不同。** `read-only` 下 prefix 的节省量读不到（账本写不进去，页面如实报「只读」，改写计数照常可见），pipe 统计照常；`workspace-write` 下插件把 `$DSH_HOME/rtk/` 登记成会话级可写根（登记的目录走物理路径，`/tmp` 这类符号链接也能落上），两面都正常；`danger-full-access` 没有额外限制。
@@ -170,6 +185,7 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 - **审批看到的是你请求的命令，不是改写后的命令。** 遮蔽层在 `execute` 里改 `args.command`，而 `execute` 跑在管线的 `tools/pre-execute` **之后**。所以通用命令审批（auto-review、danger-guard、Claude Code 风格的 hooks）求值的是冻结的原始参数（`cargo test`），实际跑的是改写形态（`rtk cargo test`）。沙箱升档审批在 `orig.execute` **之内**，原样保留——插件从不自己 spawn 命令。补在这道缝前面的三样减法由插件负责：拒绝表（只剩 `aws` 一条——改写会让退出码变含义：命令不存在时原生 127、经 rtk 是 1）、P1~P4 改写校验（只允许剥前缀、不许丢脚本运行词）、以及 vitest 主版本门控。危险命令（`rm -rf`、`git push --force`）根本不在 rtk 的改写面里，因此原样执行、原样受审——danger-guard 没有被绕过。
 - **过不了闸门的那一段被还原回去，其余段照样改写。** `cd x && aws s3 ls && cargo test` 会变成 `cd x && aws s3 ls && rtk cargo test`：rtk 会把每一段它认得的都加上前缀，所以插件把那几段原样放回，而不是整条交回。闸门按**段**判，因为 `cd x && git diff` 的首词是 `cd`——按整条判会让整张表失效。它不再做的事是「因为输出会变短就拒绝改写」：`git diff` / `git log` / `ls` / `find` / `grep` 现在照常改写，「输出变短」这个问题归压缩形态管。
 - **`rtk pipe` 处理失败的 pytest 时保住用例名，但不一定保住断言正文。** 护栏检查「有没有成功声明」与「失败行还在不在」；一个两者都过、却仍然丢了细节的 filter 输出，是 filter 的已知边界，不是护栏的。vitest 那一路不调 rtk，所以不受这条限制（见上面的 `enabledFilters`）。
+- **Windows 上 rtk 的 hook 状态目录只能尽力隔离。** 插件给 `rtk hook` 设了 `HOME` / `USERPROFILE` / `APPDATA` / `LOCALAPPDATA`，但 rtk 走 Known Folder API 解析数据目录，这几个变量可能不被读取；pipeline 配置仍由 `RTK_CONFIG_DIR` 钉住。状态文件的隔离尚未在 Windows 真机验证。
 
 ## <img src="https://api.iconify.design/lucide/wrench.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 开发
 
@@ -179,6 +195,8 @@ pnpm run check          # typecheck + lint + build + test + fmt:check
 ```
 
 在伞工作区里跑 `pnpm run smoke @jayyuen66/dsh-rtk` 会把包装进沙箱 `DSH_HOME`；被接受的判据是 `--dump-config` 的层行。
+
+集成测试在 `PATH` 上有 `rtk` 时会 spawn 真 CLI。设 `DSH_RTK_TEST_MODE=fake` 跳过这些回路，设 `real` 让缺 rtk 直接失败；缺省 `auto` 是装了就跑、没装就跳过。
 
 ## 反馈
 

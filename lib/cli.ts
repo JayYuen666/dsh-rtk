@@ -150,9 +150,66 @@ export async function runRtkPipe(options: RtkPipeOptions): Promise<RtkPipeResult
   return result;
 }
 
+/** 一次 `rtk hook` 的调用参数。 */
+export interface RtkHookOptions {
+  readonly subprocess: SubprocessFace;
+  /** `lib/rtk-hook.ts` 的 `buildHookPayload` 产物（PostToolUse JSON）。 */
+  readonly stdin: string;
+  readonly cwd: string;
+  readonly timeoutMs: number;
+  /** 三处隔离位置；`configDir` 由 `prepareHookConfig` 建好并写过配置。 */
+  readonly env: Record<string, string | undefined>;
+}
+
+/**
+ * 跑一次 `rtk hook claude`，把输出卫生交给 rtk 的 pipeline 引擎。
+ *
+ * 三种失败都折成 `{ok:false}`：`never_worse` 判无收益（stdout 零字节）、非零退出、
+ * spawn 抛错。**空 stdout 也判失败**——那是 rtk 的正常答复（没东西可改），不是「压成了空」，
+ * 调用方必须原样使用未压缩输出；把空串当成功会把整段输出从模型眼前抹掉。
+ *
+ * env 由调用方造（`hookEnvOf`）：这条路径要 `RTK_CONFIG_DIR`、单独的 `RTK_DB_PATH`，
+ * 以及一个**单独的家目录**（见 `lib/rtk-paths.ts` 的 `HookPaths.home`）。
+ */
+export async function runRtkHook(options: RtkHookOptions): Promise<RtkPipeResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, options.timeoutMs);
+  let result: RtkPipeResult = { ok: false, stdout: "" };
+  let handle: SubprocessFaceHandle | undefined;
+  try {
+    handle = options.subprocess.spawn({
+      argv: ["rtk", "hook", "claude"],
+      cwd: options.cwd,
+      stdio: {
+        stdin: { data: options.stdin },
+        stdout: { maxBytes: MAX_STDOUT_BYTES },
+        stderr: { maxBytes: MAX_STDERR_BYTES },
+      },
+      graceMs: options.timeoutMs,
+      env: options.env,
+      signal: controller.signal,
+    });
+    const outcome = await handle.done;
+    if (outcome.signal === null && outcome.exitCode === 0) {
+      const stdout = readStdout(handle);
+      // 空串是「没东西可改」，不是「压成了空」——见函数头注释。
+      if (stdout.trim() !== "") {
+        result = { ok: true, stdout };
+      }
+    }
+  } catch {
+    // ENOENT / provider 失败：保持 ok=false，调用方回落到本地窗口。
+  } finally {
+    clearTimeout(timer);
+    handle?.terminate();
+  }
+  return result;
+}
+
 /**
  * `rtk rewrite <command>`：求一条命令的等价改写。
- *
  * 这一层不判退出码含义，只做两件归一：被信号杀掉时 exitCode 归 null；stdout 一律 trimEnd
  * （实测 rc=3 的改写无尾换行、rc=0 分支曾带换行，统一之后空串才可靠地等于「没有改写」）。
  * 期限归调用方：装配层用 `AbortSignal.any([exec.signal, AbortSignal.timeout(ms)])`。

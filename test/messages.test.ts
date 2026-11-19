@@ -9,7 +9,18 @@ import { MESSAGES } from "../lib/messages.ts";
 
 // 写死的期望键集，**不从 MESSAGES 自己取键**：从被测对象推期望值，删掉一个键两边一起少，
 // 这条断言永远绿。表里只留真的从宿主发出去了的键——卡片文案归 src/ui-messages.ts。
-const KEYS = ["cargoTestWarnHint", "spillSummary", "spillLocation", "spillRelaxed"] as const;
+const KEYS = [
+  "cargoTestWarnHint",
+  "spillSummary",
+  "spillLocation",
+  "spillRelaxed",
+  "spillCapped",
+  // 常驻摘要 + skill 全文三件（0.2.2 起）：摘要每轮都进 systemPrompt，全文注册成 skill `rtk`。
+  "usageSummary",
+  "skillDescription",
+  "skillPointer",
+  "usageText",
+] as const;
 
 describe("messages 两语字典同源", () => {
   it("zh/en 键集合相等", () => {

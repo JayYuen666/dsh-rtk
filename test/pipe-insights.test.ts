@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 
 import type { PipeRecord } from "../lib/insights-shape.ts";
-import { startPipeHost } from "./integration/host-stack.ts";
+import { spillStub, startPipeHost } from "./integration/host-stack.ts";
 
 /** 假 `rtk pipe` 的产出：远小于输入，且不宣称任何成功（否则会被「伪造成功」护栏拦下）。 */
 const PIPED = "cargo test: 1 passed";
@@ -70,7 +70,7 @@ describe("b 形态的统计埋点", () => {
   });
 
   it("压成功记一条 pipe-success：家族、filter、两侧字节与 token、非负延迟都在", async () => {
-    const host = startPipeHost({ pipe: { exitCode: 0, stdout: PIPED } });
+    const host = startPipeHost({ pipe: { exitCode: 0, stdout: PIPED }, spillStore: spillStub() });
     await host.run(RAW);
     assert.deepEqual(
       host.pipeRecords.map((record) => record.kind),
@@ -111,7 +111,11 @@ describe("b 形态的统计埋点", () => {
   });
 
   it("太短 / 形态不符 / 太大 / 没正文：四种跳过各记自己的原因", async () => {
-    const host = startPipeHost({ pipe: { exitCode: 0, stdout: PIPED }, minBytes: () => 1 });
+    const host = startPipeHost({
+      pipe: { exitCode: 0, stdout: PIPED },
+      minBytes: () => 1,
+      spillStore: spillStub(),
+    });
     // 太短：把阈值抬到比这条还高。
     await host.run(SHORT_RAW);
     const shortHost = startPipeHost({
@@ -164,7 +168,7 @@ describe("b 形态的统计埋点", () => {
       pipe: { exitCode: 0, stdout: PIPED },
       forms: () => ["prefix", "pipe"],
     });
-    rewritten.rewrittenCalls.mark("call-1");
+    rewritten.rewrittenCalls.mark("call-1", "rtk git status");
     const rewrittenOut = await rewritten.run(RAW, { callId: "call-1" });
     assert.equal(onlySkipReason(rewritten.pipeRecords), "already-rewritten");
     assert.equal(rewrittenOut.piped, 0);
@@ -251,7 +255,7 @@ describe("b 形态的统计埋点", () => {
   });
 
   it("工作目录落进记录：模型给的 workdir 优先于会话 cwd", async () => {
-    const host = startPipeHost({ pipe: { exitCode: 0, stdout: PIPED } });
+    const host = startPipeHost({ pipe: { exitCode: 0, stdout: PIPED }, spillStore: spillStub() });
     // 模型按调用传绝对 workdir：`run` 把它放进 `exec.arguments.workdir`。
     await host.run(RAW, { args: { command: "cargo test", workdir: "/tmp/model-workdir" } });
     const success = recordAt(host.pipeRecords, 1, KIND_SUCCESS);

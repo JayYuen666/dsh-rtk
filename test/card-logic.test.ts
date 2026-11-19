@@ -175,7 +175,7 @@ describe("草稿读数", () => {
     assert.deepEqual(formModeOf(["nonsense"]), PREFIX);
   });
 
-  it("draftFields 九个字段逐个投影（含三个数组与一个字符串）", () => {
+  it("draftFields 十一个字段逐个投影（数组、数字、布尔与字符串）", () => {
     const fields = draftFields(
       { minBytes: 512 },
       {
@@ -185,6 +185,8 @@ describe("草稿读数", () => {
         enabledFilters: ["pytest"],
         minGainRatio: 0.9,
         stdoutCapBytes: 64_000,
+        windowHeadLines: 60,
+        windowTailLines: 240,
         warnHint: false,
         rewriteHostEnv: "openclaw",
       },
@@ -196,6 +198,8 @@ describe("草稿读数", () => {
     assert.equal(fields.minBytes, 512);
     assert.equal(fields.minGainRatio, 0.9);
     assert.equal(fields.stdoutCapBytes, 64_000);
+    assert.equal(fields.windowHeadLines, 60);
+    assert.equal(fields.windowTailLines, 240);
     assert.equal(fields.warnHint, false);
     assert.equal(fields.rewriteHostEnv, "openclaw");
   });
@@ -209,6 +213,8 @@ describe("草稿读数", () => {
     assert.equal(fields.minBytes, undefined);
     assert.equal(fields.minGainRatio, undefined);
     assert.equal(fields.stdoutCapBytes, undefined);
+    assert.equal(fields.windowHeadLines, undefined);
+    assert.equal(fields.windowTailLines, undefined);
     assert.equal(fields.warnHint, true);
     assert.equal(fields.rewriteHostEnv, "");
   });

@@ -11,6 +11,7 @@
  * ——有警告还加就是噪音，模型会以为提示本身是内容。
  */
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import { TOOL_BASH_MARKER } from "./stdout-extract.ts";
 
 const CARGO_TEST = /^cargo\s+test(?:\s|$)/u;
 
@@ -18,14 +19,12 @@ const CARGO_TEST = /^cargo\s+test(?:\s|$)/u;
 const HAS_WARN_OR_ERROR = /(?:^|\n)(?:warning:|warning\[|error\[|error:)/u;
 
 /**
- * 结构化回执末尾的退出 marker（与 `lib/stdout-extract.ts` 同形，这里只用来定位插入点）。
+ * 结构化回执末尾的退出 marker：正则与 `lib/stdout-extract.ts` 共用一份，这里只用来定位插入点。
  *
- * 复用 `lib/stdout-extract.ts` 的 `extractBody` 会更省事，但那一层的失败形态是「拆不出来
- * 就整条放行」——这里需要的是「拆不出来就追加到末尾」，两种降级方向相反，混用会让
- * 「没有 marker」那一格的行为取决于另一个模块的实现细节。
+ * 复用它的 `extractBody` 会更省事，但那一层的失败形态是「拆不出来就整条放行」——这里需要的是
+ * 「拆不出来就追加到末尾」，两种降级方向相反，所以只共享正则、不共享拆解器。
  */
-const TRAILING_MARKER =
-  /(?:^|\n)(?<marker>\[(?:exit code: -?\d+|killed by signal: [^\]\n]+|timed out after \d+ms|stopped: [^\]\n]+)\])\s*$/u;
+const TRAILING_MARKER = TOOL_BASH_MARKER;
 
 /** 是否为 `cargo test`（只看首两词，带词边界；`cargo testing` / `cargotest` 都不算）。 */
 export function isCargoTest(command: string): boolean {

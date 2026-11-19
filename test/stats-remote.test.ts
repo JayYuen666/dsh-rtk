@@ -76,6 +76,7 @@ const insightsOf = (request: InsightsRequest): InsightsResponse => ({
   suggestions: [],
   legacy: null,
   dataStart: null,
+  rtkSelf: { parseFailures: 0, recovered: 0, oversized: 0, recallEntries: 0, recallBytes: 0 },
 });
 
 /** 假读面记下的调用轨迹。 */

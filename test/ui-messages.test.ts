@@ -91,6 +91,14 @@ describe("设置卡双语字典", () => {
       suggestUnusedFilter: ["filter", "days"],
       suggestPotentialFilter: ["filter", "days", "matches"],
       suggestLowYieldCommand: ["family", "days", "attempts", "savingsPct"],
+      // 页脚的 rtk 自账对账两条：`rtkSelfFailures` 带失败数/救回数/回收率三个位，
+      // `rtkSelfOversized` 只带被 `rtk gain` 排除的行数。漏登记就等于新增了一条没人守的
+      // 插值规则，页脚会原样印出花括号。
+      rtkSelfFailures: ["failures", "recovered", "rate"],
+      rtkSelfOversized: ["oversized"],
+      // `rtkSelfRecall` 是取回库的体检数：条数 + 磁盘占用。两个占位符都不能省——只印条数
+      // 会让「这个库在悄悄长大」这件事看不见。
+      rtkSelfRecall: ["entries", "size"],
     };
     for (const [key, expected] of Object.entries(EXPECTED) as [
       keyof UiMessages,
@@ -109,6 +117,26 @@ describe("设置卡双语字典", () => {
       if (placeholders(UI_MESSAGES.zh[key]).length > 0) {
         assert.ok(key in EXPECTED, `${key} 带占位符，却没登记到期望表`);
       }
+    }
+  });
+
+  it("退柱那句说明必须同时交代「没画线」与「比率在哪」（否则会被读成比率丢了）", () => {
+    // 用户 m21519 的原话：「Insights 页面的 图表 的节省量与比率，节省量展示出来了，但是比率
+    // 没有展示出来啊，是数据问题还是代码bug啊？」——真实数据下有节省的桶只有 1~2 个，于是
+    // 18 种窗口×粒度组合全部退成柱状图，读者看到的只有柱子。裁决（m21566）是保留稀疏保护、
+    // 把提示做醒目，所以这句话必须自己把「比率没丢」说清楚，且指向它还在的两个地方。
+    const anchors = {
+      zh: { table: /表/u, rate: /节省率/u },
+      en: { table: /table/iu, rate: /rate/iu },
+    } as const;
+    for (const locale of ["zh", "en"] as const) {
+      const note = UI_MESSAGES[locale].chartSparseNote;
+      // 前半句：为什么没有折线。阈值必须出现，读者才知道「差几个桶」。
+      assert.match(note, /3/u, `${locale} 该给出稀疏阈值`);
+      // 后半句：比率在哪。这两个词是页面上真实存在的锚（KPI 行与明细表），写空话不算。
+      assert.match(note, /KPI/u, `${locale} 该指向 KPI 行`);
+      assert.match(note, anchors[locale].table, `${locale} 该指向明细表`);
+      assert.match(note, anchors[locale].rate, `${locale} 该点名它没丢的那个量`);
     }
   });
 

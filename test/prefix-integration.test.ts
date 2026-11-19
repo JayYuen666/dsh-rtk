@@ -14,8 +14,8 @@ import {
   recordingSubprocess,
   startPrefixHost,
 } from "./integration/host-stack.ts";
+import type { RtkPaths } from "../lib/rtk-paths.ts";
 import { unbuildableDir } from "./unbuildable.ts";
-import { forceShadowPlatform } from "./platform/host-platform.ts";
 
 const cleanups = makeCleanups();
 
@@ -38,6 +38,7 @@ const noop = (): void => undefined;
 /** 库文件的两个名字：与 `lib/rtk-paths.ts` 的取值同形（这里不 import，避免测被测的表）。 */
 const LEDGER_DIR = "rtk";
 const LEDGER_FILE = "history.db";
+const RECALL_FILE = "recall.db";
 
 /**
  * 账本库在某个 root 下的路径。
@@ -45,10 +46,26 @@ const LEDGER_FILE = "history.db";
  * 提成函数而不是就地写字面量：同一个形状在几条用例里出现（建得出来 / 建不出来 / 故障播报），
  * 而 `sonarjs(no-duplicate-string)` 数到三次就红——更重要的是，路径形状本身就是被测约定
  * （`$DSH_HOME/rtk/history.db`），写在一个地方才改得动。
+ * 两个库文件都要给：`recall.db` 与 `history.db` 同目录，注入时成对出现（只给前者的形状正是
+ * 会把折叠中段写进用户全局 recall 库的那种）。
  * @param root - 假 home
- * @returns 库文件路径
+ * @returns 两个库文件路径
  */
-const ledgerPathUnder = (root: string): string => path.join(root, LEDGER_DIR, LEDGER_FILE);
+/**
+ * 注入前缀的期望串：两个变量成对出现，顺序与 `withRtkLedgerEnv` 一致。
+ *
+ * 单独写一份而不是就地拼：这条前缀在两条用例里都要逐字比对，而它的形状本身是被测约定
+ * （两个库必须一起注入，见 `lib/rtk-paths.ts` 的 doc）。
+ * @param paths - 两个库路径
+ * @returns `RTK_DB_PATH='…' RTK_RECALL_DB='…'`
+ */
+const injectionOf = (paths: RtkPaths): string =>
+  `RTK_DB_PATH='${paths.historyDb}' RTK_RECALL_DB='${paths.recallDb}'`;
+
+const ledgerPathUnder = (root: string): RtkPaths => ({
+  historyDb: path.join(root, LEDGER_DIR, LEDGER_FILE),
+  recallDb: path.join(root, LEDGER_DIR, RECALL_FILE),
+});
 
 /** 假 bash 的回执形状：三条用例共用，放模块作用域而不是 describe 里（它不捕获任何东西）。 */
 const cargoReply = (text: string) => (): Record<string, unknown> => ({
@@ -73,22 +90,15 @@ const asResult = (
   value as { readonly stdout: { readonly text: string }; readonly exitCode: number };
 
 /**
- * C 形态的装配与行为判据在**三个平台**上都要跑。原先这里整片 `skipIf(!POSIX_ONLY)`，理由是
- * 两条——两条现在都不再成立：
+ * C 形态的装配与行为判据在三个平台都跑。
  *
- *   1. **实现侧**：`prefixSupportedOn("win32")` 判否，`installPrefixShadow` 在平台门禁处直接
- *      return。那条**产品决定**不变（rtk 的 Windows 分发面与 pwsh 命令形态没在真机验过），
- *      由 `test/platform/platform.test.ts` 显式注入 win32 断言「整层不装」。但本文件验的是
- *      门禁**之后**的逻辑（装配序、埋点时机、argv 形状、sandbox 登记），与宿主是不是 Windows
- *      无关，所以用 `forceShadowPlatform()` 把宿主平台值换成受支持档——判据不变形，只是不再
- *      因为宿主 OS 而缺席。
- *   2. **夹具侧**：假 rtk 早先是「PATH 上一个 0755 的 node 脚本、靠裸名被 `spawn` 找到」。
- *      现在 `installFakeRtk` 把它拆成两件事：PATH 上那个文件只过装配期门禁（win32 档的
- *      裸名候选足够），真正的子进程面是内存桩（`lib/cli.ts` 的 `spawn({argv})` 在 Windows 上
- *      不做 PATHEXT 解析，造不出跨平台可执行的假 rtk——细节见 `installFakeRtk` 的注释）。
+ * 门禁只剩一条：装配时 `findOnPath("rtk")` 命中。三平台的名称档位由 `findOnPath` 按宿主
+ * 平台处理（win32 试 `.exe`/`.cmd`/裸名）。假 rtk 的 `rtk` 文件在 POSIX 上带 shebang 与
+ * 执行位、在 win32 上另写一份 `rtk.cmd`，所以三个 runner 用的是同一份夹具。
+ *
+ * 真正的子进程面是内存桩（`lib/cli.ts` 的 `spawn({argv})` 在 Windows 上不做 PATHEXT 解析，
+ * 造不出跨平台可执行的假 rtk——细节见 `installFakeRtk` 的注释）。
  */
-const restorePlatform = forceShadowPlatform();
-
 describe("c 形态", () => {
   describe("c 形态：装配期门禁", () => {
     it("rtk 不在 PATH 时整层不装（连监听器都不注册）", async () => {
@@ -99,7 +109,7 @@ describe("c 形态", () => {
       process.env["PATH"] = empty;
       try {
         const host = await startPrefixHost();
-        // 门禁第三条就是 findOnPath('rtk')：PATH 上没有它时函数直接 return，agent/created 一条也不挂。
+        // 唯一的装配期门禁就是 findOnPath('rtk')：PATH 上没有它时函数直接 return，agent/created 一条也不挂。
         assert.equal(host.installed, false);
       } finally {
         process.env["PATH"] = saved;
@@ -380,17 +390,21 @@ describe("c 形态", () => {
       }
     });
 
-    it("调用方 signal 已 abort → 原样转调且不 spawn", async () => {
+    it("调用方 signal 已 abort → 宿主根本不执行，rtk 一次都不 spawn", async () => {
+      // 旧夹具手搓直调遮蔽体，abort 之后照样会跑到原工具；真流水线在 abort 之后不派发，
+      // 于是连原生 bash 都没有被执行。这是宿主的语义，不是插件行为——插件“abort 就不 spawn
+      // rewrite”那条判据仍由 spawned===0 兜住。
       const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_CARGO_TEST }]);
       try {
         const host = await startPrefixHost();
         const controller = new AbortController();
         controller.abort();
-        await host
+        const result = await host
           .withAgent()
           .execute({ command: CARGO_TEST }, exec({ signal: controller.signal }));
         assert.equal(rtk.spawned(), 0);
-        assert.deepEqual(host.fake.received, [CARGO_TEST]);
+        assert.deepEqual(host.fake.received, []);
+        assert.equal((result as { readonly isError?: boolean }).isError, true);
       } finally {
         rtk.restore();
       }
@@ -418,8 +432,8 @@ describe("c 形态", () => {
       //
       // 假 rtk 是**装配期门禁的前提**，不是这条用例的被测面：`findOnPath('rtk')` 交不出路径时
       // `installPrefixShadow` 直接 return，用例会在 `withAgent()` 处炸成「遮蔽层没有注册任何
-      // 工具体」而不是断言失败。开发者机器上有 /opt/homebrew/bin/rtk，CI 上没有，于是这类
-      // 用例只在 CI 红——这正是它们早先漏掉 `installFakeRtk` 却一直显示绿的原因。
+      // 工具体」而不是断言失败。这里装自己的假 rtk，而不是依赖机器或 CI 上那支真 rtk——
+      // 夹具必须自足，判据才不随跑测环境漂移。
       const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 1, stdout: "" }]);
       try {
         const subprocess = recordingSubprocess();
@@ -439,7 +453,7 @@ describe("c 形态", () => {
       }
     });
 
-    it("exec.agent 不是 agent 形状时不去问 ensure，退到 header.cwd", async () => {
+    it("会话头里的 cwd 决定 rewrite 的工作目录（宿主交来的 agent 一定带着它）", async () => {
       // resolveWorkdir 的第二级真源：宿主给过来的 agent 若不是带字符串 id 的那个形状，
       // 就不该拿去问 workingDirectory.ensure（那是个有副作用的服务调用，问错了会脏别人的状态）。
       const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 1, stdout: "" }]);
@@ -517,11 +531,12 @@ describe("c 形态", () => {
       }
     });
 
-    it("记账先于转调：bash 执行的那一刻，账本已经记下这条 callId", async () => {
+    it("记账先于转调：bash 执行的那一刻，账本已经记下这条 callId 与改写产物", async () => {
       // 判据必须在执行体内部取——从外面看，两种顺序的结果一模一样。
       // background bash 会立即返回、结果稍后到，post-execute 可能就落在那段窗口里，
       // 所以「先记账」不是风格问题，是双形态不重复压缩的前提。
-      let seenInsideExecute: boolean | undefined;
+      // 记的值是**改写后的命令**（不是 boolean）：结果侧要按它分辨「这次改写到底压不压」。
+      let seenInsideExecute: string | undefined;
       const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_CARGO_TEST }]);
       try {
         const host = await startPrefixHost({
@@ -530,19 +545,22 @@ describe("c 形态", () => {
           },
         });
         await host.withAgent().execute({ command: CARGO_TEST }, exec());
-        assert.equal(seenInsideExecute, true);
+        assert.equal(seenInsideExecute, RTK_CARGO_TEST);
       } finally {
         rtk.restore();
       }
     });
 
-    it("参数缺 command 时原样转调，不 spawn", async () => {
+    it("参数缺 command → 宿主参数校验先拒（isError），rtk 一次都不 spawn", async () => {
+      // 旧夹具自己造 bash，缺 command 也照跑；真 `tool-bash` 在 execute 之前就校验参数表
+      // （`validateBashArgs` 要求 command/description 非空），于是这条命令到不了遮蔽层。
       const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_CARGO_TEST }]);
       try {
         const host = await startPrefixHost();
-        await host.withAgent().execute({}, exec({ arguments: {} }));
+        const result = await host.withAgent().execute({}, exec({ arguments: {} }));
         assert.equal(rtk.spawned(), 0);
-        assert.equal(host.fake.received.length, 1);
+        assert.equal(host.fake.received.length, 0);
+        assert.equal((result as { readonly isError?: boolean }).isError, true);
       } finally {
         rtk.restore();
       }
@@ -553,8 +571,12 @@ describe("c 形态", () => {
       try {
         const host = await startPrefixHost();
         const shadow = host.withAgent() as unknown as Record<string, unknown>;
-        assert.equal(shadow["name"], "bash");
-        assert.equal(shadow["description"], "fake bash");
+        // 继承面拿宿主注册的那份 bash 当基准：name/description/parameters/output 必须逐字段同源，
+        // 才说明遮蔽体没有手抄一份会随宿主升级漂移的 schema。
+        const live = host.fake.definition;
+        assert.equal(shadow["name"], live["name"]);
+        assert.equal(shadow["description"], live["description"]);
+        assert.ok(typeof shadow["description"] === "string" && shadow["description"].length > 0);
         assert.equal(typeof shadow["parameters"], "object");
         assert.equal(typeof shadow["output"], "object");
       } finally {
@@ -582,7 +604,7 @@ describe("c 形态", () => {
     it("该 profile 没装 bash 时跳过（不注册任何东西）", async () => {
       const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_CARGO_TEST }]);
       try {
-        // 监听器照常挂着（门禁三关都过了），但 agent 创建时发现没有 bash 可遮蔽。
+        // 监听器照常挂着（rtk 门禁过了），但 agent 创建时发现没有 bash 可遮蔽。
         const host = await startPrefixHost({ bash: null });
         assert.equal(host.installed, true);
         assert.throws(() => host.withAgent(), /没有注册任何工具体/u);
@@ -655,25 +677,31 @@ describe("c 形态", () => {
       }
     });
 
-    it("args 不是对象时原样转调，不 spawn", async () => {
+    it("args 不是对象 → 宿主参数校验先拒（isError），rtk 一次都不 spawn", async () => {
       const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_CARGO_TEST }]);
       try {
         const host = await startPrefixHost();
-        await host.withAgent().execute("not-an-object", exec({ arguments: "not-an-object" }));
+        const result = await host
+          .withAgent()
+          .execute("not-an-object", exec({ arguments: "not-an-object" }));
         assert.equal(rtk.spawned(), 0);
-        assert.equal(host.fake.received.length, 1);
+        assert.equal(host.fake.received.length, 0);
+        assert.equal((result as { readonly isError?: boolean }).isError, true);
       } finally {
         rtk.restore();
       }
     });
 
-    it("command 不是字符串时原样转调，不 spawn", async () => {
+    it("command 不是字符串 → 宿主参数校验先拒（isError），rtk 一次都不 spawn", async () => {
       const rtk = installFakeRtk(cleanups.dirs, [{ exitCode: 3, stdout: RTK_CARGO_TEST }]);
       try {
         const host = await startPrefixHost();
-        await host.withAgent().execute({ command: 42 }, exec({ arguments: { command: 42 } }));
+        const result = await host
+          .withAgent()
+          .execute({ command: 42 }, exec({ arguments: { command: 42 } }));
         assert.equal(rtk.spawned(), 0);
-        assert.equal(host.fake.received.length, 1);
+        assert.equal(host.fake.received.length, 0);
+        assert.equal((result as { readonly isError?: boolean }).isError, true);
       } finally {
         rtk.restore();
       }
@@ -795,7 +823,7 @@ describe("c 形态", () => {
       try {
         const host = await startPrefixHost({
           reply: cargoReply(CLEAN_TEXT),
-          options: { trackingDbPath: dbPath },
+          options: { ledgerPaths: dbPath },
           sandboxPolicy: {
             registerWritableRoot: (_session: unknown, dir: string): (() => void) => {
               registered.push(dir);
@@ -805,11 +833,11 @@ describe("c 形态", () => {
         });
         await host.withAgent().execute({ command: CARGO_TEST }, exec());
         // 命令带着注入的赋值转发：改写出来的 `rtk cargo test` 因此只往 dsh 自己的库记账。
-        assert.deepEqual(host.fake.received, [`RTK_DB_PATH='${dbPath}' ${RTK_CARGO_TEST}`]);
+        assert.deepEqual(host.fake.received, [`${injectionOf(dbPath)} ${RTK_CARGO_TEST}`]);
         // 登记的是**目录**而不是那个 .db 文件：`registerWritableRoot` 拒收非目录。
         // 期望值按物理路径写：宿主拿 `realpathSync` 的结果与原文比，macOS 上 tmpdir 的
         // `/var/...` 物理路径是 `/private/var/...`，登记原文会被判成符号链接而抛错。
-        assert.deepEqual(registered, [realpathSync.native(path.dirname(dbPath))]);
+        assert.deepEqual(registered, [realpathSync.native(path.dirname(dbPath.historyDb))]);
       } finally {
         rtk.restore();
       }
@@ -828,7 +856,7 @@ describe("c 形态", () => {
         const host = await startPrefixHost({
           reply: cargoReply(CLEAN_TEXT),
           options: {
-            trackingDbPath: dbPath,
+            ledgerPaths: dbPath,
             log: (line) => {
               lines.push(line);
             },
@@ -851,7 +879,7 @@ describe("c 形态", () => {
         // `~/Library/Application Support/rtk/history.db` 建库并写 1 行）。有了变量但目录写不进去时，
         // rtk 是**静默丢掉那一行**（exit 0、stdout 正常、stderr 零字节）：少记一行只是「统计不可用」，
         // 记进别人的账本则是污染用户数据。两者不在一个量级，所以这里必须继续注入。
-        assert.deepEqual(host.fake.received, [`RTK_DB_PATH='${dbPath}' ${RTK_CARGO_TEST}`]);
+        assert.deepEqual(host.fake.received, [`${injectionOf(dbPath)} ${RTK_CARGO_TEST}`]);
         assert.deepEqual(registered, []);
         // 两行：装配期那句「建不出来」在前，执行期那句 `rewrite: a -> b` 在后。
         // 不能只断言 `lines.length === 1`——那会把「诊断日志还开着」这件既有行为判成缺陷。
@@ -877,7 +905,7 @@ describe("c 形态", () => {
         const brokenHost = await startPrefixHost({
           reply: cargoReply(CLEAN_TEXT),
           options: {
-            trackingDbPath: ledgerPathUnder(unbuildableDir()),
+            ledgerPaths: ledgerPathUnder(unbuildableDir()),
             warn: (line) => {
               warns.push(line);
             },
@@ -893,7 +921,7 @@ describe("c 形态", () => {
         warns.length = 0;
         const refusedHost = await startPrefixHost({
           reply: cargoReply(CLEAN_TEXT),
-          options: { trackingDbPath: ledgerPathUnder(root) },
+          options: { ledgerPaths: ledgerPathUnder(root) },
           sandboxPolicy: {
             registerWritableRoot: (): (() => void) => {
               throw new Error("SANDBOX_INVALID_ROOT");
@@ -971,16 +999,13 @@ describe("c 形态", () => {
   });
 });
 
-// 与上面同一个理由：晚装载验的也是 C 形态的装配路径，宿主平台值已由 `forceShadowPlatform()`
-// 换成受支持档，所以这一组在三个 runner 上都跑。
+// 晚装载验的也是 C 形态的装配路径，平台不再是门禁，所以这一组在三个 runner 上都跑。
 //
 // 收摊挂在这一组上，因为它**是文件里最后一个 describe**：describe 的 hook 在该 describe 跑完
-// 时触发，注册顺序即执行顺序。早先 `afterAll` 挂在第一个 describe 上，于是「晚装载」这组拿到
-// 的是已经还原的平台值——win32 模拟下整层不装、断言 0 !== 1（实测症状）。`afterAll` 又不许
-// 写在顶层（`vitest(no-top-level-after-all)`），所以位置只有一个。
+// 时触发，注册顺序即执行顺序。`afterAll` 又不许写在顶层
+// （`vitest(no-top-level-after-all)`），所以位置只有一个。
 describe("晚装载：装配时已经存在的 agent 也要被遮蔽", () => {
   afterAll(() => {
-    restorePlatform();
     cleanups.drain();
   });
 

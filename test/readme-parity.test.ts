@@ -7,7 +7,7 @@
 // 比对取结构而不是逐句对译：两份文档的句子本来就不是字面互译（中英术语与详略不同），按文本
 // 比会天天误报；标题层级序列与头部骨架（logo 打头 + HTML h1 + 语言徽章互链）才是可机判的最小信号。
 //
-// 第二组是数字对等：结构对等两处一起写错时它照绿。dsh-rtk 的配置面是十四字段、九个 volatile、
+// 第二组是数字对等：结构对等两处一起写错时它照绿。dsh-rtk 的配置面是十六字段、十一个 volatile、
 // 五个部署级——这三个数在文档里各写一份，任何一处跟不上 schema 都不会让别的用例变红，
 // 所以这里把「文档那句数字 = 导出的 Config 实际形状」钉成断言。
 import { readFile } from "node:fs/promises";
@@ -218,16 +218,20 @@ describe("两份文档声明的配置表数字与实际 schema 对齐", () => {
     const shape = schemaShape();
     // 这三条是 spec §2.8 终表的**独立**期望值，不从 schema 派生：
     // 从 schema 派生等于让被测对象自己给自己作证。
-    assert.equal(shape.total, 14, `Config 字段数变了：spec §2.8 是 14 项，实际 ${shape.total}`);
+    assert.equal(
+      shape.total,
+      16,
+      `Config 字段数变了：spec §2.8 是 14 项 + 0.2.2 的日志窗口两枚 = 16，实际 ${shape.total}`,
+    );
     assert.equal(
       shape.volatile,
-      9,
-      `volatile 字段数变了：spec §2.8 的 ✓ 是 9 项，实际 ${shape.volatile}`,
+      11,
+      `volatile 字段数变了：spec §2.8 的 ✓ 是 9 项 + 0.2.2 的日志窗口两枚 = 11，实际 ${shape.volatile}`,
     );
     assert.equal(
       shape.defaulted,
       shape.total - 1,
-      "enabled 没有静态默认值（跟随 rtk 就绪状态）；其余 13 个字段都必须带内置默认值",
+      "enabled 没有静态默认值（跟随 rtk 就绪状态）；其余 15 个字段都必须带内置默认值",
     );
     const claims: readonly {
       readonly label: string;
@@ -281,7 +285,7 @@ describe("两份文档声明的配置表数字与实际 schema 对齐", () => {
     }
   });
 
-  it("配置表逐行覆盖 14 个字段名（漏一行就是用户面少一个旋钮）", async () => {
+  it("配置表逐行覆盖 16 个字段名（漏一行就是用户面少一个旋钮）", async () => {
     const { dict } = configSchema as unknown as { dict: Record<string, unknown> };
     const [english, chinese] = await Promise.all([readDoc(DOC_EN), readDoc(DOC_ZH)]);
     for (const [name, text] of [

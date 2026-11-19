@@ -11,7 +11,7 @@
 //   missing   → 「rtk 还没记过账」
 //   schema    → 「库在，但没有 commands 表」（tracking 关着，或来自更老的 schema）
 //   unreadable → 「读坏了 / 没权限 / busy」
-import { mkdirSync, realpathSync } from "node:fs";
+import { mkdirSync, realpathSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -30,6 +30,7 @@ import type { SqliteModule } from "../lib/rtk-ledger.ts";
 
 /** 反复出现的字面量提到模块级（`sonarjs(no-duplicate-string)` 数到三次就红）。 */
 const HISTORY_DB = "history.db";
+const RECALL_DB = "recall.db";
 const CARGO_ORIGINAL = "cargo test";
 const CARGO_REWRITTEN = "rtk cargo test";
 const GIT_ORIGINAL = "git status";
@@ -124,6 +125,88 @@ async function seedEmptyDb(dbPath: string): Promise<void> {
   const db = new DatabaseSync(dbPath);
   db.exec("CREATE TABLE unrelated (x INTEGER)");
   db.close();
+}
+
+/**
+ * 往已存在的库里补一张 `parse_failures`（rtk 后来才加的表，所以单独造）。
+ *
+ * 列与类型逐字取自现量 DDL：`CREATE TABLE parse_failures (id INTEGER PRIMARY KEY,
+ * timestamp TEXT NOT NULL, raw_command TEXT NOT NULL, error_message TEXT NOT NULL,
+ * fallback_succeeded INTEGER NOT NULL DEFAULT 0)`。
+ * @param dbPath - 库路径
+ * @param rows - `{at, succeeded}` 两列，其余列填占位
+ */
+async function seedParseFailures(
+  dbPath: string,
+  rows: readonly { readonly at: number; readonly succeeded: boolean }[],
+): Promise<void> {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`CREATE TABLE parse_failures (
+    id INTEGER PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    raw_command TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    fallback_succeeded INTEGER NOT NULL DEFAULT 0
+  )`);
+  const insert = db.prepare(
+    "INSERT INTO parse_failures (timestamp, raw_command, error_message, fallback_succeeded) VALUES (?, ?, ?, ?)",
+  );
+  for (const row of rows) {
+    insert.run(
+      new Date(row.at).toISOString(),
+      "rtk ps aux",
+      "error: unrecognized subcommand 'ps'",
+      row.succeeded ? 1 : 0,
+    );
+  }
+  db.close();
+}
+
+/**
+ * 造一份 `recall.db`。
+ *
+ * 列与类型逐字取自现量 DDL（`recall` 表）：被测 SQL 只数行数，但表结构不对会以
+ * `no such table` 落到「读不到就给 0」那一支，于是「真的没有」与「表建错了」看起来一样。
+ * @param dbPath - 库路径
+ * @param count - 插入几条
+ * @returns 造完之后文件多大（字节）
+ */
+async function seedRecallDb(dbPath: string, count: number): Promise<number> {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`CREATE TABLE recall (
+    hash TEXT PRIMARY KEY,
+    command TEXT NOT NULL,
+    cwd TEXT,
+    exit_code INTEGER,
+    created_at INTEGER NOT NULL,
+    total_lines INTEGER NOT NULL,
+    shown_upto INTEGER NOT NULL,
+    byte_size INTEGER NOT NULL,
+    truncated INTEGER NOT NULL,
+    codec TEXT NOT NULL,
+    blob BLOB NOT NULL,
+    recalled INTEGER NOT NULL DEFAULT 0
+  )`);
+  const insert = db.prepare(
+    `INSERT INTO recall (hash, command, cwd, created_at, total_lines, shown_upto,
+       byte_size, truncated, codec, blob) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'gzip', ?)`,
+  );
+  for (let index = 0; index < count; index += 1) {
+    insert.run(
+      `hash${String(index)}`,
+      "ls-hidden",
+      REPO_WORKDIR,
+      1_795_048_799,
+      250,
+      1,
+      4096,
+      new Uint8Array([1, 2, 3]),
+    );
+  }
+  db.close();
+  return statSync(dbPath).size;
 }
 
 describe("ensureRtkDir", () => {
@@ -334,7 +417,7 @@ describe("readPrefixLedger", () => {
         workdir: OTHER_WORKDIR,
       },
     ]);
-    const ledger = await readPrefixLedger(dbPath, {
+    const ledger = await readPrefixLedger(dbPath, "", {
       form: "prefix",
       rangeDays: 7,
       granularity: "day",
@@ -375,7 +458,7 @@ describe("readPrefixLedger", () => {
       { at: old, saved: 900 },
       { at: now, saved: 100 },
     ]);
-    const weekly = await readPrefixLedger(dbPath, {
+    const weekly = await readPrefixLedger(dbPath, "", {
       form: "prefix",
       rangeDays: 7,
       granularity: "day",
@@ -386,7 +469,7 @@ describe("readPrefixLedger", () => {
       { ...weekly.workdirs[0] },
       { project_path: REPO_WORKDIR, commands: 1, input: 1000, saved: 100 },
     );
-    const monthly = await readPrefixLedger(dbPath, {
+    const monthly = await readPrefixLedger(dbPath, "", {
       form: "prefix",
       rangeDays: 90,
       granularity: "day",
@@ -395,9 +478,132 @@ describe("readPrefixLedger", () => {
     assert.equal(monthly.dataStart, new Date(old).toISOString());
   });
 
+  it("解析失败数与回收率随窗口取，超限行也只数窗口内的", async () => {
+    // 期望值全部独立写死，不从被测 SQL 派生：`input: 7501` 是刻意压在 OVERSIZED_TOKENS(7500)
+    // 两侧造出来的（7500 不算、7501 算），`old` 那两行是要被窗口挡在外面的对照。
+    const dir = await tempDir();
+    const dbPath = path.join(dir, HISTORY_DB);
+    const now = Date.now();
+    const old = now - 40 * DAY_MS;
+    await seedLedger(dbPath, [
+      { at: now, input: 7501, output: 200, saved: 100 },
+      { at: now, input: 7500, output: 200, saved: 100 },
+      { at: old, input: 9000, output: 200, saved: 100 },
+    ]);
+    await seedParseFailures(dbPath, [
+      { at: now, succeeded: true },
+      { at: now, succeeded: true },
+      { at: now, succeeded: false },
+      { at: old, succeeded: false },
+    ]);
+    const weekly = await readPrefixLedger(dbPath, "", {
+      form: "prefix",
+      rangeDays: 7,
+      granularity: "day",
+    });
+    // 窗口内的三条里两条救回来了 → 2/3；40 天前那条落在窗口外，不进分子也不进分母。
+    assert.deepEqual({ ...weekly.failures }, { total: 3, recovered: 2 });
+    // 7501 算一行、7500 不算（判据是严格大于）、9000 在窗口外。
+    assert.equal(weekly.oversized, 1);
+    const monthly = await readPrefixLedger(dbPath, "", {
+      form: "prefix",
+      rangeDays: 90,
+      granularity: "day",
+    });
+    assert.deepEqual({ ...monthly.failures }, { total: 4, recovered: 2 });
+    assert.equal(monthly.oversized, 2);
+  });
+
+  it("老库没有 parse_failures 表时留 0，不把整页判成 schema", async () => {
+    // `parse_failures` 是 rtk 后来才加的表。缺它时 `readPrefixLedger` 要照常交出聚合，
+    // 只把这两个数留 0——若让异常穿出去，整个改写形态会显示「账本形状不认识」。
+    const dbPath = path.join(await tempDir(), HISTORY_DB);
+    await seedLedger(dbPath, [{ at: Date.now(), saved: 100 }]);
+    const ledger = await readPrefixLedger(dbPath, "", {
+      form: "prefix",
+      rangeDays: 7,
+      granularity: "day",
+    });
+    assert.equal(ledger.availability, "ok");
+    assert.deepEqual({ ...ledger.failures }, { total: 0, recovered: 0 });
+    assert.equal(ledger.oversized, 0);
+  });
+
+  it("窗口内一行都没有时 failures 仍交出两个 0（SUM 在空集上是 null）", async () => {
+    // `SUM(...)` 对空集返回 NULL 而不是 0：不兜这一位，`recovered` 会被当成 `null` 一路
+    // 传到界面上，页脚的回收率算出 `NaN%`。这里命令表存在但为空，正好走到那一支。
+    const dbPath = path.join(await tempDir(), HISTORY_DB);
+    await seedLedger(dbPath, []);
+    await seedParseFailures(dbPath, []);
+    const ledger = await readPrefixLedger(dbPath, "", {
+      form: "prefix",
+      rangeDays: 7,
+      granularity: "day",
+    });
+    assert.equal(ledger.availability, "ok");
+    assert.deepEqual({ ...ledger.failures }, { total: 0, recovered: 0 });
+    assert.equal(ledger.oversized, 0);
+    assert.equal(ledger.dataStart, null);
+  });
+
+  it("recall 库的体检数按条数与文件大小给，不按窗口", async () => {
+    // 与上面几条的判据不同：`recall.db` 里没有「窗口」这个概念（rtk 自己按保留天数与条数上限
+    // 整库淘汰），所以这里只数「现在有多少」。
+    const dir = await tempDir();
+    const dbPath = path.join(dir, HISTORY_DB);
+    const recallDb = path.join(dir, RECALL_DB);
+    await seedLedger(dbPath, [{ at: Date.now() }]);
+    const bytes = await seedRecallDb(recallDb, 3);
+    const ledger = await readPrefixLedger(dbPath, recallDb, {
+      form: "prefix",
+      rangeDays: 7,
+      granularity: "day",
+    });
+    assert.equal(ledger.recall.entries, 3);
+    // 字节数取**文件大小**而不是 `SUM(byte_size)`：后者是压缩前的长度（`codec` 实测是 gzip），
+    // 而用户关心的「这个库在长大」说的是磁盘上那一份。
+    assert.equal(ledger.recall.bytes, bytes);
+  });
+
+  it("recall 库不存在或还没建表时给两个 0，不拖红整页", async () => {
+    const dir = await tempDir();
+    const dbPath = path.join(dir, HISTORY_DB);
+    await seedLedger(dbPath, [{ at: Date.now() }]);
+    const absent = await readPrefixLedger(dbPath, path.join(dir, "nope", RECALL_DB), {
+      form: "prefix",
+      rangeDays: 7,
+      granularity: "day",
+    });
+    assert.equal(absent.availability, "ok");
+    assert.deepEqual({ ...absent.recall }, { entries: 0, bytes: 0 });
+
+    // 文件在但没有 `recall` 表（rtk 用的是 tee 模式，或库是别的进程刚建的）。
+    const bare = path.join(dir, RECALL_DB);
+    await seedEmptyDb(bare);
+    const noTable = await readPrefixLedger(dbPath, bare, {
+      form: "prefix",
+      rangeDays: 7,
+      granularity: "day",
+    });
+    assert.equal(noTable.recall.entries, 0);
+    assert.equal(noTable.recall.bytes > 0, true, "文件在就有大小，哪怕里面没有我们认得的表");
+  });
+
+  it("recall 路径给空串时一个库都不读（用户把记账配空了）", async () => {
+    const dir = await tempDir();
+    const dbPath = path.join(dir, HISTORY_DB);
+    await seedLedger(dbPath, [{ at: Date.now() }]);
+    const ledger = await readPrefixLedger(dbPath, "", {
+      form: "prefix",
+      rangeDays: 7,
+      granularity: "day",
+    });
+    assert.deepEqual({ ...ledger.recall }, { entries: 0, bytes: 0 });
+  });
+
   it("库不存在时报 missing", async () => {
     const dir = await tempDir();
-    const ledger = await readPrefixLedger(path.join(dir, "nope.db"), {
+    const ledger = await readPrefixLedger(path.join(dir, "nope.db"), "", {
       form: "prefix",
       rangeDays: 7,
       granularity: "day",
@@ -415,7 +621,7 @@ describe("readPrefixLedger", () => {
   it("库在但没有 commands 表时报 missing（插件自己会把文件造出来）", async () => {
     const dbPath = path.join(await tempDir(), HISTORY_DB);
     await seedEmptyDb(dbPath);
-    const ledger = await readPrefixLedger(dbPath, {
+    const ledger = await readPrefixLedger(dbPath, "", {
       form: "prefix",
       rangeDays: 7,
       granularity: "day",
@@ -432,7 +638,7 @@ describe("readPrefixLedger", () => {
     const db = new DatabaseSync(dbPath);
     db.exec("CREATE TABLE commands (timestamp TEXT NOT NULL, original_cmd TEXT NOT NULL)");
     db.close();
-    const ledger = await readPrefixLedger(dbPath, {
+    const ledger = await readPrefixLedger(dbPath, "", {
       form: "prefix",
       rangeDays: 7,
       granularity: "day",
@@ -446,6 +652,7 @@ describe("readPrefixLedger", () => {
     const warns: string[] = [];
     const ledger = await readPrefixLedger(
       dbPath,
+      "",
       {
         form: "prefix",
         rangeDays: 7,
@@ -472,6 +679,7 @@ describe("readPrefixLedger", () => {
     const warns: string[] = [];
     const ledger = await readPrefixLedger(
       dbPath,
+      "",
       { form: "prefix", rangeDays: 7, granularity: "day" },
       () => Promise.resolve(broken),
       (line) => {
@@ -497,6 +705,7 @@ describe("readPrefixLedger", () => {
     const warns: string[] = [];
     const ledger = await readPrefixLedger(
       dbPath,
+      "",
       { form: "prefix", rangeDays: 7, granularity: "day" },
       undefined,
       (line) => {
@@ -528,7 +737,7 @@ describe("clearRtkCommands", () => {
 
     await clearRtkCommands(dbPath);
 
-    const after = await readPrefixLedger(dbPath, {
+    const after = await readPrefixLedger(dbPath, "", {
       form: "prefix",
       rangeDays: 7,
       granularity: "day",
@@ -567,7 +776,7 @@ describe("clearRtkCommands", () => {
     assert.equal(warns.length, 1);
     assert.match(warns[0] ?? "", /refusing to clear .* symbolic link/u);
     // 目标一行没动：拒绝是**真的**拒绝，不是「先清再报警」。
-    const after = await readPrefixLedger(real, {
+    const after = await readPrefixLedger(real, "", {
       form: "prefix",
       rangeDays: 7,
       granularity: "day",
@@ -592,7 +801,7 @@ describe("createRtkLedger", () => {
   it("把读与清传给两个函数", async () => {
     const dbPath = path.join(await tempDir(), HISTORY_DB);
     await seedLedger(dbPath, [{ at: Date.now() }]);
-    const ledger = createRtkLedger(dbPath);
+    const ledger = createRtkLedger(dbPath, "");
     const read = await ledger.read({ form: "prefix", rangeDays: 7, granularity: "day" });
     assert.equal(read.availability, "ok");
     await ledger.clear();

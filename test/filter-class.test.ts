@@ -8,13 +8,17 @@ import assert from "node:assert/strict";
 import { classOf } from "../lib/filter-class.ts";
 import { PIPE_TABLE } from "../lib/command-filter.ts";
 
-const SUMMARY_FILTERS = ["cargo-test", "pytest", "vitest", "ctest", "go-test"];
+const SUMMARY_FILTERS = ["cargo-test", "pytest", "vitest", "ctest", "go-test", "phpunit", "pest"];
 const COMPILE_FILTERS = ["tsc", "mypy", "go-build"];
 const LINT_FILTERS = ["ruff-check", "ruff-format"];
 const VCS_FILTERS = ["git-log", "git-diff"];
 // 只列**真的会被 `filterOf` 产出的** filter 名：`rg` 归 `grep`、`fd` 归 `find`（rtk pipe 只认
 // 这两个名字），表里若留着 `rg`/`fd` 两条映射就是死条目——它们永远不会被查。
-const LISTING_FILTERS = ["grep", "find", "git-status"];
+//
+// `window` 与 `hook` 也不是 rtk 的 filter 名，但它们**会**被查到（`host.ts` 的 `modeOf` 用它
+// 分流到本包的两条本地路径），所以登记在这里的是「过滤名 → 护栏类别」这张映射的全部键，
+// 不是「rtk pipe 的档位表」。两者归 `listing` 的理由见 `lib/filter-class.ts` 的注释。
+const LISTING_FILTERS = ["grep", "find", "git-status", "window", "hook"];
 
 describe("classOf 的边界", () => {
   it("`rg` / `fd` 不是 filter 名（rtk 用 grep / find），因此未登记", () => {

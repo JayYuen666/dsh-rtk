@@ -37,6 +37,18 @@ const CLASSES: ReadonlyMap<string, FilterClass> = new Map<string, FilterClass>([
   ["grep", "listing"],
   ["find", "listing"],
   ["git-status", "listing"],
+  ["phpunit", "summary"],
+  ["pest", "summary"],
+  // `window` 不是 rtk 的 filter 名，是本包的本地头尾窗口（`lib/output-window.ts`）。
+  // 归 `listing` 是因为它做的正是「一列条目里砍掉一段」——护栏的 `folded-entries`
+  // 会看见省略标记、判成可回收的有损压缩，于是走「先落 spill 再放行 + 正文首行写路径」
+  // 那条路。这不是借用：窗口与 listing 折叠在语义上就是同一件事。
+  ["window", "listing"],
+  // `hook` 也不是 rtk 的 filter 名：那是 `rtk hook claude` 的 pipeline 链（ansi / progress /
+  // dedup）。同样归 `listing`——`dedup` 会把 200 行相同告警折成一行 + `[x200]`，行数塌缩的
+  // 规模与 listing 折叠一样大，所以它必须落在同一条可回收判据下（见 `lib/guard.ts` 的
+  // `LINE_COLLAPSE_FILTERS`）。
+  ["hook", "listing"],
 ]);
 
 /** filter 的护栏类别；未登记返回 `undefined`。 */

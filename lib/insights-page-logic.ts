@@ -13,7 +13,14 @@ import type {
   Suggestion,
   Totals,
 } from "./insights-shape.ts";
-import { bucketLabel, formatDuration, formatPct, formatTokens, isSparse } from "./insights-view.ts";
+import {
+  bucketLabel,
+  formatBytes,
+  formatDuration,
+  formatPct,
+  formatTokens,
+  isSparse,
+} from "./insights-view.ts";
 import { localDayKey } from "./time-buckets.ts";
 
 /** `YYYY-MM-DD` 形态：pipe 侧本来就是日粒度，直接放行，不进 `Date.parse`。 */
@@ -278,6 +285,65 @@ export function dataStartOf(response: { readonly dataStart: string | null }): st
   }
   const parsed = Date.parse(raw);
   return Number.isNaN(parsed) ? raw : localDayKey(parsed);
+}
+
+/** 页脚里一条「与 rtk 自己对账」的说明：文案键 + 参数，句子归字典。 */
+export interface RtkSelfLine {
+  readonly messageKey: "rtkSelfFailures" | "rtkSelfOversized" | "rtkSelfRecall";
+  readonly values: Record<string, string>;
+}
+
+/**
+ * 页脚的 rtk 自账对账行。
+ *
+ * 三条判据，每条都对应一个真实会误导读者的情形：
+ *  - **只有 prefix 形态问**：另外两档的分子分母来自插件自己的表，而「`rtk gain` 排除超限行」
+ *    说的是 `commands` 表，与那一屏无关。混在一起等于让两个口径互相解释。
+ *  - **账本不可用时不问**：读不到账本时这几个位恒 0，印「解析失败 0 次」是把「没读到」说成
+ *    「一次都没失败」——而这正是页脚要解释的那件事。
+ *  - **0 不印**：页脚本来就在解释「为什么这一屏没有数」，再挂一句「0 次」只会把它撑长。
+ * @param response - 一份回执（只要这几位：形态、账本可用性、rtk 自账三个数）
+ * @returns 需要打印的那几条（可能为空）
+ */
+export function rtkSelfLinesOf(response: {
+  readonly form: InsightsForm;
+  readonly availability: Availability;
+  readonly rtkSelf: {
+    readonly parseFailures: number;
+    readonly recovered: number;
+    readonly oversized: number;
+    readonly recallEntries: number;
+    readonly recallBytes: number;
+  };
+}): RtkSelfLine[] {
+  if (response.form !== "prefix" || response.availability.prefix !== "ok") {
+    return [];
+  }
+  const { parseFailures, recovered, oversized, recallEntries, recallBytes } = response.rtkSelf;
+  const lines: RtkSelfLine[] = [];
+  if (parseFailures > 0) {
+    lines.push({
+      messageKey: "rtkSelfFailures",
+      // 分母是失败数本身：0 次失败进不来这一支（上一行已经挡掉），不必再兜 0 除法。
+      values: {
+        failures: String(parseFailures),
+        recovered: String(recovered),
+        rate: formatPct((recovered / parseFailures) * 100),
+      },
+    });
+  }
+  if (oversized > 0) {
+    lines.push({ messageKey: "rtkSelfOversized", values: { oversized: String(oversized) } });
+  }
+  // recall 那一条与上面两条的判据不同：它不看窗口（那个库由 rtk 整库淘汰），所以
+  // `entries === 0` 才是「还没折过东西」，而不是「这一屏没有」。
+  if (recallEntries > 0) {
+    lines.push({
+      messageKey: "rtkSelfRecall",
+      values: { entries: String(recallEntries), size: formatBytes(recallBytes) },
+    });
+  }
+  return lines;
 }
 
 /** 结局的语义色调：成功绿、跳过黄、失败红。用一个词而不是颜色值，是因为颜色写在 CSS 里

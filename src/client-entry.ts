@@ -212,6 +212,10 @@ const CARD_CSS = [
   // `initial-value:0`，数字会永远停在 0。把时长压到 1ms 等价于「直接给终值」。
   "@media (prefers-reduced-motion:reduce){.rtkc-kpi-value[data-count]{animation-duration:1ms}}",
   ".rtkc-chart{width:100%;height:220px}",
+  // 「退成柱子」那句说明（`chartSparseNote`）：它原来是灰色小字 `rtkc-note`，和页脚、空窗
+  // 提示同色同号，于是「比率去哪了」这个真问题被读成「没画出来」。这里给它一条独立的琥珀色
+  // 提示条（复用 `.rtkc-hint` 的观感），左侧再借折线色点一下「本来这里会有一条线」。
+  ".rtkc-sparse{font-size:12px;line-height:1.65;margin:8px 0 0;padding:7px 9px;border-radius:7px;border-left:3px solid var(--rtkc-chart-line);background:rgba(224,166,58,.1);color:var(--dsw-alias-label-primary,inherit)}",
   // 卡片小图：**不能矮于 120px**。ECharts 的 `grid` 上下各留 28/24px 给刻度与轴标签，
   // 64px 高时绘图区只剩约 10px——真机上表现为「一条横线 + 两个看不见的柱」，
   // 看着像图坏了。162px 给柱子留出约 80px，两根柱子的高度差才读得出来。
@@ -587,7 +591,7 @@ function StatsSection(props: {
 }
 
 /**
- * 九个可写字段的写入分派。**字段名必须是字面量**：schema-coverage 门禁按 `set("字段名")`
+ * 十一个可写字段的写入分派。**字段名必须是字面量**：schema-coverage 门禁按 `set("字段名")`
  * 的字面量识别「这一格有绑定」，拼变量名会让它判成未绑定、整包门禁红。
  */
 async function writeField(
@@ -615,6 +619,12 @@ async function writeField(
   }
   if (key === "stdoutCapBytes") {
     return set("stdoutCapBytes", numberOf(draft));
+  }
+  if (key === "windowHeadLines") {
+    return set("windowHeadLines", numberOf(draft));
+  }
+  if (key === "windowTailLines") {
+    return set("windowTailLines", numberOf(draft));
   }
   if (key === "warnHint") {
     return set("warnHint", draft !== false);
@@ -841,6 +851,44 @@ function cardNumberFields(props: FieldSectionProps): ReactNode[] {
         setField("stdoutCapBytes", next);
       },
     }),
+    // 窗口那两位排在一起（头 / 尾），与它们在上游 `cap` method 里的相邻关系一致：
+    // 分开摆会让「这两个数是同一件事的两半」读不出来。
+    numberField({
+      t,
+      field: "windowHeadLines",
+      label: t("windowHeadLabel"),
+      hint: t("windowHeadHint"),
+      value: view.windowHeadLines,
+      min: 0,
+      max: 5000,
+      step: 1,
+      editable: writable,
+      resetToken,
+      onInvalidChange: (invalid) => {
+        reportInvalid("windowHeadLines", invalid);
+      },
+      onChange: (next) => {
+        setField("windowHeadLines", next);
+      },
+    }),
+    numberField({
+      t,
+      field: "windowTailLines",
+      label: t("windowTailLabel"),
+      hint: t("windowTailHint"),
+      value: view.windowTailLines,
+      min: 0,
+      max: 5000,
+      step: 1,
+      editable: writable,
+      resetToken,
+      onInvalidChange: (invalid) => {
+        reportInvalid("windowTailLines", invalid);
+      },
+      onChange: (next) => {
+        setField("windowTailLines", next);
+      },
+    }),
     toggleField({
       label: t("warnHintLabel"),
       hint: t("warnHintHint"),
@@ -943,7 +991,7 @@ function RtkCard(props: CardSlotProps): ReactNode {
   const [saveError, setSaveError] = useState<string | null>(null);
   const { statsRemote: reader, t } = props;
   const { overview, status, resetStats } = useStatsRefresh(reader);
-  // 越界集与重置信号由 shared 的 `useInvalidFields()` 提供（六个仓共用同一套判定）。
+  // 越界集与重置信号由 shared 的 `useInvalidFields()` 提供（多个消费仓共用同一套判定）。
   const invalid = useInvalidFields();
   const { blocked, fields: invalidFields, resetToken, reportInvalid } = invalid;
 

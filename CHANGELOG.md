@@ -4,6 +4,138 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.2
+
+The two shapes get the outputs rewriting cannot reach and `rtk pipe` has no filter for: log files and
+directory listings, windowed in this plugin with the elided middle saved for retrieval. The Insights
+footnote also learned to reconcile itself with `rtk gain`.
+
+### Added
+
+- **The `prefix` shape now assembles on Windows.** `installPrefixShadow` no longer rejects `win32`;
+  the only assembly gate is `findOnPath("rtk")`, whose Windows candidates are `.exe` / `.cmd` / the
+  bare name. This supersedes the conservative stance recorded in earlier versions. CI now installs
+  rtk 1.2.0 on all three runners from the official release assets (sha256 checked) and runs the real
+  CLI circuits with `DSH_RTK_TEST_MODE=real`; the fake-rtk fixtures are executable on POSIX and use
+  `path.delimiter`, so those tests no longer depend on a machine-installed rtk.
+- **Log output is windowed locally, and the cut middle stays retrievable.** `lib/output-window.ts`
+  keeps the first 50 and last 200 lines of a long log and folds the middle into a single
+  `[+N lines omitted]` marker; `host.ts` routes a command to this `window` mode when `isLogTarget`
+  matches. The reason is that nothing else covers it: `rtk read` defaults to `--level none` and
+  passes bytes through unchanged (`guard.ts` 14,947 B → 14,947 B), its `aggressive` level strips the
+  `export` keyword off every declaration, and `rtk pipe` has no `cat` filter at all — while `cat` is
+  the single largest command family in a real ledger (35.4% of input tokens). The marker shape is
+  `[+N lines omitted]` on purpose: that is the family `GUARD_RULES`' `folded-entries` rule already
+  recognises, so the window cannot silently become an unreported truncation — the guard rejects it,
+  the original goes to the spill store, and the relaxed pass writes the retrieval path as the first
+  line of the body. Scope is command × target: `cat src/app.ts` is untouched (source files are never
+  windowed), and both line counts are card fields (`windowHeadLines` / `windowTailLines`, defaulting
+  to the same 50/200 as rtk's own `cap` method).
+- **`phpunit` and `pest` join the filter table.** `rtk pipe -f phpunit` keeps every failure fact
+  (method name, assertion text, `FooTest.php:42`) while going 466 B → 212 B, and `pest` passes
+  through faithfully (though it does not compress: guard says `low-gain`, which is the right answer).
+  `pint`, `phpstan`'s text path, `sqlfluff-lint`'s text path, `ecs` and `log` were measured and
+  **rejected** — the first three only parse JSON or fail into a tail-of-60-lines fallback, `ecs`
+  drops the stack trace, and `log` discards every line its keyword classifier does not recognise.
+  `prettier` stays permanently out (it fabricates success).
+- **The Insights footnote reconciles itself with `rtk gain`.** `rtkSelf` carries rtk's own two
+  counters from the **same** ledger and window: failed parse count plus how many fell back and ran
+  anyway (`parse_failures`), and how many rows `rtk gain` would exclude as oversized (input above
+  7,500 tokens, rtk's `HEADLINE_INPUT_CAP_TOKENS`). The page deliberately keeps the full totals and
+  only annotates the difference, so the two numbers can be told apart instead of one silently
+  mimicking the other. Both lines appear only for the rewrite shape, only when the ledger is
+  readable, and only when non-zero — printing "0 parse failures" when the ledger could not be read
+  would turn "nothing was read" into "nothing failed".
+
+- **The recall store is taken over, so folded output is retrievable inside dsh.** The injected prefix
+  now carries `RTK_RECALL_DB` next to `RTK_DB_PATH`, pointing at `$DSH_HOME/rtk/recall.db`. Before
+  this, the prefix path only set `RTK_DB_PATH`; measured under a clean `HOME`, a single `rtk ls -la`
+  then created the **global** `~/Library/Application Support/rtk/recall.db` and wrote one row into it,
+  so the compressed lines pointed at a store the page never mentioned. Both variables are also
+  tombstoned in `withoutRtkDbEnv`, and the Insights footer reports the store's entry count and disk
+  size (file size, not `SUM(byte_size)` — that column holds the pre-gzip length). "Clear" deliberately
+  does not touch it: the pointers already handed to the model would stop resolving, while the button
+  promises to clear counters.
+- **rtk's own cleanup chain runs on dsh output.** `lib/rtk-hook.ts` generates a `pipeline.toml` at
+  `$DSH_HOME/rtk/config/pipeline.toml` (`schema_version = 1`, `extends = "rtk:posthook"`, plus one
+  `[[hook.after_tool.shell]]` rule this plugin owns) and `host.ts` pipes long output through
+  `rtk hook claude` before windowing it. The chain is `ansi → progress → dedup`: `base64-elide` was
+  measured and left out because its `MethodInfo` is `lossy: true, recovery: Recovery::None` and
+  removing it changed the compressed result by zero bytes; `cap` is left out because the windowing
+  above already cuts head and tail, and two cutters would make the omitted count un-reconcilable.
+  Order is clean-then-window on measurement (792-line build log 32,550 B → 9,228 B, against 10,366 B
+  for the window alone and 9,309 B the other way round). It takes the output above the log window
+  and the long output no filter claims (`./build.sh`, `make`), so `hook` joins the default filter set.
+  Three side effects are isolated rather than tolerated: the config lives under `RTK_CONFIG_DIR`, the
+  ledger under a **separate** `$DSH_HOME/rtk/hook.db` (rtk writes one `Bash <cmd>` row per call, which
+  would otherwise show up as a command in the Insights tables), and `HOME` / `USERPROFILE` (plus
+  `APPDATA` / `LOCALAPPDATA` on Windows) point at `$DSH_HOME/rtk/home` — without that last one, rtk
+  writes `pipeline-status.json` into the platform data dir and a clean load **deletes the user's own
+  copy** (measured on macOS; on Windows rtk resolves that directory through the Known Folder API, so
+  the redirect is best-effort and not yet verified on a real machine). `parseHookOutput` treats an
+  empty reply as "nothing to change", not "compressed to nothing": rtk emits zero bytes whenever
+  `never_worse` or `min_size` says no, and hiding the output in that case would be the worst possible
+  reading.
+
+- **Reading material is never touched, and the model is told why.** Two changes with one goal: the
+  model must not be able to mistake a compressed excerpt for a complete output. First, the "never
+  touched" predicate got narrower — `isReadingTarget` (`lib/output-window.ts`) means a file-reading
+  command (`cat` / `head` / `tail` / `less` / `more` / `zcat` / `zless` / `zmore`) **whose operands
+  carry no log extension**, so `head -1000 src/app.ts` (900 lines → 4,400 B before this) and
+  `cat notes.txt` now pass through untouched, while `cat build.log` still gets windowed. `.txt` left
+  the log-extension list for the same reason: the real ledger's `.txt` rows are
+  `coverage/rust-summary.txt`, `.scratch/*-gaps.txt`, `huge.txt` — reports and prose, not noise.
+  Second, the plugin now registers a resident summary (`rtk-usage`, systemPrompt order 1565) holding
+  the three facts that change a decision — reading commands are never compressed, anything dropped is
+  retrievable, `rtk bypass <cmd>` is the one clean way to keep a command verbatim — and registers the
+  full rules as the virtual skill `rtk`, which appears in the skill catalog from the first step and
+  loads by name. The body is not pushed into the context by default. `@deepseek-ai/dsh-skill` and
+  `@deepseek-ai/dsh-system-prompt` are `devDependencies` only, and `skills` is deliberately **not**
+  in `inject`: a missing skill service costs only the loadable body, never the assembly.
+
+### Fixed
+
+- **`windowOf` returns through a single exit.** The first version had one branch returning a value
+  and another returning nothing, which the repository's `typescript(consistent-return)` baseline
+  rejects; the rewrite is behaviour-identical.
+- **A hook pass that saved nothing is reported as "nothing to save", not as a failure.** `rtk hook`
+  emits zero bytes whenever `never_worse` or `min_size` says no, so the `hook` mode legitimately
+  returns "no change" — and `renderCompressed` was mapping that to `pipe-failed`, the record type for
+  a spawn failure. On the page that reads as "rtk is broken" and sends the reader to check the
+  installation, when the honest answer is "this output had nothing worth cutting". Both non-spawning
+  modes (`window` and `hook`) now record `guard:low-gain`; only the `rtk pipe` branch can produce
+  `pipe-failed`.
+- **The `already-rewritten` handoff no longer gives up on rewrites that compress nothing.**
+  `rtk rewrite` turns `cat build.log` into `rtk read build.log`, and `rtk read`'s `--level` defaults
+  to `none` — measured, 22,390 B in and 22,390 B out. So "this call was rewritten" was being read as
+  "this output is already compressed", and the window never got a chance at exactly the family where
+  it earns most: `rtk_cmd = 'rtk read'` is 710 rows / 7,353,339 input tokens all-time, of which the
+  rows with a log-extension target are 431 rows / 6,672,440 tokens; since 1.2.0 that is still 73 rows
+  / 1,855,886 tokens. The one-shot ledger now records the rewritten command instead of a boolean, and
+  `isVerbatimRewrite` (in `lib/dedup.ts`) keeps the handoff only for rewrites that really do compress
+  (`rtk read` with no `-l` / `-m` / `--head-lines` / `--tail-lines`). The ledger entry is still
+  consumed either way, so a call is never asked twice.
+- **The bars-only fallback now says where the rate went.** When fewer than three buckets carry
+  savings the chart drops the rate line on purpose (two points are not a trend), but the old note
+  only explained the missing line — so on a real ledger, where two days of data mean every window and
+  granularity lands in that mode, the page read as "the rate is not drawn". The note is now its own
+  amber callout rather than grey footnote text, and it names both places the rate still appears (the
+  KPI row and the detail tables). The fallback rule itself is unchanged.
+
+### Tests
+
+- 991 cases across 62 files, coverage at 100% on all four dimensions. New unit files:
+  `test/output-window.test.ts` (target detection over nine log viewers, nine log extensions and
+  seven source extensions, reading-material detection, plus the window's marker shape, line
+  accounting, newline preservation and invalid-argument handling), `test/rtk-hook.test.ts` (the
+  generated `pipeline.toml`, the PostToolUse payload, the eight environment keys and the three-level
+  reply parser) and `test/skill.test.ts` (the skill spec handed to the host, every silent failure
+  mode — absent service, empty body, throwing register — and where the disposal lands). The
+  integration rigs under `test/integration/` drive the real Cordis pipeline, the real agent loop,
+  the real tool-bash receipts, the real web gateway and loader, the real rtk CLI, and real cargo/git
+  data; `test/platform/platform.test.ts` asserts the assembly gate on the host platform, Windows
+  included.
+
 ## 0.2.1
 
 Compression stops being decorative. The default filter set now covers the commands command rewriting

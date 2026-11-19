@@ -74,6 +74,61 @@ jobs:
       # lockfile 后继续跑——那样绿的是「CI 现场解出来的那棵树」，不是仓库里这一份。
       - shell: bash
         run: pnpm install --frozen-lockfile
+      # 真实 rtk 回路：三格都装真 rtk，门禁随后以 DSH_RTK_TEST_MODE=real 跑，缺件必红而不是静默跳过。
+      # 版本钉在 README 实测口径的 1.2.0，资产与 sha256 都取自官方 release（不是安装脚本的 latest）；
+      # GitHub 托管的 runner 不预装 rtk，这一步就是那唯一来源。装完当场打印版本，作为正向证据。
+      - name: 安装 rtk（真实 CLI 回路）
+        shell: bash
+        env:
+          RTK_VERSION: "1.2.0"
+        run: |
+          set -euo pipefail
+          os="$(uname -s)"
+          arch="$(uname -m)"
+          case "$arch" in
+            x86_64|amd64) arch="x86_64" ;;
+            arm64|aarch64) arch="aarch64" ;;
+            *) echo "::error::不认识的架构：$arch"; exit 1 ;;
+          esac
+          case "$os" in
+            Linux) target="unknown-linux-musl"; ext="tar.gz" ;;
+            Darwin) target="apple-darwin"; ext="tar.gz" ;;
+            MINGW*|MSYS*|CYGWIN*) target="pc-windows-msvc"; ext="zip" ;;
+            *) echo "::error::不认识的操作系统：$os"; exit 1 ;;
+          esac
+          asset="rtk-${arch}-${target}.${ext}"
+          base="https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}"
+          bin="$RUNNER_TEMP/rtk-bin"
+          mkdir -p "$bin"
+          curl -fsSL "$base/$asset" -o "$RUNNER_TEMP/$asset"
+          curl -fsSL "$base/checksums.txt" -o "$RUNNER_TEMP/rtk-checksums.txt"
+          expected="$(awk -v name="$asset" '$2 == name { print $1 }' "$RUNNER_TEMP/rtk-checksums.txt")"
+          if [ -z "$expected" ]; then
+            echo "::error::官方 checksums.txt 里没有 $asset"
+            exit 1
+          fi
+          actual="$(node -e 'const { createHash } = require("node:crypto"); const { readFileSync } = require("node:fs"); process.stdout.write(createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"))' "$RUNNER_TEMP/$asset")"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::$asset 的 sha256 不匹配"
+            exit 1
+          fi
+          if [ "$ext" = "zip" ]; then
+            # Windows 的 bsdtar 能解 zip；Git Bash 自带的 GNU tar 不能。
+            "$(cygpath -u "$SYSTEMROOT")/System32/tar.exe" -xf "$RUNNER_TEMP/$asset" -C "$bin"
+            exe="rtk.exe"
+            cygpath -w "$bin" >> "$GITHUB_PATH"
+          else
+            tar -xzf "$RUNNER_TEMP/$asset" -C "$bin"
+            exe="rtk"
+            echo "$bin" >> "$GITHUB_PATH"
+          fi
+          chmod +x "$bin/$exe" 2>/dev/null || true
+          installed="$(PATH="$bin:$PATH" "$bin/$exe" --version)"
+          if [ "$installed" != "rtk ${RTK_VERSION}" ]; then
+            echo "::error::rtk 版本不是 ${RTK_VERSION}：${installed}"
+            exit 1
+          fi
+          echo "rtk 已就绪：${installed}"
       # 两格命令不同：四项 100% 覆盖率门只由 ubuntu 一格判定（覆盖率报告也只收它），其余格
       # 跑同一套 typecheck/lint/两个 bundle/全量用例/格式，不判覆盖率。windows 格的全量用例
       # 照跑：root 判据的 win32 档收盘符与 UNC（lib/cli.ts 的 assertAbsoluteRoot），真盘用例
@@ -83,6 +138,7 @@ jobs:
         shell: bash
         env:
           NO_COLOR: "1"
+          DSH_RTK_TEST_MODE: "real"
         run: |
           set -o pipefail
           pnpm run check 2>&1 | tee "$RUNNER_TEMP/gate.log"
@@ -91,6 +147,7 @@ jobs:
         shell: bash
         env:
           NO_COLOR: "1"
+          DSH_RTK_TEST_MODE: "real"
         run: |
           set -o pipefail
           pnpm run check:platform 2>&1 | tee "$RUNNER_TEMP/gate.log"

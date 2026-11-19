@@ -6,7 +6,7 @@
  * **位置解析住在 `lib/rtk-paths.ts`**：这里只剩「拿到一个路径之后做什么」。分开的理由是路径要
  * 三处共用（读面、写面、沙箱登记），而「怎么写 SQL」只属于读面。
  */
-import { existsSync, lstatSync, mkdirSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, statSync } from "node:fs";
 
 import type { InsightsRequest } from "./insights-shape.ts";
 import { physicalDirOf } from "./rtk-paths.ts";
@@ -58,6 +58,31 @@ export interface LedgerWorkdirRow {
 }
 
 /**
+ * rtk 自己「没认出命令、退回原样执行」的那本账（`parse_failures` 表）。
+ *
+ * `total` 是窗口内所有解析失败，`recovered` 是其中 `fallback_succeeded = 1`（退回原样执行
+ * 之后照样跑成了）的那部分。rtk 的 `rtk gain -F` 报这两个数再加一个回收率；这里只搬两个
+ * 计数，百分比由界面算——它是 100 × recovered / total，total 为 0 时**没有回收率可言**
+ * （rtk 自己在这种情况下给 0.0%，那是「没东西可回收」不是「一次都没救回来」）。
+ */
+export interface ParseFailureTally {
+  readonly total: number;
+  readonly recovered: number;
+}
+
+/**
+ * `recall.db` 的两个读数：存了多少条、占多少字节。
+ *
+ * 这是**取回通道**的体检数，不是节省量：rtk 把被折叠掉的中段（`[+N hidden: rtk recall <hash>]`
+ * 指向的那些）存进这里，模型可以按 hash 取回。页脚显示它只为一件事——让人知道「有一个库在
+ * 悄悄长大」，以及去哪个目录找它。
+ */
+export interface RecallTally {
+  readonly entries: number;
+  readonly bytes: number;
+}
+
+/**
  * 只读聚合的回执。
  *
  * `readonly` 不在这里：它是「沙箱不允许写」这件事的投影，由 service 层合成（ledger 只关心库
@@ -69,6 +94,24 @@ export interface PrefixLedgerResult {
   readonly commands: readonly LedgerCommandRow[];
   readonly workdirs: readonly LedgerWorkdirRow[];
   readonly dataStart: string | null;
+  readonly failures: ParseFailureTally;
+  /**
+   * 窗口内 input 超过 rtk 展示上限的行数。
+   *
+   * 这一位存在的理由只有一个：`rtk gain` 会把这类行**整行排除**在汇总之外
+   * （`HEADLINE_INPUT_CAP_TOKENS`），而本页是全量汇总。两个数因此会在有大日志的那一天分叉，
+   * 页脚必须能说清「差在哪几行」。不排除是本页的取舍：这是一个只统计 dsh 会话的小库，
+   * 而 `dsh-rtk` 自己的窗口与压缩本来就在往小里收；为了对齐一个展示口径而丢掉真跑过的
+   * 命令，等于让页面的总量对不上账本的行数。
+   */
+  readonly oversized: number;
+  /**
+   * `recall.db` 的体检数（不是窗口内的——那张表没有「窗口」这个概念，rtk 自己按
+   * `retention_days` / `max_entries` 淘汰整库）。
+   *
+   * 库不存在或表不存在时给两个 0：那是「还没存过东西」，不是故障。
+   */
+  readonly recall: RecallTally;
 }
 
 /** 账本端口：读一份聚合、清一次账。 */
@@ -110,10 +153,27 @@ const READ_BUSY_TIMEOUT_MS = 500;
 const NO_SUCH_THING = /no such (?:table|column)/u;
 /** SQLite 的错误码（本层只认这一个）。 */
 const SQLITE_ERROR = "ERR_SQLITE_ERROR";
+/**
+ * rtk 汇总时排除的大行门槛（tokens）。
+ *
+ * 抄的是 rtk 自己的 `HEADLINE_INPUT_CAP_TOKENS`（`src/core/tracking.rs:424`：7,500 DB tokens
+ * ≈ 30,000 chars，等于 Claude Code 的默认 Bash 输出上限）。**这里只用它数行数、不拿它过滤**：
+ * 本页是全量汇总，`rtk gain` 会把这批行整行排除，两个数因此可能不一样，页脚负责解释差在哪。
+ */
+const OVERSIZED_TOKENS = 7500;
 
 /** 空回执（四种非 ok 态共用同一份骨架）。 */
 function emptyResult(availability: PrefixLedgerResult["availability"]): PrefixLedgerResult {
-  return { availability, days: [], commands: [], workdirs: [], dataStart: null };
+  return {
+    availability,
+    days: [],
+    commands: [],
+    workdirs: [],
+    dataStart: null,
+    failures: { total: 0, recovered: 0 },
+    oversized: 0,
+    recall: { entries: 0, bytes: 0 },
+  };
 }
 
 /**
@@ -225,6 +285,47 @@ function toRfc3339Utc(day: string): string {
 }
 
 /**
+ * 读 `recall.db` 的体检数：多少条、占多少字节。
+ *
+ * 三个「不是故障」的空档一起当成 0：库文件不存在（rtk 还没折叠过任何东西）、表不存在（老
+ * schema 或 rtk 用的是 tee 模式）、读超时（那台机器正被 rtk 写着）。recall 只是取回通道，
+ * 它的体检数读不到不该把整页判成不可用——与 `parse_failures` 同一条取舍。
+ *
+ * 字节数取**文件大小**而不是 `SUM(byte_size)`：后者是压缩前的原始字节，而用户关心的「这个库
+ * 在长大」说的是磁盘上的那份。实测 rtk 的 `recall.byte_size` 是未压缩长度，`codec` 是
+ * `gzip`（`src/core/retriever.rs` 的 `CompressedBlob`）。
+ * @param dbPath - `recall.db` 的路径；空串 = 不读
+ * @param importSqlite - 测试注入口
+ * @returns 两个计数（读不到给两个 0）
+ */
+async function readRecallTally(
+  dbPath: string,
+  importSqlite: ImportSqlite = () => import("node:sqlite"),
+): Promise<RecallTally> {
+  if (dbPath === "" || !existsSync(dbPath)) {
+    return { entries: 0, bytes: 0 };
+  }
+  let entries = 0;
+  let bytes = 0;
+  let db: DatabaseFace | undefined;
+  try {
+    bytes = statSync(dbPath).size;
+    db = await openSqlite(dbPath, { readOnly: true, timeout: READ_BUSY_TIMEOUT_MS }, importSqlite);
+    /* v8 ignore next —— `get` 在 `COUNT(*)` 聚合上恒有行（空集也是一个 0），`?.` 与 `?? 0`
+       都是类型位的兜底，不是能发生的分支；「库在但没有 recall 表」由用例钉住，走的是 catch。 */
+    entries =
+      db.prepare("SELECT COUNT(*) AS count FROM recall").get<{ readonly count: number }>()?.count ??
+      0;
+  } catch {
+    // 表不存在 / 读超时 / 文件坏：都是「体检数读不到」，给 0 而不是让整页报 unreadable。
+    entries = 0;
+  } finally {
+    closeQuietly(db);
+  }
+  return { entries, bytes };
+}
+
+/**
  * 只读聚合 rtk 账本。
  *
  * 四种非 ok 态的判据都来自实测：
@@ -235,7 +336,11 @@ function toRfc3339Utc(day: string): string {
  * - 时间窗先把边界折成 rtk 写下的 RFC3339 UTC 串、再直接比较 `timestamp` 列（见调用处的
  *   注释）：这样 `WHERE` 上是普通比较、能走索引，而分桶那一步照样用
  *   `date(timestamp,'localtime')`——分桶必须按本地日，边界也要按本地零点算，两者不矛盾。
+ * - **`failures` 与 `oversized` 是「与 rtk 自己对账」的两个数**，与 `commands` 走同一个
+ *   时间窗。前者读 `parse_failures`（rtk 后来才加的表，读不到就当 0，不把整页拖红）；
+ *   后者数 input 超 `OVERSIZED_TOKENS` 的行，只用于页脚解释「本页比 `rtk gain` 多算了什么」。
  * @param dbPath - `history.db` 的路径
+ * @param recallDb - `recall.db` 的路径（体检数用；空串 = 本次装配不碰 recall）
  * @param request - 时间窗
  * @param importSqlite - 测试注入口
  * @param warn - 读失败时的诊断口（`unreadable` 的成因不止一种，别让它零线索）
@@ -243,6 +348,7 @@ function toRfc3339Utc(day: string): string {
  */
 export async function readPrefixLedger(
   dbPath: string,
+  recallDb: string,
   request: InsightsRequest,
   importSqlite: ImportSqlite = () => import("node:sqlite"),
   warn?: (line: string) => void,
@@ -291,7 +397,42 @@ export async function readPrefixLedger(
     const first = db
       .prepare("SELECT MIN(timestamp) AS first FROM commands")
       .get<{ readonly first: string | null }>();
-    return { availability: "ok", days, commands, workdirs, dataStart: first?.first ?? null };
+    // 下面两个数是「与 rtk 自己那两个视图对得上」的部分，读不出来就报 0、不把整页拖红：
+    // `parse_failures` 是 rtk 后来才加的表，老库没有它（那时页脚写「解析失败 0 次」，
+    // 与 rtk gain -F 在同一个老库上的结论一致——它也是 0）。
+    let failures: ParseFailureTally = { total: 0, recovered: 0 };
+    try {
+      const row = db
+        .prepare(
+          `SELECT COUNT(*) AS total,
+             SUM(CASE WHEN fallback_succeeded = 1 THEN 1 ELSE 0 END) AS recovered
+           FROM parse_failures WHERE timestamp >= ?`,
+        )
+        .get<{ readonly total: number; readonly recovered: number | null }>(start);
+      /* v8 ignore next —— `get` 在 `COUNT(*)` 聚合上恒有行（空集也是一个 0），`row?.` 是类型位
+         防御；`recovered ?? 0` 那一半是**真**分支（空集上 `SUM` 返回 NULL），由空表用例钉住。 */
+      failures = { total: row?.total ?? 0, recovered: row?.recovered ?? 0 };
+    } catch {
+      // 表不存在：留空与 rtk 同口径。
+    }
+    // 超限行只数**窗口内**的：页脚解释的是「这一屏的汇总与 rtk gain 差在哪」，而 rtk gain
+    // 那句话说的也是同一段窗口。
+    /* v8 ignore next —— 同上的 `COUNT(*)` 聚合：恒有行，`?.` 与 `?? 0` 都是类型位的兜底，
+       不是能发生的分支（「窗口内一行都没有」由空表用例钉住，走的是 `n = 0` 而不是 `n` 缺席）。 */
+    const oversized =
+      db
+        .prepare("SELECT COUNT(*) AS count FROM commands WHERE timestamp >= ? AND input_tokens > ?")
+        .get<{ readonly count: number }>(start, OVERSIZED_TOKENS)?.count ?? 0;
+    return {
+      availability: "ok",
+      days,
+      commands,
+      workdirs,
+      dataStart: first?.first ?? null,
+      failures,
+      oversized,
+      recall: await readRecallTally(recallDb),
+    };
   } catch (error) {
     const code = errorFieldOf(error, "code");
     const message = errorFieldOf(error, "message");
@@ -384,13 +525,24 @@ export async function clearRtkCommands(
 }
 
 /** 把两个函数收成一个端口，供 service 层按依赖注入使用。
+ *
+ * `clear` **不碰 `recall.db`**：那个库存的是已经发给模型（可能还在上下文里）的
+ * `[+N hidden: rtk recall <hash>]` 指针所指向的原文。清掉它等于让历史轮次里的取回指引全部
+ * 失效，而用户点「清零」要清的是统计计数。rtk 自己的 `gain --reset` 也只清
+ * `commands`/`parse_failures`/`hook_decisions`/`engine_attribution`/`classifier_cache`
+ * 这五张，`recall.db` 是另一个文件、不在此列。
  * @param dbPath - `history.db` 的路径
+ * @param recallDb - `recall.db` 的路径（只用于读体检数）
  * @param warn - 读失败时的诊断口（透传给 `readPrefixLedger`）
  * @returns 账本端口
  */
-export function createRtkLedger(dbPath: string, warn?: (line: string) => void): RtkLedger {
+export function createRtkLedger(
+  dbPath: string,
+  recallDb: string,
+  warn?: (line: string) => void,
+): RtkLedger {
   return {
-    read: (request) => readPrefixLedger(dbPath, request, undefined, warn),
+    read: (request) => readPrefixLedger(dbPath, recallDb, request, undefined, warn),
     clear: () => clearRtkCommands(dbPath, undefined, warn),
   };
 }

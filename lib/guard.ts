@@ -57,6 +57,7 @@ const FAILURE_MARK =
  * | `[+150 hidden: rtk recall <hash>]` | `rtk ls` 默认 env（SQLite 模式且 hidden_lines > 0） |
  * | `[+56 lines omitted]` | `pipe -f git-log` |
  * | `[9 more lines]` | `smart_truncate` |
+ * | `[x200]` | `rtk hook` 的 `dedup` method（`engine/src/methods/dedup.rs`，连续 ≥3 行相同合并成一行 + 这个计数） |
  *
  * 一条正则覆盖不了它们：措辞、括号形态、有没有 recall 指针各不相同。曾经这里只有
  * `^\s*\+\d+(?:\s+more\S*)?$` 一条，于是 9 种标记里漏了 7 种——那等于「rtk 新换一种
@@ -73,6 +74,9 @@ const LISTING_COLLAPSE: readonly RegExp[] = [
   /^\s*\.{3}\s*\+\d+\s+more\s+files$/u,
   /^\s*\[\+\d+\s+lines?\s+omitted\]$/u,
   /^\s*\[\d+\s+more\s+lines\]$/u,
+  // `dedup` 的计数标记。它**不是**省略：被折掉的 N 行与留下的那行完全相同，信息量是 1 行。
+  // 但护栏不该知道这个区别——`[x200]` 出现就说明行数塌缩了，交给 spill 兜底才是同一条纪律。
+  /^\s*\[x\d+\]$/u,
 ];
 
 /** 行数塌缩的判据：输出非空行不到输入的 95%。95% 而非「一半」：条目类输出要么全留、
@@ -95,7 +99,13 @@ const HASH_RE = /\b[0-9a-f]{7,40}\b/gu;
  * `fd` 也不在：`rtk pipe` 只认 `find` 这个名字（`filterOf` 把 fd 归到 find），写在这里也匹配不到。
  * `ls` 留着是因为 `rtk` 有它自己的 listing 过滤器，将来若进 `PIPE_TABLE` 就直接生效。
  */
-const LINE_COLLAPSE_FILTERS: ReadonlySet<string> = new Set(["find", "ls", "git-status"]);
+const LINE_COLLAPSE_FILTERS: ReadonlySet<string> = new Set([
+  "find",
+  "ls",
+  "git-status",
+  "window",
+  "hook",
+]);
 
 /** 行数塌缩的下限：少于这个行数的输出不值得按「塌缩」判。 */
 const MIN_COLLAPSE_LINES = 20;
