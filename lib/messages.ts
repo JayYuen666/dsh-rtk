@@ -128,6 +128,10 @@ export const MESSAGES: MessagesCatalog<Messages> = {
       "",
       "源码再长也不压：这条是硬的，与「省了多少」无关。判读代码时被挖掉中段，比多看几千 token 贵得多。",
       "",
+      "**复合命令按段判，不按首词判。** `cd /repo && cat build.log` 会压（后一段是日志），`cd /repo && cat src/app.ts` 一个字都不动（后一段是阅读材料）——判据对 `&&` / `||` / `;` / `|` / 换行拆出的每一段各跑一遍；拆不开的（`$(...)`、真重定向、后台 `&`、shell 注释）退回按整条判。",
+
+      "**filter 表也按段判，只跳过「不往 stdout 写东西」的前缀段。** `cd /repo && cargo test` 命中（`cd` / `export` / `set` / `unset` / `true` / `:` 这些段跳过，再判第一个真正产出输出的段）；`ls -la && cargo test` 不命中——`ls` 的 stdout 会混进 cargo 的输出，再按 cargo 的格式去解就是硬伤。",
+      "",
       "## 四、被省掉的东西去哪取回",
       "",
       "| 标记 | 含义 | 怎么取回 |",
@@ -210,6 +214,10 @@ export const MESSAGES: MessagesCatalog<Messages> = {
       "Log extension whitelist: `.log` / `.out` / `.err` / `.jsonl` / `.ndjson` / `.trace` / `.dump` (compression suffixes such as `.gz` and rotation numbers stack). `.txt` and `.md` are **not** on it — the `.txt` files in a real ledger are reports and prose meant to be read.",
       "",
       "Source code is never compressed no matter how long: that rule is hard and independent of how much it would save. Reading code with its middle cut out costs far more than reading a few thousand extra tokens.",
+      "",
+      "**Compound commands are judged per segment, not by their first word.** `cd /repo && cat build.log` is compressed (its last segment is a log), `cd /repo && cat src/app.ts` is not touched (its last segment is reading material) — every segment split off `&&` / `||` / `;` / `|` / newline is judged on its own; shapes that cannot be split (`$(...)`, real redirection, background `&`, a shell comment) fall back to being judged as one command.",
+
+      "**The filter table is judged per segment too, skipping only leading segments that write nothing to stdout.** `cd /repo && cargo test` matches (`cd` / `export` / `set` / `unset` / `true` / `:` segments are skipped, and the first segment that actually produces output is judged); `ls -la && cargo test` does not — `ls` writes into the same stdout that is later handed to the cargo filter, and parsing that as libtest output is a real defect.",
       "",
       "## 4. Where dropped text can be retrieved",
       "",

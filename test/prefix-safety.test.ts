@@ -8,12 +8,12 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { splitCommand } from "../lib/command-segments.ts";
 import {
   structuralReject,
   findOnPath,
   executableOf,
   pipeStructuralReject,
-  splitCommand,
 } from "../lib/prefix-safety.ts";
 
 /** 两个原因串提到模块级：同一字面量在断言里出现多次，`sonarjs(no-duplicate-string)` 会判红。 */

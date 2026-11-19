@@ -589,12 +589,23 @@ describe("b 形态监听器", () => {
     host.dispose();
   });
 
-  it("首词不是测试命令的复合命令命中不了表（表每行锚 ^）", async () => {
-    // `cd /tmp && cargo test` 的 stdout 确实该压，但 pipe 表判的是**首词**——`cd` 不是
-    // cargo test 那一行的形状。这条钉住那个前提：表若哪天改成非锚定匹配就会变，届时
-    // 要么补一条 `^(cd .* &&)` 的识别、要么明确接受漏压，不能悄悄改变语义。
+  it("复合命令里的 filter 目标照样被压：`cd X && cargo test` 命中表", async () => {
+    // 表里每行都锚 `^`，而 `cd /repo && cargo test` 是模型最常用的形状之一。早先这一条
+    // 断言的是 `piped === 0`（「表按首词判，`cd` 不是 cargo test 那一行的形状」，要么补
+    // 一条识别、要么明确接受漏压）。现在补了识别：跳过**不往 stdout 写东西**的静默设置段
+    // （`cd` / `export` / `set` / `unset` / `true` / `:`）之后判第一段，所以这一条翻成
+    // 「必须压」——输出里只有 cargo test 自己的东西，没有别人的 stdout 混进来。
     const host = startPipeHost({ pipe: { exitCode: 0, stdout: PIPED } });
     const out = await host.run(RAW, { command: "cd /tmp && cargo test" });
+    assert.equal(out.piped, 1);
+    host.dispose();
+  });
+
+  it("前面有真正写输出的命令时不命中表（混进来的 stdout 会把 filter 解坏）", async () => {
+    // 与上一条互补的边界：`ls` 的 stdout 会混进 cargo test 的输出，再按 cargo 的格式
+    // 去解是硬伤。跳过只到静默段为止，这一条钉住那个界线。
+    const host = startPipeHost({ pipe: { exitCode: 0, stdout: PIPED } });
+    const out = await host.run(RAW, { command: "ls -la && cargo test" });
     assert.equal(out.piped, 0);
     host.dispose();
   });
@@ -1214,13 +1225,23 @@ describe("hook 清理链", () => {
     // 正文折成 `[xN]`（实测 200 行相同文档 6,221 B → 102 B），窗口会把中段挖掉，两者对
     // 判读代码/文档都是硬伤。
     //
+    // 复合形态是同一条规矩的另一半：`cd X && cat src/app.ts` 曾经两项判据都回 false
+    // （首词是 `cd`），于是落进清理链、被 dedup 折成 `[x200]`（实测真宿主 8,044 B 源码
+    // → 360 B）。那不是收益问题，是模型读到残件。现在按段判，它必须与裸 `cat` 同档。
+    //
     // 对照组是同一次装配下的 `CAT_LOG`（日志），它必须仍然走链——否则这条用例证不了
     // 「判据在目标上」，只能证明「装配坏了」。
-    // 三条命令各起一份装配：`startPipeHost` 的计时与去重表是按实例记的，串起来会互相污染。
-    // 用 `Promise.all` 而不是 for-await：这是并行独立的三份装配，没有先后依赖
+    // 各条命令各起一份装配：`startPipeHost` 的计时与去重表是按实例记的，串起来会互相污染。
+    // 用 `Promise.all` 而不是 for-await：这是并行独立的几份装配，没有先后依赖
     // （`no-await-in-loop` 在这一条上不是风格问题——串行等待会让失败点的归属含糊）。
     const readings = await Promise.all(
-      ["cat src/app.ts", "head -1000 lib/guard.ts", "cat notes.txt"].map(async (command) => {
+      [
+        "cat src/app.ts",
+        "head -1000 lib/guard.ts",
+        "cat notes.txt",
+        "cd /tmp && cat src/app.ts",
+        "cd /tmp && head -1000 lib/guard.ts",
+      ].map(async (command) => {
         const host = startPipeHost({
           pipe: { exitCode: 0, stdout: PIPED },
           filters: [WINDOW_FILTER, "hook"],
@@ -1267,6 +1288,29 @@ describe("hook 清理链", () => {
       spillStore: spillStub(),
     });
     const out = await host.run(LONG_LOG, { command: CAT_LOG });
+
+    assert.equal(host.hookCalls(), 1);
+    assert.equal(out.piped, 0);
+    const text = stdoutText(out.decision);
+    assert.ok(text.includes("line 0"), text);
+    assert.ok(text.includes("line 399"), text);
+    assert.ok(text.includes(OMITTED_150), text);
+    host.dispose();
+  });
+
+  it("复合命令里的日志照样被窗口化：`cd /tmp && cat build.log` 不再整条漏掉", async () => {
+    // 与上一条同一个装配，只换命令形状。改动前这一步两项判据都回 false（首词是 `cd`），
+    // 于是链跑完回零字节、窗口也够不着，45 KB 的构建日志原样进上下文（真宿主实测
+    // 55,213 B 的日志一个字没压）。现在按段判，末段是日志目标 → 链 + 窗口照常串起来。
+    const host = startPipeHost({
+      pipe: { exitCode: 0, stdout: PIPED },
+      filters: [WINDOW_FILTER, "hook"],
+      hook: hookLocations,
+      hookReply: "",
+      minBytes: () => 1,
+      spillStore: spillStub(),
+    });
+    const out = await host.run(LONG_LOG, { command: "cd /tmp && cat build.log" });
 
     assert.equal(host.hookCalls(), 1);
     assert.equal(out.piped, 0);

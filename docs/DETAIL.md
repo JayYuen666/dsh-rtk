@@ -21,7 +21,8 @@ Compound commands (`cd <repo> && cargo test`) are handled **segment by segment**
 per segment (`cd /tmp && cargo test` → `cd /tmp && rtk cargo test`), so the plugin splits both the
 original command and the product, requires the separator sequence to match one for one, and verifies
 each segment on its own. Constructs that cannot be split (command substitution, redirection,
-background `&`, unbalanced quotes) run the whole command unchanged. A segment that fails the gate is
+background `&`, unbalanced quotes, shell comments, a trailing lone `\`) run the whole command
+unchanged. A segment that fails the gate is
 put back verbatim while the rest still gets rewritten: `cd x && aws s3 ls && cargo test` becomes
 `cd x && aws s3 ls && rtk cargo test`. The gate holds one entry only — `aws`, where rewriting changes
 the exit code (127 natively vs 1 through rtk when the CLI is missing); "the output would get shorter"
@@ -37,7 +38,15 @@ first `windowHeadLines` (50) and the last `windowTailLines` (200) lines; the mid
 `[+N lines omitted]` marker. Source files and prose are never touched: `cat src/app.ts`,
 `head -1000 lib/guard.ts` and `cat notes.txt` pass through whole — `.txt` is deliberately *not* a log
 extension, because the real ledger's `.txt` rows are coverage reports and drafts, i.e. material meant to
-be read word for word. The defaults match rtk's own `cap` method (50/200), because the same question —
+be read word for word. The predicate is judged **per segment**, not by the first word of the whole
+command: `cd /repo && cat build.log` is windowed (its last segment is a log) while
+`cd /repo && cat src/app.ts` is left alone (its last segment is prose); shapes that cannot be split
+(`$(...)`, real redirection, a trailing `&`, a shell comment) fall back to being judged as one
+command. That matters
+more than it sounds: before the split, a `cd` prefix made both predicates answer false, so a 900-line
+build log went through untouched (55,213 B) and a source file with 200 identical lines got folded to
+`[x200]` (8,044 B → 360 B) — reading material, mangled, which is the one thing this rule exists to
+prevent. The defaults match rtk's own `cap` method (50/200), because the same question —
 how much of a log is worth reading — was already answered there. The omitted stretch goes to spill like
 any other compressed output, and the first body line names the path to it.
 
@@ -51,6 +60,8 @@ The number inside `FAILURES (31):` is explained too: rtk counts **output lines**
 (a 15-failure run prints 31). The plugin does not rewrite a number it has not verified; it adds one
 line under the header saying what the count means, how many failing blocks the input really has, and
 whether any were folded away.
+
+The filter table has its own per-segment semantics too: it skips only leading segments that write nothing to stdout — `cd` / `export` / `set` / `unset` / `true` / `:`. The reason is that the filter receives the **stdout of the whole compound command**, and anything that writes into that same stream before the target makes parsing it as libtest (or pytest) output a real defect. So `cd /repo && cargo test` now matches (a bare `cd` used to keep the entire command out of the table — on a real ledger 257 `cd`-family pipe rows in one day, 444,666 B, reached the pipe layer with nothing claiming them), while `ls -la && cargo test` still does not. `pushd` / `popd` are deliberately not on the silent list: measured, they write the directory stack to stdout. Shapes that cannot be split (`$(...)`, real redirection, background `&`, a shell comment) fall back to being judged as one command, which fails closed.
 
 Before the window is cut, output goes through rtk's own cleanup chain (the `ansi` / `progress` / `dedup`
 steps of `rtk hook claude`): terminal colours are stripped, progress frames collapse into one line, and

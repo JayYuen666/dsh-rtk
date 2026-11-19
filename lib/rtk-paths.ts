@@ -19,7 +19,7 @@ import path from "node:path";
 
 import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 
-import { splitCommand } from "./prefix-safety.ts";
+import { splitCommand } from "./command-segments.ts";
 
 /** 本插件账本的文件名。与 rtk 的 `HISTORY_DB` 同名，因为它就是同一个程序写的同一个 schema。 */
 const HISTORY_DB = "history.db";

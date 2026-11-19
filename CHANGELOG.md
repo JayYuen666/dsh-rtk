@@ -4,6 +4,87 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.3
+
+Compound commands stop being judged by their first word. The window and the reading-material
+predicate now split the line and judge every segment, the pipe filter table skips only leading
+segments that write nothing to stdout, and the splitter itself moved out of the module that needs
+`node:fs` so the client bundle can share it.
+
+### Fixed
+
+- **Compound commands are judged per segment, so reading material stops being mangled.** Both
+  predicates in `lib/output-window.ts` used to look only at the first word of the whole command,
+  which made `cd /repo && cat build.log` answer "neither a log nor reading material" — a `cd` prefix
+  was enough to slip past both compression paths. The cost ran in two directions. On logs it was a
+  missed opportunity: a 900-line build log passed through untouched at 55,213 B, and on a real
+  ledger 183 skipped `cd`-family calls in one day held 337,517 B while nothing compressed them
+  (`rtk hook claude` returns zero bytes for an unduplicated 55 KB log, so only the local window can
+  recover it). On reading material it was a correctness defect, which is worse: `cd /tmp && cat
+  fresh2.ts` (203 lines, 8,044 B, 200 of them identical) fell into the cleanup chain instead, and
+  `dedup` folded it to `[x200]` — the model received 360 B and a `[+N lines omitted]` header for a
+  source file, which is exactly what "reading material is never touched" exists to prevent. Both
+  predicates now split the command with `splitCommand` (the same splitter the rewrite layer uses)
+  and judge each segment; a log segment wins over a reading segment, and shapes that cannot be split
+  (`$(...)`, real redirection, a trailing `&`, a shell comment) fall back to being judged as one
+  command.
+
+- **The splitter's own boundaries were tightened: shell comments, fd target words, a trailing `\`.**
+  Three shapes were being cut where bash sees something else. A word-initial `#` opens a shell
+  comment, so `echo ok # note; more` runs only `echo ok` (measured) — the splitter used to cut
+  ` more` out as a second command, which let the family and filter predicates reason about a command
+  that never runs. An `>&` target counts as an fd copy only when the **whole word** is digits:
+  `echo hi >&2log` really creates a file named `2log` and `2>&1x` reports an ambiguous redirect (both
+  measured in bash), so checking only the first digit let a file-writing redirection through as a
+  harmless dup — and the next segment would then read output that had already been compressed. A lone
+  trailing `\` means the command is unfinished; the splitter used to advance past the end of the
+  string and still report success, so the segment count it handed out was not the one bash sees. All
+  three now return `undefined`, and every caller already reads `undefined` as "do not split, treat it
+  as one command": `structuralReject` calls it `compound`, `verifyRewrite` calls it
+  `not-segmentable`, `withRtkLedgerEnv` returns the command unchanged — none of them treat "cannot
+  split" as "verified, safe to run". The `CommandSegment.sep` contract was wrong in prose only:
+  `a && b` yields `sep: "&&"` with the spaces kept in `text`, not `sep: " && "`; rejoining was always
+  lossless, so only the doc changed.
+
+### Changed
+
+- **The pipe filter table skips leading segments that write nothing to stdout.** `filterOf` used to
+  match every table row against the whole command, and every row anchors on `^` — so `cd /repo &&
+  cargo test`, the shape a model uses most often, could never match any row. On a real ledger 257
+  `cd`-family pipe rows in one day (444,666 B) reached the pipe layer with nothing claiming them —
+  all of them compound commands whose first word is `cd`. The table now skips a
+  **silent-setup prefix** (`cd` / `export` / `set` / `unset` / `true` / `:`) and judges the first
+  segment that actually produces output. The boundary is deliberate: the filter receives the stdout
+  of the whole compound command, so anything that writes into that same stream before the target
+  makes parsing it as libtest (or pytest) output a real defect — `ls -la && cargo test` therefore
+  still does not match, and `pushd` / `popd` are not on the silent list because they write the
+  directory stack to stdout (measured). A first segment that already matches keeps the old
+  behaviour (`cargo test && echo hi` still compresses), and shapes that cannot be split fall back to
+  being judged as one command.
+- **The splitter moved to `lib/command-segments.ts`, which has no node imports.** With the table
+  judging segments, `lib/command-filter.ts` needed `splitCommand`, and that module is in the client
+  bundle (`src/client-entry.ts` imports it for the default filter set). Taking it from
+  `lib/prefix-safety.ts` drags `node:fs` into `client.js` as an unregistered external — caught by
+  the build's registered-externals gate, not by the compiler: `client.js` came back byte-identical
+  afterwards, because the client only uses the table constants and the splitter is tree-shaken.
+
+### Tests
+
+- 1019 cases across 63 files, coverage at 100% on all four dimensions. New cases: the compound
+  window predicate (log in the last segment, prose in the last segment, both present, unsplittable
+  fallback, and the neither-path case, in `test/output-window.test.ts`), the filter table's
+  per-segment semantics (`cd X && cargo test` and friends, consecutive silent segments, the
+  `ls -la && cargo test` boundary, first-segment behaviour, unsplittable fallback, and the enabled
+  set applying to compound commands, in `test/command-filter.test.ts`), and `test/command-segments.test.ts`
+  (14 cases) which pins the splitter's own boundaries: shell comments, fd copy targets that are not
+  a whole number, a lone trailing backslash, unbalanced quotes, and — separately, because one cannot
+  stand in for the other — that `sep + text` rejoins the original command byte for byte. The
+  integration hook that spawns real binaries also stopped riding on vitest's default 10s budget:
+  `test/integration/real-data.test.ts` now declares its own hook timeout, probes the rtk version once
+  per file instead of once per `describe`, and bounds the `cargo --version` probe, because two
+  external spawns under one 10s hook turned into `Hook timed out in 10000ms` on the Windows runner
+  with 63 concurrent workers — a test-only defect that reported nothing about the plugin.
+
 ## 0.2.2
 
 The two shapes get the outputs rewriting cannot reach and `rtk pipe` has no filter for: log files and

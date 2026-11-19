@@ -28,15 +28,32 @@ const cleanups = makeCleanups();
 
 const mode = rtkTestMode();
 
+/**
+ * 同一个文件里两个 describe 各探一次太贵：Windows 上起一次真进程要几秒（刚解出来的 exe
+ * 还得过一遍 AV 扫描），而第二次探的是同一个答案，所以整个文件只探一次。
+ */
+let probeOf: Promise<string | undefined> | undefined;
+
+const realRtkVersion = (): Promise<string | undefined> => {
+  probeOf ??= probeRealRtk();
+  return probeOf;
+};
+
 interface RunResult {
   readonly status: number | null;
   readonly stdout: string;
   readonly stderr: string;
 }
 
+/** hook 自己的预算：探一次真进程要几百毫秒，Windows 上要几秒，而 vitest 默认只有 10s。 */
+const HOOK_TIMEOUT_MS = 60_000;
+
+/** cargo 探针的预算：够慢机器回一句版本，又不至于把整条 hook 拖成「hook 超时」。 */
+const CARGO_PROBE_MS = 15_000;
+
 const runProcess = (
   argv: readonly string[],
-  options: { readonly cwd: string; readonly input?: string },
+  options: { readonly cwd: string; readonly input?: string; readonly timeoutMs?: number },
 ): Promise<RunResult> =>
   // oxlint-disable-next-line promise/avoid-new -- spawn 只能靠事件回调收束，没有内置 Promise 形态
   new Promise((resolve, reject) => {
@@ -47,6 +64,14 @@ const runProcess = (
     });
     let stdout = "";
     let stderr = "";
+    // 只有探针带预算：卡住的 `cargo --version` 会把 hook 拖到 vitest 的默认上限，
+    // 那时报出来的成因是「hook 超时」，而不是「这支 cargo 没有回应」。
+    const timer =
+      options.timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            child.kill("SIGTERM");
+          }, options.timeoutMs);
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -55,8 +80,12 @@ const runProcess = (
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
     });
-    child.on("error", reject);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
     child.on("close", (status) => {
+      clearTimeout(timer);
       resolve({ status, stdout, stderr });
     });
     child.stdin.end(options.input);
@@ -194,7 +223,7 @@ describe("真 cargo 大输出：失败题头对账与原文落盘", () => {
   let skipReason: string | undefined;
 
   beforeAll(async () => {
-    const version = await probeRealRtk();
+    const version = await realRtkVersion();
     if (mode === "real" && version === undefined) {
       throw new Error(
         "DSH_RTK_TEST_MODE=real 但 PATH 上没有 rtk：先 brew install rtk，或把开关设成 fake / auto",
@@ -204,13 +233,21 @@ describe("真 cargo 大输出：失败题头对账与原文落盘", () => {
       skipReason = mode === "fake" ? "DSH_RTK_TEST_MODE=fake" : "PATH 上没有 rtk";
       return;
     }
-    const cargoProbe = await runProcess(["cargo", "--version"], { cwd: tmpdir() }).catch(
-      () => null,
-    );
-    if (cargoProbe?.status !== 0) {
+    const cargoProbe = await runProcess(["cargo", "--version"], {
+      cwd: tmpdir(),
+      timeoutMs: CARGO_PROBE_MS,
+    }).catch(() => null);
+    if (cargoProbe === null) {
       skipReason = "PATH 上没有 cargo";
+    } else if (cargoProbe.status !== 0) {
+      // 走到这里有两种成因：假的有 cargo 但退非零，或者到点被 kill（status 是 null）。
+      // 后者报「没有回应」而不是「没有 cargo」——查错的人不该被引去装 cargo。
+      skipReason =
+        cargoProbe.status === null
+          ? `cargo --version 没有在 ${String(CARGO_PROBE_MS)} ms 内回应`
+          : "PATH 上没有能跑的 cargo";
     }
-  });
+  }, HOOK_TIMEOUT_MS);
 
   beforeEach(({ skip }) => {
     if (skipReason !== undefined) {
@@ -251,7 +288,7 @@ describe("真 git 仓库的大 log：丢 hash 时走放宽 + 原文落盘", () =
   let skipReason: string | undefined;
 
   beforeAll(async () => {
-    const version = await probeRealRtk();
+    const version = await realRtkVersion();
     if (mode === "real" && version === undefined) {
       throw new Error(
         "DSH_RTK_TEST_MODE=real 但 PATH 上没有 rtk：先 brew install rtk，或把开关设成 fake / auto",
@@ -260,7 +297,7 @@ describe("真 git 仓库的大 log：丢 hash 时走放宽 + 原文落盘", () =
     if (mode === "fake" || version === undefined) {
       skipReason = mode === "fake" ? "DSH_RTK_TEST_MODE=fake" : "PATH 上没有 rtk";
     }
-  });
+  }, HOOK_TIMEOUT_MS);
 
   beforeEach(({ skip }) => {
     if (skipReason !== undefined) {

@@ -13,7 +13,7 @@
  * `cd /tmp && rtk cargo test` 能通过（`cd` 那段原样、后一段是纯前插），而
  * `cd /tmp && rtk cargo test` 若被改成动到 `cd` 段、或把两段并成一段，都仍然被拒。
  */
-import { splitCommand } from "./prefix-safety.ts";
+import { splitCommand } from "./command-segments.ts";
 
 /** P1 要求的前缀形态：`rtk` 加一个空格。**不带**空格的那种（`rtk` / `rtkx`）不算前插形态。 */
 const RTK_PREFIX = "rtk ";

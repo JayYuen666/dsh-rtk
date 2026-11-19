@@ -8,7 +8,7 @@
  * 认不出就是 `unknown`。宁可把 `cargo build --release` 与 `cargo build` 合成一家，
  * 也不去猜参数语义——猜错了没有读者能验证，而统计口径一旦不可验证就没人信。
  */
-import { splitCommand } from "./prefix-safety.ts";
+import { splitCommand } from "./command-segments.ts";
 
 /** 只改命令、不改变「在跑什么」的前缀词；归一前剥掉它们的路径与赋值形态。 */
 const WRAPPERS = new Set(["sudo", "env", "command", "time", "nohup", "builtin"]);

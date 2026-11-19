@@ -22,7 +22,13 @@
  * 窗口口径默认取 rtk `cap` method 的那一组（`engine/src/methods/cap.rs:10-12` 的
  * `HEAD_LINES = 50` / `TAIL_LINES = 200`）：同一份输出走 rtk hook 时是这两个数，走本包时也
  * 该是同样两个数，否则「换一条路径看到的东西不一样」这件事没人解释得清。
+ *
+ * **判据按段，不按整条**：模型的命令几乎都是复合形态（`cd X && cat Y`），而下面两个判据
+ * 曾经只看整条的**首词**——首词是 `cd` 时它们一起回 false，于是日志白丢一次窗口机会、
+ * 阅读材料反而落进清理链被 `dedup` 折成 `[xN]`。这两种副作用一个少省、一个改样，后者
+ * 是硬伤，所以拆分用 `splitCommand`（与改写层同一把尺子，拆不开的形状两者都退回整条）。
  */
+import { splitCommand } from "./command-segments.ts";
 
 /** 默认保留的头部行数。与 rtk `cap` 的 `HEAD_LINES` 同值。 */
 export const DEFAULT_WINDOW_HEAD_LINES = 50;
@@ -74,22 +80,53 @@ const FILE_READ_COMMANDS: readonly RegExp[] = [
 const WORD_SEP = /[\s|<>;&]+/u;
 
 /**
- * 这条命令读出的是不是日志。
- * @param command - 模型给的原始命令（不带前缀层的改写）
- * @returns 是日志类目标时 true
+ * 把一条命令拆成**段**：复合命令（`cd /tmp && cat build.log`）里每一段都是独立的输出来源。
+ *
+ * 拆不开的（命令替换 `$(...)`、真重定向 `>file`、后台执行 `&`）退回**整条当一段**——
+ * `splitCommand` 对这些形状返回 `undefined`，那本来就是「插件证明不了拆开之后语义没变」
+ * 的三类；判据在这里也不该比它更敢猜。
+ * @param command - 模型给的原始命令
+ * @returns 至少一段；空命令给 `[""]`
  */
-export function isLogTarget(command: string): boolean {
-  const trimmed = command.trimStart();
-  if (SELF_LOG_COMMANDS.some((pattern) => pattern.test(trimmed))) {
+function segmentsOf(command: string): readonly string[] {
+  const parts = splitCommand(command);
+  return parts === undefined ? [command] : parts.map((part) => part.text.trim());
+}
+
+/** 单段的日志判定：自带日志语义的命令命中，读文件的命令按操作数扩展名判。 */
+function isLogSegment(segment: string): boolean {
+  if (SELF_LOG_COMMANDS.some((pattern) => pattern.test(segment))) {
     return true;
   }
-  if (!FILE_READ_COMMANDS.some((pattern) => pattern.test(trimmed))) {
+  if (!FILE_READ_COMMANDS.some((pattern) => pattern.test(segment))) {
     return false;
   }
   // 取**操作数**里的扩展名，跳过以 `-` 开头的选项：`cat -n build.log`、
   // `cat build.log | head` 都该命中，`cat src/app.ts` 不该。
-  const operands = trimmed.split(WORD_SEP).slice(1);
+  const operands = segment.split(WORD_SEP).slice(1);
   return operands.some((word) => !word.startsWith("-") && LOG_EXTENSION.test(word));
+}
+
+/** 单段的阅读材料判定：读文件的命令 + 一个日志扩展名都没有。 */
+function isReadingSegment(segment: string): boolean {
+  if (!FILE_READ_COMMANDS.some((pattern) => pattern.test(segment))) {
+    return false;
+  }
+  const operands = segment.split(WORD_SEP).slice(1);
+  return !operands.some((word) => !word.startsWith("-") && LOG_EXTENSION.test(word));
+}
+
+/**
+ * 这条命令读出的是不是日志。
+ *
+ * **按段判**，不按整条的首词判：`cd /tmp && cat build.log` 的首词是 `cd`，按整条判会得出
+ * 「既不是日志也不是阅读材料」，于是两条压缩路一起放过它——日志那份白丢一次窗口机会
+ * （真宿主实测 55,213 B 的构建日志在 `cd` 前缀下一个字没压）。
+ * @param command - 模型给的原始命令（不带前缀层的改写）
+ * @returns 任一段是日志类目标时 true
+ */
+export function isLogTarget(command: string): boolean {
+  return segmentsOf(command).some((segment) => isLogSegment(segment));
 }
 
 /**
@@ -104,16 +141,22 @@ export function isLogTarget(command: string): boolean {
  *
  * 所以判据写成：**读文件的命令 + 操作数里一个日志扩展名都没有** → 这是阅读材料，两条压缩
  * 路都不许碰。反过来 `cat build.log` 不是阅读材料（日志），可以走链。
+ *
+ * **复合命令按段判**，这一条比日志那面更要紧：`cd /tmp && cat src/app.ts` 按整条判会得出
+ * 「两项都不是」，落进清理链被 dedup 折掉（真宿主实测 8,044 B 的源码回 360 B，200 行
+ * 相同折成 `[x200]`），而模型拿到的是残件——「阅读材料一律不碰」这条硬规矩在复合形态上
+ * 从来没生效过。现在任一段是日志 → 不是阅读材料（有日志可压时压日志，既有裁决不变）；
+ * 否则任一段是阅读材料 → 是阅读材料，一个字都不许动。
  * @param command - 模型给的原始命令（不带前缀层的改写）
  * @returns 是阅读材料时 true
  */
 export function isReadingTarget(command: string): boolean {
-  const trimmed = command.trimStart();
-  if (!FILE_READ_COMMANDS.some((pattern) => pattern.test(trimmed))) {
+  const segments = segmentsOf(command);
+  // 有日志段时让给日志：两条路的方向相反，同时成立会让同一份输出去向不明。
+  if (segments.some((segment) => isLogSegment(segment))) {
     return false;
   }
-  const operands = trimmed.split(WORD_SEP).slice(1);
-  return !operands.some((word) => !word.startsWith("-") && LOG_EXTENSION.test(word));
+  return segments.some((segment) => isReadingSegment(segment));
 }
 
 /** 一次窗口化的结果。 */

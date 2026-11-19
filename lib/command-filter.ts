@@ -15,6 +15,7 @@
  * （`rtk rewrite` 认 `bun test`，但那一路由 C 形态处理；B 形态这张表只管「输出该喂谁」，
  * 没实测过 bun 的 pipe 过滤结果，所以不入表——不入表比猜一个 filter 名安全。）
  */
+import { splitCommand } from "./command-segments.ts";
 
 /**
  * B 形态的一行：命令形态 → pipe filter。
@@ -160,11 +161,49 @@ export const ALL_FILTERS: readonly string[] = [
   ...new Set([...PIPE_TABLE.map((entry) => entry.filter), WINDOW_FILTER, HOOK_FILTER]),
 ].toSorted();
 
-/** 命中表且该行 filter 已启用才返回 filter 名；否则 `undefined`（这条不做 pipe 压缩）。 */
-export function filterOf(cmd: string, enabled: ReadonlySet<string>): string | undefined {
-  const trimmed = cmd.trimStart();
+/**
+ * 前缀里那些**不往 stdout 写任何东西**的段：换目录、设环境变量、改 shell 选项、空操作。
+ *
+ * 名单刻意只收这几个，理由都来自「filter 看到的是整条复合命令的 stdout」这一事实：
+ *   · `pushd` / `popd` 不在名单里——实测它们会把目录栈打到 stdout；
+ *   · `ls` / `echo` 之类更不在：它们的输出会混进被压的那一段，再按 cargo 的格式去解是硬伤。
+ *
+ * `set -x` 的 trace 走 stderr，不进被压的那股输出，所以 `set` 这一条是安全的。
+ */
+const SILENT_SETUP = /^(?:cd|export|set|unset|true|:)(?:\s|$)/u;
+
+/** 单段查表：命中且该行 filter 已启用时返回 filter 名。 */
+function matchOf(segment: string, enabled: ReadonlySet<string>): string | undefined {
   const found = PIPE_TABLE.find(
-    (entry) => entry.pattern.test(trimmed) && enabled.has(entry.filter),
+    (entry) => entry.pattern.test(segment) && enabled.has(entry.filter),
   );
   return found?.filter;
+}
+
+/**
+ * 命中表且该行 filter 已启用才返回 filter 名；否则 `undefined`（这条不做 pipe 压缩）。
+ *
+ * **复合命令跳过前缀的静默设置段再判。** 表里每行都锚 `^`，按整条判时 `cd` 会把整行挡在
+ * 门外——而 `cd /repo && cargo test` 是模型最常用的形状之一（真实账本里 `command_family='cd'`
+ * 的 `reason='compound'` 一天 384 条），那些输出本来都该有 filter 可压。
+ *
+ * 放宽只到「静默设置段」为止：跳过的段必须一个字节都不往 stdout 写，因为 filter 拿到的是
+ * 整条复合命令的 stdout——前面有东西写进同一股输出，再按 cargo 的格式去解就是硬伤。所以
+ * `ls -la && cargo test` 仍然不命中。首段本身命中时行为与早先完全一致（`cargo test && echo hi`
+ * 照样压，实测那段 libtest 形状无损）。
+ *
+ * 拆分用 `splitCommand`（与改写层、窗口判据同一把尺子）：拆不开的形状（`$(...)`、真重定向、
+ * 后台 `&`）退回按整条判，方向是保守的。
+ * @param cmd - 模型给的原始命令（不带前缀层的改写）
+ * @param enabled - 生效的 filter 名集合（`Config.enabledFilters` 的现读值）
+ * @returns 该喂给哪个 filter；`undefined` 表示表里没有能接它的行
+ */
+export function filterOf(cmd: string, enabled: ReadonlySet<string>): string | undefined {
+  const parts = splitCommand(cmd);
+  const segments =
+    parts === undefined ? [cmd.trimStart()] : parts.map((part) => part.text.trimStart());
+  // `find` 取的正是「第一个不往 stdout 写东西的段」：静默段跳过，一遇到真正产出输出的段
+  // 就停在那里，后面还有什么都与这条判据无关（那股输出已经混了别人的东西）。
+  const produced = segments.find((segment) => !SILENT_SETUP.test(segment));
+  return produced === undefined ? undefined : matchOf(produced, enabled);
 }

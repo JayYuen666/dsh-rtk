@@ -1,5 +1,6 @@
 import path from "node:path";
-import { splitCommand, structuralReject } from "./prefix-safety.ts";
+import { splitCommand } from "./command-segments.ts";
+import { structuralReject } from "./prefix-safety.ts";
 import { detectVitestMajor, isVitestCommand } from "./vitest-major.ts";
 
 /**

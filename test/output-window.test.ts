@@ -140,6 +140,60 @@ describe("isReadingTarget：模型的阅读材料", () => {
   });
 });
 
+describe("复合命令：按段判，不按首词判", () => {
+  // 缺陷的形状：两个判据都只取整条命令的**首词**，于是 `cd X && cat build.log` 的首词是
+  // `cd`——既不算日志也不算阅读材料，两条压缩路一起放过它。日志那份白丢一次窗口机会
+  // （实测 55,213 B 的日志一个字没压），阅读材料那份更糟：`cd X && cat src/app.ts` 因为
+  // 「既不是日志也不是阅读材料」而落进清理链，`dedup` 把连续 200 行相同折成 `[x200]`
+  // （实测 8,044 B 源码 → 360 B），模型读到的是残件——这正是「阅读材料一律不碰」那条
+  // 硬规矩要防的形状，而它在复合命令上从来没生效过。
+  it("日志在后一段时命中（`cd X && cat build.log` 该被窗口化）", () => {
+    for (const command of [
+      "cd /tmp && cat build.log",
+      "cd /tmp/win-probe && cat build.log",
+      "cd /tmp; cat build.log",
+      "make 2>&1 && cat out.log",
+      "cd /repo && tail -100 app.log",
+    ]) {
+      assert.equal(isLogTarget(command), true, command);
+      assert.equal(isReadingTarget(command), false, command);
+    }
+  });
+
+  it("阅读材料在后一段时命中（`cd X && cat src/app.ts` 一个字都不许动）", () => {
+    for (const command of [
+      "cd /tmp && cat src/app.ts",
+      "cd /repo && head -1000 lib/guard.ts",
+      "cd /tmp; cat notes.txt",
+      "cd /repo && cat README.md",
+    ]) {
+      assert.equal(isReadingTarget(command), true, command);
+      assert.equal(isLogTarget(command), false, command);
+    }
+  });
+
+  it("日志与阅读材料同时出现时按日志算（这条不改变今天的行为）", () => {
+    // `cat src/app.ts && cat build.log` 在改动前就是 log=true（首词是 cat、操作数里有
+    // `build.log`），改动后仍是 log=true（后一段是日志）。有日志可压时压日志，是既有裁决。
+    assert.equal(isLogTarget("cat src/app.ts && cat build.log"), true);
+    assert.equal(isReadingTarget("cat src/app.ts && cat build.log"), false);
+  });
+
+  it("拆不开的命令退回按整条判（命令替换、重定向、后台执行）", () => {
+    // `splitCommand` 对这些形状返回 undefined，调用方按整条当一段——保守方向不能反过来：
+    // 判不出来时宁可不动手，也不能把一段未知语义命令当日志压掉。
+    assert.equal(isLogTarget("cat build.log > out.txt"), true);
+    assert.equal(isReadingTarget("cat build.log > out.txt"), false);
+    assert.equal(isLogTarget("cd $(pwd) && cat build.log"), false);
+    assert.equal(isReadingTarget("cd $(pwd) && cat build.log"), false);
+  });
+
+  it("整条都是别的命令时仍然两条路都不接（`cd X && ls -la`）", () => {
+    assert.equal(isLogTarget("cd /tmp && ls -la"), false);
+    assert.equal(isReadingTarget("cd /tmp && ls -la"), false);
+  });
+});
+
 /** 造 `count` 行文本，行内容 `line N`（提到模块级：每次 describe 重建一份是纯浪费）。 */
 const linesOf = (count: number): string =>
   Array.from({ length: count }, (_unused, index) => `line ${String(index)}`).join("\n");

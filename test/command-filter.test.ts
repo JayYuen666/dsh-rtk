@@ -122,6 +122,67 @@ describe("filterOf", () => {
   });
 });
 
+/** 复合形状提一个常量：同一字面量在断言里出现多次，`sonarjs(no-duplicate-string)` 会判红。 */
+const CD_CARGO = "cd /tmp && cargo test";
+
+describe("复合命令：跳过静默设置段，判第一个真正产出输出的段", () => {
+  // 缺陷的形状：表里每行都锚 `^`，按整条命令判时 `cd` 会把整行挡在门外。而
+  // `cd /repo && cargo test` 是模型最常用的形状之一——先换目录再跑测试。真实账本里
+  // `command_family='cd'` 的 `reason='compound'` 一天 384 条、`no-rewrite` 697 条，
+  // 这些输出本来都该有 filter 可压。
+  //
+  // 新判据只放宽到「静默设置段」为止：跳过的段必须**不往 stdout 写任何东西**，
+  // 因为 filter 看到的是整条复合命令的 stdout——前面有东西写进同一股输出，再按
+  // cargo 的格式去解就是硬伤。
+  it("`cd X && cargo test` 命中（进目录再跑）", () => {
+    assert.equal(filterOf(CD_CARGO, ALL), CARGO_FILTER);
+    assert.equal(filterOf("cd /Users/me/repo && cargo test --all", ALL), CARGO_FILTER);
+    assert.equal(filterOf("cd /repo && pnpm test", ALL), "vitest");
+    assert.equal(filterOf("cd /repo && git status --short", ALL), GIT_STATUS);
+    assert.equal(filterOf("cd /repo && grep -rn TODO src", ALL), "grep");
+  });
+
+  it("多个静默设置段可以连在一起", () => {
+    for (const command of [
+      "cd /tmp && export CI=1 && cargo test",
+      "cd /tmp; set -e; cargo test",
+      "cd /tmp && true && cargo test",
+      "export RUST_BACKTRACE=1 && cargo test",
+    ]) {
+      assert.equal(filterOf(command, ALL), CARGO_FILTER, command);
+    }
+  });
+
+  it("只跳静默段：前面有真正写输出的命令时不命中", () => {
+    // `ls` / `echo` 的 stdout 会混进 cargo test 的输出，按 cargo 的格式去解是硬伤。
+    assert.equal(filterOf("ls -la && cargo test", ALL), undefined);
+    assert.equal(filterOf("cd /tmp && ls && cargo test", ALL), undefined);
+    assert.equal(filterOf("echo hi && cargo test", ALL), undefined);
+    // `pushd` 不在静默名单里：它会把目录栈打到 stdout（实测）。
+    assert.equal(filterOf("pushd /tmp >/dev/null && cargo test", ALL), undefined);
+  });
+
+  it("首段命中仍然按首段判（今天的行为不变）", () => {
+    assert.equal(filterOf("cargo test && echo hi", ALL), CARGO_FILTER);
+    assert.equal(filterOf("grep -rn TODO src | head -20", ALL), "grep");
+  });
+
+  it("静默段之后的段不是 filter 目标时仍回 undefined（cat 归窗口，不归 pipe）", () => {
+    assert.equal(filterOf("cd /tmp && cat build.log", ALL), undefined);
+    assert.equal(filterOf("cd /tmp && ls -la", ALL), undefined);
+  });
+
+  it("拆不开的命令退回按整条判（与改写层同一把尺子）", () => {
+    assert.equal(filterOf("cd $(pwd) && cargo test", ALL), undefined);
+    assert.equal(filterOf(`${CD_CARGO} > out.log`, ALL), undefined);
+  });
+
+  it("启用集合对复合命令照样生效（未启用就 undefined）", () => {
+    assert.equal(filterOf(CD_CARGO, new Set(["pytest"])), undefined);
+    assert.equal(filterOf(CD_CARGO, new Set([CARGO_FILTER])), CARGO_FILTER);
+  });
+});
+
 /** 每行至少一条能命中它的命令：期望值**独立写死**，不从表里的 `id` / `pattern` 推。 */
 const SAMPLES: readonly (readonly [string, string])[] = [
   ["cargo test", CARGO_FILTER],
