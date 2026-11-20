@@ -38,7 +38,13 @@ import { hasMethods, isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 // 之外；锁随在册那一份的 fiber 卸载自动释放，所以后续装配仍能抢到。
 import { claimInstance } from "@jayyuen66/dsh-plugin-shared/lib/instance-lock";
 
-import { RTK_REWRITE_ENV, runRtkHook, runRtkPipe, runRtkRewrite } from "./lib/cli.ts";
+import {
+  RTK_REWRITE_ENV,
+  runRtkHook,
+  runRtkPipe,
+  runRtkPipelineValidate,
+  runRtkRewrite,
+} from "./lib/cli.ts";
 import { commandFamilyOf, rewrittenFamilies } from "./lib/command-family.ts";
 import {
   ALL_FILTERS,
@@ -71,7 +77,7 @@ import {
   withRtkLedgerEnv,
   withoutRtkDbEnv,
 } from "./lib/rtk-paths.ts";
-import type { RtkPaths } from "./lib/rtk-paths.ts";
+import type { HookPaths, RtkPaths } from "./lib/rtk-paths.ts";
 import { buildHookPayload, hookEnvOf, parseHookOutput, pipelineToml } from "./lib/rtk-hook.ts";
 import {
   DEFAULT_WINDOW_HEAD_LINES,
@@ -2468,6 +2474,53 @@ function warnSinkOf(ctx: HostContext): (line: string) => void {
 }
 
 /**
+ * 装配期把 `pipeline.toml` 写出来，并折出 `rtk hook` 的三处位置。
+ *
+ * 配置正文只在装配期写一次：它的第一行就写明「改动会被覆盖」，每次调用重写只会白做 IO。
+ * 写不出来就明确关掉这条路径并留一行：实测 `RTK_CONFIG_DIR` 指到不存在的目录时 `rtk hook`
+ * 回 0 字节（rc 仍是 0），那一路静默退化成「没收益」，与「这条输出本来就没得省」读起来
+ * 完全一样。沙箱写许可不单独登记：三处都在 `$DSH_HOME/rtk/` 之下，C 形态已经为账本登记过
+ * 那个目录（`registerRtkWritableRoot` 收的是目录，父目录的授权覆盖子目录）。
+ */
+function installHookEnv(
+  ctx: HostContext,
+  hookPaths: HookPaths,
+  recallDb: string,
+): HookEnv | undefined {
+  const configDir = prepareHookConfig(hookPaths, pipelineToml());
+  if (configDir === undefined) {
+    warnSinkOf(ctx)(
+      `[rtk] hook: cannot prepare ${hookPaths.configDir}; the cleanup chain stays off`,
+    );
+  }
+  return configDir === undefined
+    ? undefined
+    : { configDir, home: hookPaths.home, dbPath: hookPaths.dbPath, recallDb };
+}
+
+/**
+ * 写出来不等于装得上：rtk 对坏 pipeline 是静默降级（回 `rtk:default`、rc 仍 0），只剩
+ * `pipeline-status.json` 里一行没人读的诊断。这里问一次；问不到也只留一行，不阻塞装配。
+ *
+ * 只在版本探测确认 rtk 可用之后才跑（`probeVersion` 的 `onSupported`）：rtk 缺失时
+ * `rtk pipeline validate` 的失败与「文件写坏」同形，多报一条会把用户引向错的排查方向。
+ */
+async function validateHookPipeline(ctx: HostContext, hookEnv: HookEnv): Promise<void> {
+  const result = await runRtkPipelineValidate({
+    subprocess: ctx.subprocess,
+    cwd: process.cwd(),
+    timeoutMs: VERSION_PROBE_MS,
+    env: hookEnvOf(hookEnv),
+  });
+  if (!result.ok) {
+    const detail = result.diagnostics === "" ? "no diagnostics" : result.diagnostics;
+    warnSinkOf(ctx)(
+      `[rtk] hook: generated pipeline.toml was rejected by rtk pipeline validate (${detail}); rtk falls back to rtk:default`,
+    );
+  }
+}
+
+/**
  * 装配期探版本，并把结果记进 `assign`。
  *
  * 探不到就**记一条 warn**（spec §7.1）：用户开了开关却没有任何效果时，日志里必须有一句话
@@ -2477,6 +2530,7 @@ function warnSinkOf(ctx: HostContext): (line: string) => void {
 async function probeVersion(
   ctx: HostContext,
   assign: (probing: { readonly raw: string; readonly supported: boolean } | undefined) => void,
+  onSupported?: () => void,
 ): Promise<void> {
   const log = loggerOf(ctx);
   const probed = await probeRtkVersion(() => readRtkVersion(ctx));
@@ -2490,6 +2544,11 @@ async function probeVersion(
     );
   }
   assign(probed === undefined ? undefined : { raw: probed.raw, supported: probed.supported });
+  // 校验只在「版本确实可用」之后跑：rtk 缺失或过旧时，`rtk pipeline validate` 只会给一条
+  // 「问不到」的伪故障日志，把「没装 rtk」与「pipeline.toml 写坏了」搅成同一句话。
+  if (probed?.supported === true) {
+    onSupported?.();
+  }
 }
 
 /** 文案 thunk：每次现读 locale 偏好，用户切语言后无需重载插件。 */
@@ -2577,33 +2636,9 @@ function apply(ctx: unknown, config: Config): void {
   //     这里，两条流因此不相交。
   const ledgerPaths = resolveLedgerPaths();
 
-  // 2c. rtk 清理链（`rtk hook`）的三处位置。配置文件在**装配期写一次**：它是本包的产物
-  //     （第一行就写明「改动会被覆盖」），每次调用重写只会白做 IO；而三处路径本身是纯字符串
-  //     拼接，所以交给 `PipeOptions.hook` 现算不影响 volatile 语义（用户在卡片上勾掉 `hook`
-  //     之后下一次长输出就不再 spawn，那一位由 `enabledFilters` 管，不在这里）。
-  //
-  //     写不出来就明确关掉这条路径并留一行：实测 `RTK_CONFIG_DIR` 指到不存在的目录时
-  //     `rtk hook` 回 0 字节（rc 仍是 0），那一路会静默退化成「没收益」，读面上与
-  //     「这条输出本来就没得省」完全一样——两种原因不该共用一个读法。
-  //
-  //     沙箱写许可不单独登记：三处都在 `$DSH_HOME/rtk/` 之下，C 形态已经为账本登记过
-  //     那个目录（`registerRtkWritableRoot` 收的是目录，父目录的授权覆盖子目录）。
+  // 2c. rtk 清理链（`rtk hook`）的三处位置与配置文件都在装配期定下（理由见 `installHookEnv`）。
   const hookPaths = resolveHookPaths();
-  const hookConfigDir = prepareHookConfig(hookPaths, pipelineToml());
-  const hookEnv =
-    hookConfigDir === undefined
-      ? undefined
-      : {
-          configDir: hookConfigDir,
-          home: hookPaths.home,
-          dbPath: hookPaths.dbPath,
-          recallDb: ledgerPaths.recallDb,
-        };
-  if (hookEnv === undefined) {
-    warnSinkOf(host)(
-      `[rtk] hook: cannot prepare ${hookPaths.configDir}; the cleanup chain stays off`,
-    );
-  }
+  const hookEnv = installHookEnv(host, hookPaths, ledgerPaths.recallDb);
 
   // 3. 结论缓存与去重账本：跨调用共享，所以必须建在 apply 层而不是 execute 里。
   //    `rewriteCacheSize` 是普通值（部署级）；`rewrittenCalls` 的 512 只是防泄漏兜底，
@@ -2650,15 +2685,19 @@ function apply(ctx: unknown, config: Config): void {
     // 配置的对象。
     forms: [...formsOr(config.enabledForms.get())],
   });
-  void probeVersion(host, (result) => {
-    probed = result;
-  });
+  void probeVersion(
+    host,
+    (result) => {
+      probed = result;
+    },
+    hookEnv === undefined ? undefined : () => void validateHookPipeline(host, hookEnv),
+  );
 
   /**
    * 版本门：探到「低于下限」时两层都退回原样执行。
    *
    * `probed === undefined`（还在探 / 探不到）时**放行**——放行才是保守的一侧吗？这里刻意
-   * 与前缀层的装配期门禁分开：rtk 装得到、pipe 跑得动，就让它工作；只有明确读到「低于 1.0.0」
+   * 与前缀层的装配期门禁分开：rtk 装得到、pipe 跑得动，就让它工作；只有明确读到「低于 1.2.1」
    * 才停手。README 承诺的正是这一条（「below that it reports the version it found and does
    * nothing」），而卡片上那句「请升级 rtk 后再打开压缩」也只有这一条能让它成真。
    */

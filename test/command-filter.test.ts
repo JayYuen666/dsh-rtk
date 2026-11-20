@@ -22,6 +22,7 @@ const CARGO_FILTER = "cargo-test";
 const GIT_LOG = "git-log";
 const GIT_DIFF = "git-diff";
 const GIT_STATUS = "git-status";
+const SQLFLUFF_LINT = "sqlfluff-lint";
 const KNOWN = new Set([
   CARGO_FILTER,
   "pytest",
@@ -40,6 +41,12 @@ const KNOWN = new Set([
   "ruff-format",
   "phpunit",
   "pest",
+  "log",
+  SQLFLUFF_LINT,
+  "prettier",
+  "ecs",
+  "phpstan",
+  "pint",
   WINDOW_FILTER,
 ]);
 
@@ -98,8 +105,22 @@ describe("filterOf", () => {
     assert.equal(filterOf("cat x.py", ALL), undefined);
   });
 
-  it("prettier 永久不入表（rtk 对它伪造成功）", () => {
-    assert.equal(filterOf("prettier --check .", ALL), undefined);
+  it("prettier 在表里，安全网是 guard 的 fabricated-success 拒收", () => {
+    // 实测 `rtk pipe -f prettier` 对违规输出会打印 `All files formatted correctly`；
+    // 让这一行成立的是 `lib/guard.ts` 的第三条规则（输出含成功声明 + 输入含失败词），
+    // 不是 rtk 的退出码。见 `test/guard.test.ts` 的 prettier 用例。
+    assert.equal(filterOf("prettier --check .", ALL), "prettier");
+    assert.equal(filterOf("npx prettier --check foo.ts", ALL), "prettier");
+  });
+
+  it("rtk filter 别名在启用集合里被归一成规范名", () => {
+    // rtk 1.2.1 的 `pipe -f` 同时接受 cargo / rg / fd / paratest / php-test。
+    // 用户配置写别名时必须命中同一行，否则「官方文档写 cargo」就成了静默失灵。
+    assert.equal(filterOf(CARGO_TEST, new Set(["cargo"])), CARGO_FILTER);
+    assert.equal(filterOf("grep -rn foo .", new Set(["rg"])), "grep");
+    assert.equal(filterOf("find . -name x", new Set(["fd"])), "find");
+    assert.equal(filterOf("pest --stop-on-failure", new Set(["paratest"])), "pest");
+    assert.equal(filterOf("vendor/bin/pest", new Set(["php-test"])), "pest");
   });
 
   it("filter 未启用则 undefined", () => {
@@ -215,6 +236,16 @@ const SAMPLES: readonly (readonly [string, string])[] = [
   ["vendor/bin/phpunit --testsuite Unit", "phpunit"],
   ["pest", "pest"],
   ["vendor/bin/paratest --parallel", "pest"],
+  ["journalctl -u nginx", "log"],
+  ["docker logs api", "log"],
+  ["kubectl logs pod/web", "log"],
+  ["sqlfluff lint models", SQLFLUFF_LINT],
+  ["npx sqlfluff lint models", SQLFLUFF_LINT],
+  ["prettier --check .", "prettier"],
+  ["npx prettier --write src", "prettier"],
+  ["vendor/bin/ecs check src", "ecs"],
+  ["vendor/bin/phpstan analyse src", "phpstan"],
+  ["vendor/bin/pint --test", "pint"],
 ];
 
 describe("表的每一行都真的能命中（期望值独立写死，不从 pattern 推）", () => {
@@ -282,8 +313,8 @@ describe("表结构与默认值", () => {
     }
   });
 
-  it("表共 20 条", () => {
-    assert.equal(PIPE_TABLE.length, 20);
+  it("表共 26 条", () => {
+    assert.equal(PIPE_TABLE.length, 26);
   });
 
   it("id 唯一", () => {

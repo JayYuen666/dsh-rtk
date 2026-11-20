@@ -645,7 +645,7 @@ describe("apply 的装配动作", () => {
         done: Promise.resolve({ exitCode: 0, signal: null }),
         collected: {
           stdout: {
-            readFrom: () => ({ text: "rtk 1.2.0", nextOffset: 10, lossy: false }),
+            readFrom: () => ({ text: "rtk 1.2.1", nextOffset: 10, lossy: false }),
           },
         },
         terminate: noop,
@@ -661,7 +661,7 @@ describe("apply 的装配动作", () => {
     };
     await eventually(() => service.status().rtkVersion !== null);
     const status = service.status();
-    assert.equal(status.rtkVersion, "rtk 1.2.0");
+    assert.equal(status.rtkVersion, "rtk 1.2.1");
     assert.equal(status.supported, true);
   });
 
@@ -723,7 +723,7 @@ describe("apply 的装配动作", () => {
       spawn: () => ({
         done: Promise.resolve({ exitCode: 0, signal: null }),
         collected: {
-          stdout: { readFrom: () => ({ text: "rtk 1.2.0", nextOffset: 10, lossy: false }) },
+          stdout: { readFrom: () => ({ text: "rtk 1.2.1", nextOffset: 10, lossy: false }) },
         },
         terminate: noop,
       }),
@@ -737,8 +737,88 @@ describe("apply 的装配动作", () => {
     await eventually(() => service.status().rtkVersion !== null);
     // 先确认探测**真的落地了**，再断「一条 warn 都没有」：只断后者的话，探测还没跑完时
     // 它天然成立，漏报会被当成通过。
-    assert.equal(service.status().rtkVersion, "rtk 1.2.0");
+    assert.equal(service.status().rtkVersion, "rtk 1.2.1");
     assert.equal(seen.warns.length, 0);
+  });
+
+  it("装配期问一次 rtk pipeline validate：rc=1 时把 E000/W025 写进 warn", async () => {
+    // rtk 对坏 pipeline 是静默降级：装配写出的 pipeline.toml 坏掉时，`rtk hook` 仍回 0，
+    // 只剩 pipeline-status.json 里一行没人读的诊断。这一条钉住「插件自己在装配期问出来」。
+    let spawns = 0;
+    const { host, seen } = makeHost({
+      spawn: () => {
+        spawns += 1;
+        const failed = spawns > 1;
+        const text = failed
+          ? "E000 not valid TOML\nW025 ... has errors and is not loaded — your other pipeline files stay active"
+          : "rtk 1.2.1";
+        return {
+          done: Promise.resolve({ exitCode: failed ? 1 : 0, signal: null }),
+          collected: {
+            stdout: { readFrom: () => ({ text, nextOffset: text.length, lossy: false }) },
+          },
+          terminate: noop,
+        };
+      },
+    });
+    applyTo(host, configSchema({}));
+    // 判据是 warn 的正文，不是条数：版本探测成功不记 warn，校验失败那条是唯一一条。
+    await eventually(() =>
+      warnLines(seen).some((line) => line.includes("rejected by rtk pipeline validate")),
+    );
+    const [only] = warnLines(seen);
+    assert.ok(only !== undefined);
+    assert.ok(only.includes("E000 not valid TOML"), only);
+    assert.equal(spawns, 2, "版本探测 + 一次校验");
+  });
+
+  it("校验失败但 rtk 没给诊断时写 no diagnostics，而不是留一对空括号", async () => {
+    // rc=1 且 stdout 为空：成因可能是权限、超时或 rtk 自己没话说。空括号读起来像插件漏了正文。
+    let spawns = 0;
+    const { host, seen } = makeHost({
+      spawn: () => {
+        spawns += 1;
+        const failed = spawns > 1;
+        const text = failed ? "" : "rtk 1.2.1";
+        return {
+          done: Promise.resolve({ exitCode: failed ? 1 : 0, signal: null }),
+          collected: {
+            stdout: { readFrom: () => ({ text, nextOffset: text.length, lossy: false }) },
+          },
+          terminate: noop,
+        };
+      },
+    });
+    applyTo(host, configSchema({}));
+    await eventually(() =>
+      warnLines(seen).some((line) => line.includes("rejected by rtk pipeline validate")),
+    );
+    const [only] = warnLines(seen);
+    assert.ok(only?.includes("(no diagnostics)") === true, String(only));
+  });
+
+  it("版本过旧时不 spawn pipeline validate（否则「没装/太旧」会被报成 TOML 坏了）", async () => {
+    let spawns = 0;
+    const { host, seen } = makeHost({
+      spawn: () => {
+        spawns += 1;
+        return {
+          done: Promise.resolve({ exitCode: 0, signal: null }),
+          collected: {
+            stdout: {
+              readFrom: () => ({ text: "rtk 0.9.0", nextOffset: 10, lossy: false }),
+            },
+          },
+          terminate: noop,
+        };
+      },
+    });
+    applyTo(host, configSchema({}));
+    await eventually(() => seen.warns.length > 0);
+    const text = warnLines(seen).join("\n");
+    assert.ok(text.includes("minimum supported version"), text);
+    assert.ok(!text.includes("pipeline validate"), text);
+    assert.equal(spawns, 1, "只问了版本，没有第二条 spawn");
   });
 
   it("没有 logger 服务时回退 console.warn，而不是把这条痕迹丢掉", async () => {
@@ -1103,7 +1183,7 @@ describe("b 形态的走线（经 apply 装配之后才拿得到的那一份依�
         return {
           done: Promise.resolve({ exitCode: 0, signal: null }),
           collected: {
-            stdout: { readFrom: () => ({ text: "rtk 1.2.0", nextOffset: 9, lossy: false }) },
+            stdout: { readFrom: () => ({ text: "rtk 1.2.1", nextOffset: 9, lossy: false }) },
           },
           terminate: noop,
         };
@@ -1199,7 +1279,7 @@ describe("b 形态的走线（经 apply 装配之后才拿得到的那一份依�
         return {
           done: Promise.resolve({ exitCode: 0, signal: null }),
           collected: {
-            stdout: { readFrom: () => ({ text: "rtk 1.2.0", nextOffset: 9, lossy: false }) },
+            stdout: { readFrom: () => ({ text: "rtk 1.2.1", nextOffset: 9, lossy: false }) },
           },
           terminate: noop,
         };

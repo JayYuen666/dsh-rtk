@@ -75,12 +75,12 @@ jobs:
       - shell: bash
         run: pnpm install --frozen-lockfile
       # 真实 rtk 回路：三格都装真 rtk，门禁随后以 DSH_RTK_TEST_MODE=real 跑，缺件必红而不是静默跳过。
-      # 版本钉在 README 实测口径的 1.2.0，资产与 sha256 都取自官方 release（不是安装脚本的 latest）；
+      # 版本钉在 README 实测口径的 1.2.1，资产与 sha256 都取自官方 release（不是安装脚本的 latest）；
       # GitHub 托管的 runner 不预装 rtk，这一步就是那唯一来源。装完当场打印版本，作为正向证据。
       - name: 安装 rtk（真实 CLI 回路）
         shell: bash
         env:
-          RTK_VERSION: "1.2.0"
+          RTK_VERSION: "1.2.1"
         run: |
           set -euo pipefail
           os="$(uname -s)"

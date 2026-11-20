@@ -4,13 +4,24 @@
 // 归一必须保守——认不出就只留首词，不能靠猜参数语义；猜错了没有读者能验证。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
-import { commandFamilyOf, rewrittenFamilies } from "../lib/command-family.ts";
+import {
+  commandFamilyOf,
+  hasRtkFront,
+  isTransparentPrefix,
+  rewrittenFamilies,
+  rtkFrontOf,
+  rtkRemainder,
+} from "../lib/command-family.ts";
 
 /** 期望值里反复出现的几条命令原文（独立写死，不从被测实现推导）。 */
 const CARGO_TEST = "cargo test";
+const PNPM_RUN_BUILD = "pnpm run build";
 const GIT_STATUS = "git status";
 const CD_CARGO = "cd /tmp && cargo test";
 const RTK_CARGO = "rtk cargo test";
+const GIT_LOG = "git log";
+const RTK_GIT_LOG = "rtk git log";
+const ENV_RTK_GIT_LOG = "env FOO=1 rtk git log";
 
 describe("commandFamilyOf", () => {
   it("已知工具取两词", () => {
@@ -20,7 +31,7 @@ describe("commandFamilyOf", () => {
   });
 
   it("包管理器 run 取三词（run 与 script 名都是语义）", () => {
-    assert.equal(commandFamilyOf("pnpm run build"), "pnpm run build");
+    assert.equal(commandFamilyOf(PNPM_RUN_BUILD), PNPM_RUN_BUILD);
     assert.equal(commandFamilyOf("npm run test:unit"), "npm run test:unit");
   });
 
@@ -71,7 +82,25 @@ describe("commandFamilyOf", () => {
 
   it("第二个词是 flag 时不当子命令（flag 不是动作）", () => {
     assert.equal(commandFamilyOf("cargo --version"), "cargo");
-    assert.equal(commandFamilyOf("git --no-pager log"), "git");
+    // 不取值的 flag 跳过之后，子命令仍然读得出来（rtk 1.2.1 放行 `git --no-pager log` 那一类）。
+    assert.equal(commandFamilyOf("git --no-pager log"), "git log");
+  });
+
+  it("工具自己的取值 flag 与 +toolchain 不吞掉子命令", () => {
+    // P1-1：`cargo +nightly test` 过去折成 `cargo`，于是这条命令在账本里与 `cargo build` 混一族。
+    assert.equal(commandFamilyOf("cargo +nightly test"), CARGO_TEST);
+    assert.equal(commandFamilyOf("cargo +stable build"), "cargo build");
+    assert.equal(commandFamilyOf("git -C /tmp log"), "git log");
+    assert.equal(commandFamilyOf("git --git-dir=/tmp/x log"), "git log");
+    assert.equal(commandFamilyOf("git -c core.pager=cat log"), "git log");
+    assert.equal(commandFamilyOf("docker --context prod ps"), "docker ps");
+    assert.equal(commandFamilyOf("docker -H tcp://box ps"), "docker ps");
+    assert.equal(commandFamilyOf("pnpm --silent run build"), PNPM_RUN_BUILD);
+    assert.equal(commandFamilyOf("pnpm -C /repo run build"), PNPM_RUN_BUILD);
+  });
+
+  it("不认识的取值 flag 按一个词跳：宁可多切也不吞掉子命令", () => {
+    assert.equal(commandFamilyOf("cargo --future-flag test"), CARGO_TEST);
   });
 
   it("复合命令只看首段", () => {
@@ -115,5 +144,61 @@ describe("rewrittenFamilies", () => {
 
   it("拆不开的命令返回空表", () => {
     assert.deepEqual(rewrittenFamilies(`echo $(${CARGO_TEST})`, `rtk echo $(${CARGO_TEST})`), []);
+  });
+
+  it("包装器在中间时也算被改写（P1-4）", () => {
+    assert.deepEqual(rewrittenFamilies("env FOO=1 cargo test", "env FOO=1 rtk cargo test"), [
+      CARGO_TEST,
+    ]);
+  });
+});
+
+describe("rtkFrontOf", () => {
+  it("普通前缀：命令本身就是 rtk", () => {
+    assert.deepEqual(rtkFrontOf(RTK_GIT_LOG), { prefix: "", rest: GIT_LOG });
+    assert.equal(hasRtkFront(RTK_GIT_LOG), true);
+  });
+
+  it("包装器在中间时 prefix 是它前面那段，透明包装器才认", () => {
+    assert.deepEqual(rtkFrontOf(ENV_RTK_GIT_LOG), {
+      prefix: "env FOO=1 ",
+      rest: GIT_LOG,
+    });
+    assert.equal(hasRtkFront(ENV_RTK_GIT_LOG), true);
+    assert.equal(hasRtkFront("command rtk git log"), true);
+    assert.equal(hasRtkFront("time rtk git log"), true);
+    assert.equal(hasRtkFront("nohup rtk git log"), true);
+    // 会改变执行语义的包装器不算：它们可能不回传退出码/输出。
+    assert.equal(hasRtkFront("sudo rtk git log"), false);
+    assert.equal(hasRtkFront("uv run rtk git log"), false);
+    assert.equal(hasRtkFront("timeout 5 rtk git log"), false);
+  });
+
+  it("没有整词 rtk 就不成立（rtkfoo、rtk 前缀的路径都不算）", () => {
+    assert.equal(rtkFrontOf("rtkfoo --version"), undefined);
+    assert.equal(rtkFrontOf("env FOO=1 rtk"), undefined);
+    // 连第一个真词都没有：偏移回退到 0 与整串长度，不能因此抛错。
+    assert.equal(rtkFrontOf("env FOO=1"), undefined);
+    assert.equal(rtkFrontOf("   "), undefined);
+    assert.equal(rtkFrontOf("rtk"), undefined);
+    assert.equal(hasRtkFront("rtk"), false);
+    assert.equal(hasRtkFront("rtk "), false);
+  });
+
+  it("rtkRemainder 交出 rtk 之后那段，非前插时是 undefined", () => {
+    assert.equal(rtkRemainder(RTK_GIT_LOG), GIT_LOG);
+    assert.equal(rtkRemainder(ENV_RTK_GIT_LOG), GIT_LOG);
+    assert.equal(rtkRemainder("git log"), undefined);
+    assert.equal(rtkRemainder("rtk"), undefined);
+  });
+
+  it("isTransparentPrefix 只认赋值与透明包装器", () => {
+    assert.equal(isTransparentPrefix(""), true);
+    assert.equal(isTransparentPrefix("env FOO=1 "), true);
+    assert.equal(isTransparentPrefix("env -u FOO "), true);
+    assert.equal(isTransparentPrefix("FOO=1 BAR=2 "), true);
+    assert.equal(isTransparentPrefix("sudo "), false);
+    assert.equal(isTransparentPrefix("xargs "), false);
+    assert.equal(isTransparentPrefix("uv run "), false);
   });
 });

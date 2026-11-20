@@ -14,7 +14,8 @@
 export type FilterClass = "summary" | "compile" | "lint" | "vcs" | "listing";
 
 /**
- * 键是 `PIPE_TABLE` 里真的会出现的那 15 个 filter 名。`rg` / `fd` 曾在这里各占一行，
+ * 键是 rtk 1.2.1 的 `rtk pipe -f` 名单（23 个 filter 名），外加本包的 `window` / `hook`。
+ * `rg` / `fd` 曾在这里各占一行，
  * 但 `filterOf` 只会回 `grep` / `find`（rtk 不接受 `rg` / `fd` 作 filter），那两行永远匹配不到——
  * 死映射不只是冗余，它会让「同一件事有两套名字」这个错觉留下来，下一个读表的人按它加 filter 就会错。
  *
@@ -39,6 +40,15 @@ const CLASSES: ReadonlyMap<string, FilterClass> = new Map<string, FilterClass>([
   ["git-status", "listing"],
   ["phpunit", "summary"],
   ["pest", "summary"],
+  // `log` 的 rtk 输出是「Log Summary + 三行计数」，把整段原始行都丢掉：与 listing 一样是
+  // 「一列条目里砍掉一段」，必须走可回收判据（`LINE_COLLAPSE_FILTERS` 里也有它）。
+  ["log", "listing"],
+  // PHP / Python 生态的四个检查器与 sqlfluff / prettier 都归 lint：它们只印自己的摘要与计数。
+  ["sqlfluff-lint", "lint"],
+  ["prettier", "lint"],
+  ["ecs", "lint"],
+  ["phpstan", "lint"],
+  ["pint", "lint"],
   // `window` 不是 rtk 的 filter 名，是本包的本地头尾窗口（`lib/output-window.ts`）。
   // 归 `listing` 是因为它做的正是「一列条目里砍掉一段」——护栏的 `folded-entries`
   // 会看见省略标记、判成可回收的有损压缩，于是走「先落 spill 再放行 + 正文首行写路径」

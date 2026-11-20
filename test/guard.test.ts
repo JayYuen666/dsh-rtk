@@ -89,6 +89,22 @@ describe("通用护栏", () => {
     });
   });
 
+  it("prettier 的伪造成功被这条规则兜住（违规输入 → 宣称已格式化）", () => {
+    // 实测 rtk 1.2.1：`rtk pipe -f prettier` 对下面这段违规输出只回一行
+    // `Prettier: All files formatted correctly`（1.2.1 源码里空列表分支直接打成功，
+    // 不看 `All matched files use Prettier` 那一行）。这一行能进表，靠的就是本条判据。
+    const violations =
+      "Checking formatting...\n[warn] src/foo.ts\n[warn] Code style issues found".repeat(8);
+
+    assert.deepEqual(
+      guardCompressed(opts(violations, "Prettier: All files formatted correctly", "prettier")),
+      {
+        ok: false,
+        reason: "fabricated-success",
+      },
+    );
+  });
+
   it("输入没有失败标记时，成功宣告不算伪造", () => {
     // 干净输入 + 成功摘要 = 正常压缩结果，不能一律拦。
     const clean = "running 1 test\ntest a ... ok\ntest result: ok. 1 passed; 0 failed\n".repeat(3);
@@ -271,6 +287,24 @@ describe("listing 类查折叠标记", () => {
     const output = "f:1:a\nf:2:b\nf:3:c";
 
     assert.equal(guardCompressed(opts(input, output, "grep")).ok, true);
+  });
+
+  it("log 的整段丢弃按行数塌缩判拒", () => {
+    // 实测 rtk 1.2.1：40 行 INFO 日志被 `rtk pipe -f log` 压成 4 行摘要
+    // （`Log Summary` + error/warn/info 三个计数），原文一行不剩。log 归 listing 类，
+    // 且进 LINE_COLLAPSE_FILTERS——否则这条折叠没有任何标记可认，护栏会静默放行。
+    const input = Array.from(
+      { length: 40 },
+      (_unused, index) => `INFO request id=${String(index)} path=/api/x status=200`,
+    ).join("\n");
+    const output =
+      "Log Summary\n   [error] 0 errors (0 unique)\n   [warn] 0 warnings (0 unique)\n   [info] 40 info messages";
+
+    assert.deepEqual(guardCompressed(opts(input, output, "log")), {
+      ok: false,
+      reason: FOLDED,
+      recoverable: true,
+    });
   });
 
   it("没有折叠标记且行数守恒则通过", () => {

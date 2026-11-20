@@ -130,7 +130,7 @@ pipe 统计照常；`workspace-write` 下插件把 `$DSH_HOME/rtk/` 登记成会
 
 ## 它需要外部有什么
 
-`PATH` 上有 rtk ≥ 1.0.0。安装：
+`PATH` 上有 rtk ≥ 1.2.1。安装：
 
 ```
 brew install rtk            # macOS / Linux
@@ -138,6 +138,11 @@ winget install rtk-ai.rtk   # Windows
 ```
 
 rtk 不在时插件照常装载，所有压缩路径都 fail-open：命令正常跑、输出原样返回、卡片告诉你该装什么。
+
+探到可用的 rtk 之后，装配期还会拿刚写出的 `pipeline.toml` 问一次 `rtk pipeline validate`。
+那份文件有错时 rtk 会静默回落到内置流水线（`rtk hook` 的退出码仍是 0），所以校验被拒会留一行
+warn，带上 loader 的 `E000` / `W025` 诊断，而不是只剩 `pipeline-status.json` 里一条没人读的记录。
+这一步不阻塞装配；rtk 缺失或低于下限时根本不会去问。
 
 ## 更多
 

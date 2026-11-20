@@ -174,7 +174,7 @@ These are read once at assembly and need a host restart to take effect:
 
 ## What it needs from outside
 
-rtk ≥ 1.0.0 on `PATH`. Install it with:
+rtk ≥ 1.2.1 on `PATH`. Install it with:
 
 ```
 brew install rtk        # macOS / Linux
@@ -183,6 +183,12 @@ winget install rtk-ai.rtk   # Windows
 
 If rtk is missing the plugin stays loaded and every compression path fails open: commands run
 normally, output comes through untouched, and the card tells you what to install.
+
+Once a supported rtk is found, assembly also asks `rtk pipeline validate` about the `pipeline.toml`
+it just wrote. rtk falls back to its built-in pipeline silently when that file has errors
+(`rtk hook` still exits 0), so a rejection is surfaced as one warn line carrying the loader's
+`E000` / `W025` diagnostics instead of leaving only a note in `pipeline-status.json`. The check
+never blocks assembly and is skipped entirely when rtk is absent or below the floor.
 
 ## Further detail
 

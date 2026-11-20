@@ -22,7 +22,7 @@ import { STATS_DESCRIPTORS } from "../src/stats-reader.ts";
 
 /** 这些字面量在用例里各出现多次，提成常量（`sonarjs(no-duplicate-string)` 数到三次就红）。 */
 const RTK_PATH = "/opt/homebrew/bin/rtk";
-const RTK_VERSION = "rtk 1.2.0";
+const RTK_VERSION = "rtk 1.2.1";
 const PREFIX_FORM = "prefix";
 const STATUS_FIELD = "supported";
 

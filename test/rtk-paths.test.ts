@@ -256,6 +256,26 @@ describe("withRtkLedgerEnv", () => {
     assert.equal(withoutInjection(injected, PATHS), command);
   });
 
+  it("包装器在中间时也注入（P1-4：rtk 仍是真正被执行的那个）", () => {
+    // rtk 1.2.1 对 `env FOO=1 cargo test` 给 `env FOO=1 rtk cargo test`。
+    // 注入必须跟着那一段走，否则这次 rtk 调用会写进用户的全局账本。
+    const command = "env FOO=1 rtk git status";
+    const injected = withRtkLedgerEnv(command, PATHS);
+
+    assert.equal(injected, `${injectionOf(PATHS)} ${command}`);
+    assert.equal(withoutInjection(injected, PATHS), command);
+  });
+
+  it("会改执行语义的包装器前不注入（sudo/uv run 可能不回传输出与退出码）", () => {
+    for (const command of [
+      "sudo rtk git status",
+      "uv run rtk cargo test",
+      "timeout 5 rtk git status",
+    ]) {
+      assert.equal(withRtkLedgerEnv(command, PATHS), command);
+    }
+  });
+
   it("不是 rtk 的命令原样返回", () => {
     const command = "ls -la && echo done";
     assert.equal(withRtkLedgerEnv(command, PATHS), command);

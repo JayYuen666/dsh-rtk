@@ -11,7 +11,7 @@ import path from "node:path";
 
 import { afterAll, assert, beforeAll, beforeEach, describe, it } from "vitest";
 
-import { pipelineToml } from "../../lib/rtk-hook.ts";
+import { hookEnvOf, pipelineToml } from "../../lib/rtk-hook.ts";
 import { prepareHookConfig, resolveHookPaths } from "../../lib/rtk-paths.ts";
 import type { SpillStoreStub } from "./host-stack.ts";
 
@@ -205,6 +205,39 @@ describe("真实 rtk CLI 回路", () => {
       );
     } finally {
       host.dispose();
+    }
+  });
+
+  // P0-2：插件写出的 pipeline.toml 是一份**发给 rtk 的契约**，不是内部配置。这里不问插件自己
+  // 读得懂不懂，直接让 rtk 的 loader 判：`rtk pipeline validate` 回 0 且点名 rtk:posthook，
+  // 才说明清理链真的会挂上去（装载失败时 rtk 静默回 rtk:default、`rtk hook` 仍回 0）。
+  it("生成的 pipeline.toml 能被真 rtk 装载（validate 回 pipeline: ok）", async () => {
+    const sandbox = mkdtempSync(path.join(tmpdir(), "rtk-real-validate-"));
+    cleanups.push(sandbox);
+    const paths = resolveHookPaths({ HOME: sandbox, USERPROFILE: sandbox, DSH_HOME: sandbox });
+    const configDir = prepareHookConfig(paths, pipelineToml());
+    assert.ok(configDir !== undefined);
+    const subprocess = realSubprocess();
+    const handle = subprocess.spawn({
+      argv: ["rtk", "pipeline", "validate"],
+      cwd: sandbox,
+      stdio: { stdin: "ignore", stdout: { maxBytes: 65_536 }, stderr: { maxBytes: 65_536 } },
+      graceMs: 3000,
+      env: hookEnvOf({
+        configDir,
+        home: paths.home,
+        dbPath: paths.dbPath,
+        recallDb: path.join(sandbox, "recall.db"),
+      }),
+    });
+    const outcome = await handle.done;
+    const stdout = handle.collected.stdout?.readFrom(0).text ?? "";
+    try {
+      assert.equal(outcome.signal, null);
+      assert.equal(outcome.exitCode, 0, stdout);
+      assert.match(stdout, /pipeline: ok \(rtk:posthook\)/u, stdout);
+    } finally {
+      handle.terminate();
     }
   });
 

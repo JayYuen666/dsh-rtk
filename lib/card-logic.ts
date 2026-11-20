@@ -235,7 +235,7 @@ export function hintOf(status: StatsStatus | undefined): CardHint | undefined {
       hint = { kind: "missing" };
     } else if (status.supported === false) {
       // 版本串读不到时给 `?`：这一支只可能出现在「探到了 supported=false 但没留下原文」的
-      // 构造里，正常探测两者同时有；给空串会让句子读成「探到的 rtk 是 ，低于支持的 1.0.0」。
+      // 构造里，正常探测两者同时有；给空串会让句子读成「探到的 rtk 是 ，低于支持的 1.2.1」。
       hint = { kind: "too-old", version: status.rtkVersion ?? "?" };
     } else if (status.supported === true) {
       // 就绪行：`{installed, version}` 是 spec §7.1 点名要显示的东西，README 也承诺了

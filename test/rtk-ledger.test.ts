@@ -26,7 +26,7 @@ import {
   readPrefixLedger,
   registerRtkWritableRoot,
 } from "../lib/rtk-ledger.ts";
-import type { SqliteModule } from "../lib/rtk-ledger.ts";
+import type { DatabaseFace, SqliteModule, StatementFace } from "../lib/sqlite-face.ts";
 
 /** 反复出现的字面量提到模块级（`sonarjs(no-duplicate-string)` 数到三次就红）。 */
 const HISTORY_DB = "history.db";
@@ -714,6 +714,92 @@ describe("readPrefixLedger", () => {
     );
     // 表被整个删掉时报 missing（文件是我们自己造出来的，见实现里的口径说明）。
     assert.equal(ledger.availability, "missing");
+    assert.deepEqual(warns, []);
+  });
+
+  // rtk 1.2.1 用 `PRAGMA user_version` 记自己的 schema 档（Initial=1、EngineTables=2、
+  // InitialRecheck=3，`src/core/tracking.rs`）。版本比插件认识的新时，读面可能少列；
+  // 这种漂移**不会**让任何 SQL 报错（多出来的表/列与这里的聚合无关），所以只能自己报。
+  it("库的 user_version 比插件认识的新时播报漂移", async () => {
+    const dbPath = path.join(await tempDir(), HISTORY_DB);
+    await seedLedger(dbPath, [{ at: Date.now() }]);
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    db.exec("PRAGMA user_version = 4");
+    db.close();
+    const warns: string[] = [];
+    const ledger = await readPrefixLedger(
+      dbPath,
+      "",
+      { form: "prefix", rangeDays: 7, granularity: "day" },
+      undefined,
+      (line) => {
+        warns.push(line);
+      },
+    );
+    // 判据是「照旧读出数据 + 留一行告警」：漂移不是故障，不该把页面打成不可用。
+    assert.equal(ledger.availability, "ok");
+    assert.equal(warns.length, 1);
+    assert.match(
+      warns[0] ?? "",
+      /ledger schema is version 4, newer than the 3 .*insights may be incomplete/u,
+    );
+  });
+
+  it("user_version 等于插件认识的那一档时不播报", async () => {
+    const dbPath = path.join(await tempDir(), HISTORY_DB);
+    await seedLedger(dbPath, [{ at: Date.now() }]);
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    db.exec("PRAGMA user_version = 3");
+    db.close();
+    const warns: string[] = [];
+    await readPrefixLedger(
+      dbPath,
+      "",
+      { form: "prefix", rangeDays: 7, granularity: "day" },
+      undefined,
+      (line) => {
+        warns.push(line);
+      },
+    );
+    assert.deepEqual(warns, []);
+  });
+
+  it("pragma user_version 读不到时按 0 处理，不播报漂移", async () => {
+    // 防御支：驱动异常或旧库可能不回这一行。把它当 0 是保守的——未知版本不该被报成「比你认识的新」。
+    const dbPath = path.join(await tempDir(), HISTORY_DB);
+    await seedLedger(dbPath, [{ at: Date.now() }]);
+    const { DatabaseSync } = await import("node:sqlite");
+    function OpenFace(file: string): DatabaseFace {
+      const db = new DatabaseSync(file, { readOnly: true, timeout: 500 });
+      return {
+        prepare: (sql: string): StatementFace =>
+          sql === "PRAGMA user_version"
+            ? { run: (): unknown => null, get: (): undefined => void 0, all: () => [] }
+            : db.prepare(sql),
+        exec: (sql: string) => {
+          db.exec(sql);
+        },
+        close: () => {
+          db.close();
+        },
+      };
+    }
+    const stub: SqliteModule = {
+      DatabaseSync: OpenFace as unknown as SqliteModule["DatabaseSync"],
+    };
+    const warns: string[] = [];
+    const ledger = await readPrefixLedger(
+      dbPath,
+      "",
+      { form: "prefix", rangeDays: 7, granularity: "day" },
+      () => Promise.resolve(stub),
+      (line) => {
+        warns.push(line);
+      },
+    );
+    assert.equal(ledger.availability, "ok");
     assert.deepEqual(warns, []);
   });
 });

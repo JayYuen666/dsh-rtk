@@ -4,6 +4,49 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.4
+
+Follows rtk 1.2.1. CI now installs 1.2.1 and the real CLI circuits run against it; the pipe
+filter table covers rtk 1.2.1's whole `pipe -f` name set; tool-level flags no longer swallow the
+subcommand in command-family statistics; the verify layer accepts a transparent wrapper before
+`rtk`; the generated `pipeline.toml` is checked by rtk's own loader at assembly; and a ledger
+written by a newer rtk schema reports its version instead of silently looking stale.
+
+### Added
+
+- **The pipe filter table covers every rtk 1.2.1 `pipe -f` name.** `log`, `sqlfluff-lint`,
+  `prettier`, `ecs`, `phpstan` and `pint` join the table, and rtk's aliases are normalised when
+  they appear in `enabledFilters` (`cargo` → `cargo-test`, `rg` → `grep`, `fd` → `find`,
+  `paratest` / `php-test` → `pest`), so an entry written with an alias keeps matching. All 25
+  canonical names are classified for the output guard: `log` joins the listing class (recoverable
+  folding), the five new linters join the lint class. The `prettier` row leans on the guard's
+  fabricated-success rule: rtk prints "All files formatted correctly" for a run that reported
+  violations, and that claim against the original warning lines is what rejects the compression.
+- **The generated `pipeline.toml` is validated by rtk's own loader.** `rtk pipeline validate` runs
+  once at assembly, after the version probe confirms a supported rtk, and a non-zero exit turns
+  `E000` / `W025` diagnostics into one warn line. rtk otherwise falls back to `rtk:default`
+  silently while `rtk hook` still exits 0, which reads exactly like "nothing to save". The check
+  never blocks assembly, and it is not spawned when rtk is missing or too old.
+- **A ledger written by a newer schema reports its version.** `readPrefixLedger` reads
+  `PRAGMA user_version` and warns when it is above 3 (`Initial` / `EngineTables` /
+  `InitialRecheck` in rtk 1.2.1); the data is still read, so a future additive migration degrades
+  visibly rather than looking like an empty week.
+- **The verify layer accepts a transparent wrapper before `rtk`.** `env FOO=1 rtk git status`,
+  `command rtk cargo test`, `time rtk git log` and `nohup rtk …` now pass P1, and the ledger env
+  injection finds `rtk` behind the same wrappers. `sudo`, `uv run`, `timeout`, `nice` and `xargs`
+  are still rejected: those change the exit-code or output meaning the plugin reasons about.
+
+### Fixed
+
+- **Tool-level flags no longer swallow the subcommand in command-family statistics.** `cargo
+  +nightly test`, `git -C /tmp log`, `git --no-pager log`, `pnpm --silent run build` and
+  `docker --context prod ps` used to normalise to the bare tool name, so the Insights page could
+  not tell them apart from `cargo` / `git` / a plain `pnpm` invocation. The family reader now skips
+  value-taking global flags (a table per tool) and `+toolchain` tokens before reading the
+  subcommand.
+- **CI pins rtk 1.2.1 and the measured baseline moved with it.** README, the Chinese README, this
+  changelog and the workflow all name 1.2.1; the plugin's lower bound moves to `>= 1.2.1` as well.
+
 ## 0.2.3
 
 Compound commands stop being judged by their first word. The window and the reading-material

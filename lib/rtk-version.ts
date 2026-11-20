@@ -27,13 +27,17 @@ export function formatRtkVersion(version: RtkVersion): string {
 }
 
 /**
- * 支持面的下限。rtk 1.0.0 是 `rewrite` / `pipe` 两个子命令成形的那一版。
+ * 支持面的下限。rtk 1.2.1 是本仓全部结论的实测基线，也是 CI 精确钉住的那一版。
+ *
+ * `rewrite` / `pipe` 虽然 1.0.0 就已成形，但 1.0.0–1.2.0 没有被任何门禁覆盖：1.2.0 与
+ * 1.2.1 在 cargo 的 toolchain / 全局前缀改写上已有实测差异，账本 schema 在 1.2.1 上
+ * 也带 `user_version` 档位。低于 1.2.1 时两层保持停手，而不是带着未验证行为工作。
  *
  * 三段拆开写、字符串由 {@link formatRtkVersion} 生成，两者**不可能不同源**：把下限
  * 写成字符串再由代码 parse 回来，那条 parse 失败的分支在真实运行中永远走不到
  * （字面量就是对的），只会逼出 ignore 注释或放宽阈值。
  */
-const MIN_SUPPORTED: RtkVersion = { major: 1, minor: 0, patch: 0 };
+const MIN_SUPPORTED: RtkVersion = { major: 1, minor: 2, patch: 1 };
 
 /** 下限的字符串形态（设置卡与报错文案引用它）。 */
 export const MIN_RTK_VERSION = formatRtkVersion(MIN_SUPPORTED);

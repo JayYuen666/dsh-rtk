@@ -19,6 +19,7 @@ import path from "node:path";
 
 import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 
+import { hasRtkFront } from "./command-family.ts";
 import { splitCommand } from "./command-segments.ts";
 
 /** 本插件账本的文件名。与 rtk 的 `HISTORY_DB` 同名，因为它就是同一个程序写的同一个 schema。 */
@@ -122,7 +123,10 @@ export function withRtkLedgerEnv(command: string, paths: RtkPaths): string {
     .map((segment) => {
       // 分隔符必须原样带上：只回 `segment.text` 会把第二段起的分隔符吃掉
       // （`cd x && ls` 会拼成 `cd x ls`），那是把命令改成了另一个东西。
-      const isRtk = segment.text.trimStart().startsWith("rtk ");
+      // `env FOO=1 rtk …` 也算：rtk 1.2.1 会把 wrapper 留在外面、只改里面那段，
+      // 这时不注入就等于让那一次调用落回用户的全局账本。`hasRtkFront` 只认透明前缀，
+      // `sudo` / `uv run` / `timeout` 这些不注入——它们改变的执行语义不该被这里一并接受。
+      const isRtk = hasRtkFront(segment.text);
       return isRtk ? `${segment.sep}${prefix} ${segment.text}` : `${segment.sep}${segment.text}`;
     })
     .join("");

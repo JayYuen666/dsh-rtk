@@ -21,13 +21,24 @@ const CD_CARGO = "cd /tmp && cargo test";
 const CD_RTK_CARGO = "cd /tmp && rtk cargo test";
 const SCRIPT_STRIPPED = "script-runner-stripped";
 
-describe("P1 必须以 rtk 开头", () => {
-  it("rtk 被插进 wrapper 内部则拒", () => {
+describe("P1 必须以 rtk 开头（或前置透明包装器）", () => {
+  it("会改执行语义的 wrapper 中间插 rtk 则拒", () => {
     // 实测形态：`uv run cargo test` 被改成 `uv run rtk cargo test`；wrapper 语义未知，统一拒绝。
     assert.equal(verifyRewrite(UV_RUN_CARGO_TEST, "uv run rtk cargo test"), NOT_PREFIXED);
     assert.equal(verifyRewrite("timeout 5 cargo test", "timeout 5 rtk cargo test"), NOT_PREFIXED);
     assert.equal(verifyRewrite("nice -n 5 cargo test", "nice -n 5 rtk cargo test"), NOT_PREFIXED);
-    assert.equal(verifyRewrite("env FOO=1 cargo test", "env FOO=1 rtk cargo test"), NOT_PREFIXED);
+    assert.equal(verifyRewrite("sudo cargo test", "sudo rtk cargo test"), NOT_PREFIXED);
+    assert.equal(verifyRewrite("xargs cargo test", "xargs rtk cargo test"), NOT_PREFIXED);
+  });
+
+  it("透明包装器（env/command/time/nohup、赋值）中间插 rtk 放行（P1-4）", () => {
+    // rtk 1.2.1 会把前缀留在原处：`env FOO=1 cargo test` → `env FOO=1 rtk cargo test`。
+    // 这类包装器不改退出码与输出，所以「rtk 是真正被执行的那个」仍然成立。
+    assert.equal(verifyRewrite("env FOO=1 cargo test", "env FOO=1 rtk cargo test"), undefined);
+    assert.equal(verifyRewrite("FOO=1 cargo test", "FOO=1 rtk cargo test"), undefined);
+    assert.equal(verifyRewrite("command cargo test", "command rtk cargo test"), undefined);
+    assert.equal(verifyRewrite("time cargo test", "time rtk cargo test"), undefined);
+    assert.equal(verifyRewrite("nohup cargo test", "nohup rtk cargo test"), undefined);
   });
 
   it("链式命令按段校验：只前插了 rtk 的那一段通过，其余段必须原样", () => {

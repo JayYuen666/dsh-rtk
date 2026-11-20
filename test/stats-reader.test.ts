@@ -173,7 +173,7 @@ function statusOf(enabled: boolean): {
 } {
   return {
     rtkPath: "/opt/homebrew/bin/rtk",
-    rtkVersion: "rtk 1.2.0",
+    rtkVersion: "rtk 1.2.1",
     supported: true,
     enabled,
     forms: ["prefix"],

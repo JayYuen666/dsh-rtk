@@ -105,7 +105,7 @@ async function loadRtk(dataDir: string): Promise<Loaded> {
 
   const configureCalls: unknown[] = [];
   ctx.provide("settings", settingsStub(configureCalls));
-  const fake = installFakeRtk([dataDir], [{ exitCode: 0, stdout: "rtk 1.2.0" }]);
+  const fake = installFakeRtk([dataDir], [{ exitCode: 0, stdout: "rtk 1.2.1" }]);
   ctx.provide("subprocess", fake.subprocess);
   ctx.provide("workingDirectory", {
     ensure: async (): Promise<string> => dataDir,

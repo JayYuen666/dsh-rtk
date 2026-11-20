@@ -208,6 +208,70 @@ export async function runRtkHook(options: RtkHookOptions): Promise<RtkPipeResult
   return result;
 }
 
+/** 一次 `rtk pipeline validate` 的调用参数。 */
+export interface RtkValidateOptions {
+  readonly subprocess: SubprocessFace;
+  readonly cwd: string;
+  readonly timeoutMs: number;
+  /** `hookEnvOf` 造的那份环境：校验必须读同一份 `pipeline.toml`。 */
+  readonly env: Record<string, string | undefined>;
+}
+
+/** 校验结论：`diagnostics` 只在失败时非空（rtk 把 E000/W025 之类的行写在 stdout）。 */
+export interface RtkValidateResult {
+  readonly ok: boolean;
+  readonly diagnostics: string;
+}
+
+/**
+ * 跑一次 `rtk pipeline validate`，确认刚写出的 `pipeline.toml` 能被 rtk 装载。
+ *
+ * 为什么需要这一步：rtk 的 pipeline 装载是**静默降级**的——文件有解析错误时它只记进
+ * `pipeline-status.json` 并回落到 `rtk:default`，`rtk hook` 的退出码仍是 0。插件若只看 hook
+ * 的输出，看到的只是「没收益」，与「清理链根本没生效」同形。这里把装载结论在装配期就问一次，
+ * 失败时由调用方留一行 warn。
+ *
+ * 判据只看退出码：rtk 的诊断（`E000 not valid TOML` / `W025 … has errors and is not loaded`）
+ * 写在 stdout 而不是 stderr（实测），所以退出码非零时把 stdout 原样带回去。spawn 抛错与超时
+ * 都折成失败，但诊断串为空——那种情况下连「文件有没有被读」都无从判断，不该伪造成 TOML 错误。
+ */
+export async function runRtkPipelineValidate(
+  options: RtkValidateOptions,
+): Promise<RtkValidateResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, options.timeoutMs);
+  let result: RtkValidateResult = { ok: false, diagnostics: "" };
+  let handle: SubprocessFaceHandle | undefined;
+  try {
+    handle = options.subprocess.spawn({
+      argv: ["rtk", "pipeline", "validate"],
+      cwd: options.cwd,
+      stdio: {
+        stdin: "ignore",
+        stdout: { maxBytes: MAX_STDOUT_BYTES },
+        stderr: { maxBytes: MAX_STDERR_BYTES },
+      },
+      graceMs: options.timeoutMs,
+      env: options.env,
+      signal: controller.signal,
+    });
+    const outcome = await handle.done;
+    const stdout = readStdout(handle).trim();
+    result =
+      outcome.signal === null && outcome.exitCode === 0
+        ? { ok: true, diagnostics: "" }
+        : { ok: false, diagnostics: stdout };
+  } catch {
+    // ENOENT / provider 失败：保持失败但无诊断；调用方只报「问不到」，不编造 TOML 错误。
+  } finally {
+    clearTimeout(timer);
+    handle?.terminate();
+  }
+  return result;
+}
+
 /**
  * `rtk rewrite <command>`：求一条命令的等价改写。
  * 这一层不判退出码含义，只做两件归一：被信号杀掉时 exitCode 归 null；stdout 一律 trimEnd

@@ -30,8 +30,10 @@ export type GuardResult =
 
 /**
  * 「成功宣告」词表。输出里出现它们、而输入里含失败标记 —— 就是伪造成功。
- * prettier 是已知的伪造成功案例（原始输出有违例、rtk 却回 `All files formatted correctly`），
- * 所以那一整条命令永久不进 pipe 表；这张表兜的是同一类缺陷的其它工具。
+ * prettier 是已知的伪造成功案例（原始输出有违例、rtk 却回 `All files formatted correctly`）。
+ * 它现在留在 `PIPE_TABLE` 里（rtk 1.2.1 的 `pipe -f` 名单要求对齐），**这一条就是它的安全网**：
+ * 违例输出里带 warn / issues found，于是整段压缩被判 `fabricated-success` 拒绝；输入本来就
+ * 没有失败标记时压缩才放行。同一张表也兜其它工具的这一类缺陷。
  */
 const SUCCESS_CLAIMS: readonly string[] = [
   "All files formatted correctly",
@@ -98,11 +100,14 @@ const HASH_RE = /\b[0-9a-f]{7,40}\b/gu;
  *
  * `fd` 也不在：`rtk pipe` 只认 `find` 这个名字（`filterOf` 把 fd 归到 find），写在这里也匹配不到。
  * `ls` 留着是因为 `rtk` 有它自己的 listing 过滤器，将来若进 `PIPE_TABLE` 就直接生效。
+ * `log` 在：`rtk pipe -f log` 把整段日志收成 `Log Summary` + 三行计数，原始行全丢——
+ * 与 listing 折叠同一件事，必须落 spill 后再放行。
  */
 const LINE_COLLAPSE_FILTERS: ReadonlySet<string> = new Set([
   "find",
   "ls",
   "git-status",
+  "log",
   "window",
   "hook",
 ]);

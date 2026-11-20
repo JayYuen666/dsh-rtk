@@ -231,7 +231,7 @@ describe("hintOf（卡片顶部引导行）", () => {
   /** 正常状态：装好了、版本够新。三个用例都从它出发改一位。 */
   const healthy = {
     rtkPath: "/opt/homebrew/bin/rtk",
-    rtkVersion: "rtk 1.2.0",
+    rtkVersion: "rtk 1.2.1",
     supported: true,
     enabled: false,
     forms: ["prefix"],

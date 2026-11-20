@@ -3,9 +3,14 @@
  *
  * 这不是命令范围的权威——C 形态的范围由 `rtk rewrite` 的输出定义（官方 95 条规则 +
  * 62 个 TOML filter）。这张表只回答「这段输出该喂给哪个 filter 压」，所以：
- *   · rg 归 grep、fd 归 find——`rtk pipe` 只认 `grep` / `find` 这两个名字；
- *   · prettier 永久不入表：实测 rtk 对它输出「All files formatted correctly」而原始输出
- *     里有违例，属伪造成功，护栏补救不了；
+ *   · 名字以 rtk 1.2.1 的 `rtk pipe -f` 名单为准：cargo-test / pytest / go-test / go-build /
+ *     ctest / tsc / vitest / grep / find / git-log / git-diff / git-status / log / mypy /
+ *     ruff-check / ruff-format / sqlfluff-lint / prettier / phpunit / pest / ecs / phpstan / pint。
+ *     rtk 认的别名（cargo / rg / fd / paratest / php-test）由 `canonicalFilter` 归一，所以用户
+ *     在 `enabledFilters` 里写别名也生效；
+ *   · `log` 与 `prettier` 两行的压缩结果**依赖 `lib/guard.ts` 的 fabricated-success 判据**：
+ *     rtk 对 prettier 的违例输出会印「All files formatted correctly」，护栏据原始输出里的
+ *     warn / issues found 把它拒掉。那条判据若放松，这两行就会放出伪造的成功；
  *   · vitest 的四行（`vitest` / `pnpm test` / `npm test` / `yarn test`）在默认集合里，但那一路
  *     的压缩**不经 rtk**：`host.ts` 的 `modeOf` 把它导到 `lib/vitest-strip.ts` 本地删通过行。
  *     rtk 在 vitest 5 上三层解析全失败（JSON 走了文件），喂原生文本又只剩失败名——两条都不可用。
@@ -93,7 +98,26 @@ export const WINDOW_FILTER = "window";
  */
 export const HOOK_FILTER = "hook";
 
-/** 表共 20 行；`filter` 取值必须落在 rtk 的已知 filter 名单内（测试交叉核对）。 */
+/**
+ * rtk 认的 filter 别名 → 本包使用的规范名。
+ *
+ * `rtk pipe -f` 同时接受 `cargo` 与 `cargo-test`（同一个函数）、`rg` 与 `grep`、`fd` 与 `find`、
+ * `paratest` / `php-test` 与 `pest`。插件内部只记规范名（统计与类表都按它查），但用户配置里
+ * 写别名也必须能用——否则「官方文档写 cargo，插件只认 cargo-test」是一处静默的开关失灵。
+ */
+const FILTER_ALIASES: Readonly<Record<string, string>> = {
+  cargo: "cargo-test",
+  fd: "find",
+  paratest: "pest",
+  "php-test": "pest",
+  rg: "grep",
+};
+
+/** 把 rtk 的 filter 别名归一成插件使用的规范名（不是别名就原样返回）。 */
+function canonicalFilter(name: string): string {
+  return FILTER_ALIASES[name] ?? name;
+}
+/** 表共 26 行；`filter` 取值必须落在 rtk 1.2.1 的已知 filter 名单内（测试交叉核对）。 */
 export const PIPE_TABLE: readonly PipeEntry[] = [
   {
     id: "cargo test",
@@ -147,6 +171,28 @@ export const PIPE_TABLE: readonly PipeEntry[] = [
   },
   { id: "grep", pattern: /^(?:grep|rg)(?:\s|$)/u, filter: "grep" },
   { id: "find", pattern: /^(?:find|fd)(?:\s|$)/u, filter: "find" },
+  {
+    id: "log",
+    pattern: /^(?:journalctl|dmesg|docker\s+logs|kubectl\s+logs)(?:\s|$)/u,
+    filter: "log",
+  },
+  {
+    id: "sqlfluff lint",
+    pattern: /^(?:npx\s+)?sqlfluff\s+lint(?:\s|$)/u,
+    filter: "sqlfluff-lint",
+  },
+  { id: "prettier", pattern: /^(?:npx\s+)?prettier(?:\s|$)/u, filter: "prettier" },
+  {
+    id: "ecs",
+    pattern: /^(?:\.\/)?(?:vendor\/bin\/)?ecs(?:\s|$)/u,
+    filter: "ecs",
+  },
+  {
+    id: "phpstan",
+    pattern: /^(?:php\s+)?(?:\.\/)?(?:(?:vendor\/)?bin\/)?phpstan(?:\s|$)/u,
+    filter: "phpstan",
+  },
+  { id: "pint", pattern: /^(?:\.\/)?(?:vendor\/bin\/)?pint(?:\s|$)/u, filter: "pint" },
 ];
 
 /**
@@ -205,5 +251,8 @@ export function filterOf(cmd: string, enabled: ReadonlySet<string>): string | un
   // `find` 取的正是「第一个不往 stdout 写东西的段」：静默段跳过，一遇到真正产出输出的段
   // 就停在那里，后面还有什么都与这条判据无关（那股输出已经混了别人的东西）。
   const produced = segments.find((segment) => !SILENT_SETUP.test(segment));
-  return produced === undefined ? undefined : matchOf(produced, enabled);
+  // 启用集合先归一：用户在 `enabledFilters` 里写 `cargo` / `rg` / `fd`（rtk 认的别名）也生效。
+  return produced === undefined
+    ? undefined
+    : matchOf(produced, new Set(Array.from(enabled, canonicalFilter)));
 }

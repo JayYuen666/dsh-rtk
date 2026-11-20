@@ -1,5 +1,6 @@
 /**
- * `rtk rewrite` 的后置校验：只有「把一段 wrapper 前缀剥掉、剩下逐字符不动」的改写才采用。
+ * `rtk rewrite` 的后置校验：改写只允许在 `rtk` 前插位置上多出 `rtk `（`rtk` 之前只能是
+ * 透明 wrapper 与环境变量赋值），或者剥掉一段允许的 wrapper 前缀、剩下逐字符不动；其余一律拒绝。
  *
  * 返回 `undefined` 表示通过；返回原因串表示拒绝（调用方原样执行原命令）。
  *
@@ -9,14 +10,14 @@
  *
  * 复合命令按段校验：`lib/prefix-safety.ts` 的 `splitCommand` 先把原命令与改写结果各拆成若干段，
  * 分隔符序列必须逐一相同，然后**每一段各自**走下面这套 P1~P4——没被动过的段要求逐字符相同，
- * 被动过的那段必须是「只在前插位置多了 `rtk `」。这样 `cd /tmp && cargo test` →
- * `cd /tmp && rtk cargo test` 能通过（`cd` 那段原样、后一段是纯前插），而
- * `cd /tmp && rtk cargo test` 若被改成动到 `cd` 段、或把两段并成一段，都仍然被拒。
+ * 被动过的那段必须是「在 `rtk` 前插位置多了一段」且 `rtk` 之前只允许透明 wrapper（`env` /
+ * `command` / `time` / `nohup` 与环境变量赋值）。这样 `cd /tmp && cargo test` →
+ * `cd /tmp && rtk cargo test` 能通过（`cd` 那段原样、后一段是纯前插），
+ * `env FOO=1 cargo test` → `env FOO=1 rtk cargo test` 也能通过；而把 `rtk` 插进
+ * `uv run` / `timeout` / `nice` 里仍然被拒——那些 wrapper 会改变命令的语义。
  */
+import { isTransparentPrefix, rtkFrontOf } from "./command-family.ts";
 import { splitCommand } from "./command-segments.ts";
-
-/** P1 要求的前缀形态：`rtk` 加一个空格。**不带**空格的那种（`rtk` / `rtkx`）不算前插形态。 */
-const RTK_PREFIX = "rtk ";
 
 // npm / pnpm 的脚本运行词。被剥掉的前缀里出现它们，就意味着「用户脚本可能被换成了同名工具」。
 const SCRIPT_RUNNER = /\b(?:run-script|run|rum|urn)\b/u;
@@ -53,20 +54,9 @@ function stripsScriptRunner(stripped: string): boolean {
 }
 
 /**
- * P1：只接受前插形态。
- *
- * `rtk` 落在命令中间说明 rtk 认为某个 wrapper 可以被剥，但插件无法判断该 wrapper
- * （timeout / nice / nohup / env）的语义，统一拒绝。链式命令同理：实测
- * `cd /tmp && cargo test` 的产物是 `cd /tmp && rtk cargo test`，落在中间 → 这里拒。
- */
-function checkPrefix(rewritten: string): string | undefined {
-  return rewritten.startsWith(RTK_PREFIX) ? undefined : "not-rtk-prefixed";
-}
-
-/**
  * P2：`rtk ` 之后必须有东西。
  *
- * `trimEnd` 是必须的——实测 stdout 不带尾换行，但下游拼接与夹具可能带尾随空白，
+ * `trimEnd` 是必须的——实测 stdout 不带尾换行，但 downstream 拼接与夹具可能带尾随空白，
  * 不 trim 会让 P3 的 `endsWith` 永远不成立。
  */
 function checkRest(rest: string): string | undefined {
@@ -107,13 +97,16 @@ function verifySingle(original: string, rewritten: string): string | undefined {
   // 症状是「明明只是前插了 rtk，却被报 `not-a-suffix`」。
   const source = original.trimStart().trimEnd();
   // 原段本身已经是 rtk 形态：再压一层就是「压两次比压一次更坏」（`rtk rtk cargo test` 这类
-  // 二次前插在 P1~P4 眼里完全合法，只有这一条能拦住它）。
-  if (source.startsWith(RTK_PREFIX)) {
+  // 二次前插在 P1~P4 眼里完全合法，只有这一条能拦住它）。`env FOO=1 rtk …` 这种 wrapper
+  // 在中间的前插也算「已经是 rtk」，否则它会被当成再一次改写。
+  if (rtkFrontOf(source) !== undefined) {
     return "already-rtk";
   }
   const target = rewritten.trimStart();
-  const prefixProblem = checkPrefix(target);
-  const rest = target.slice(RTK_PREFIX.length).trimEnd();
+  const front = rtkFrontOf(target);
+  const prefixProblem =
+    front === undefined || !isTransparentPrefix(front.prefix) ? "not-rtk-prefixed" : undefined;
+  const rest = front?.rest.trimEnd() ?? "";
   const restProblem = prefixProblem === undefined ? checkRest(rest) : undefined;
   const suffixProblem =
     prefixProblem === undefined && restProblem === undefined

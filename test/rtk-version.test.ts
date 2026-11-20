@@ -1,7 +1,7 @@
 // lib/rtk-version.ts 单测：三段解析（含溢出与读不懂）、支持面比较、阈值同源，
 // 以及装配期探测的三条失败路径（读不到 / 读不懂 / 读取本身抛错）。
 //
-// 「阈值同源」那条不写死 1.0.0：期望值从 MIN_RTK_VERSION 走一遍 parse → format 回到原字符串，
+// 「阈值同源」那条不写死具体下限：期望值从 MIN_RTK_VERSION 走一遍 parse → format 回到原字符串，
 // 这样抬下限时不会被一份独立的字面量挡住。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
@@ -37,18 +37,20 @@ describe("parseRtkVersion", () => {
 });
 
 describe("isRtkVersionSupported", () => {
-  it("≥1.0.0 支持", () => {
-    assert.equal(isRtkVersionSupported({ major: 1, minor: 0, patch: 0 }), true);
+  it("≥1.2.1 支持", () => {
+    assert.equal(isRtkVersionSupported({ major: 1, minor: 2, patch: 1 }), true);
     assert.equal(isRtkVersionSupported({ major: 2, minor: 0, patch: 0 }), true);
   });
 
-  it("0.x 不支持", () => {
+  it("0.x 与 1.2.0 不支持", () => {
     assert.equal(isRtkVersionSupported({ major: 0, minor: 99, patch: 9 }), false);
+    assert.equal(isRtkVersionSupported({ major: 1, minor: 2, patch: 0 }), false);
   });
 
   it("同主版本比次版本、同次版本比补丁", () => {
-    assert.equal(isRtkVersionSupported({ major: 1, minor: 0, patch: 1 }), true);
-    assert.equal(isRtkVersionSupported({ major: 1, minor: 0, patch: 0 }), true);
+    assert.equal(isRtkVersionSupported({ major: 1, minor: 2, patch: 2 }), true);
+    assert.equal(isRtkVersionSupported({ major: 1, minor: 3, patch: 0 }), true);
+    assert.equal(isRtkVersionSupported({ major: 1, minor: 1, patch: 9 }), false);
   });
 });
 
@@ -66,15 +68,15 @@ describe("阈值同源", () => {
 
 describe("probeRtkVersion", () => {
   it("拿到版本且支持", async () => {
-    const probe = await probeRtkVersion(async () => "rtk 1.2.0");
+    const probe = await probeRtkVersion(async () => "rtk 1.2.1");
     assert.ok(probe !== undefined);
-    assert.equal(probe.raw, "rtk 1.2.0");
-    assert.equal(formatRtkVersion(probe.version), "1.2.0");
+    assert.equal(probe.raw, "rtk 1.2.1");
+    assert.equal(formatRtkVersion(probe.version), "1.2.1");
     assert.equal(probe.supported, true);
   });
 
   it("版本过低 supported false（不是 undefined）", async () => {
-    const probe = await probeRtkVersion(async () => "rtk 0.9.9");
+    const probe = await probeRtkVersion(async () => "rtk 1.2.0");
     assert.ok(probe !== undefined);
     assert.equal(probe.supported, false);
   });

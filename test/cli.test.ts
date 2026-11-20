@@ -9,6 +9,7 @@ import {
   RTK_REWRITE_ENV,
   runRtkHook,
   runRtkPipe,
+  runRtkPipelineValidate,
   runRtkRewrite,
 } from "../lib/cli.ts";
 import type { SubprocessFace, SubprocessFaceHandle } from "../lib/cli.ts";
@@ -128,6 +129,13 @@ function rewriteOpts(
 
 function hookOpts(face: SubprocessFace, timeoutMs = 3000): Parameters<typeof runRtkHook>[0] {
   return { subprocess: face, stdin: PAYLOAD, cwd: TMP, timeoutMs, env: HOOK_ENV };
+}
+
+function validateOpts(
+  face: SubprocessFace,
+  timeoutMs = 3000,
+): Parameters<typeof runRtkPipelineValidate>[0] {
+  return { subprocess: face, cwd: TMP, timeoutMs, env: HOOK_ENV };
 }
 
 describe("runRtkHook", () => {
@@ -251,6 +259,57 @@ describe("runRtkPipe", () => {
     const result = await runRtkPipe(pipeOpts(stalledFace(), 5));
 
     assert.deepEqual(result, { ok: false, stdout: "" });
+  });
+});
+
+describe("runRtkPipelineValidate", () => {
+  it("argv 是 rtk pipeline validate；成功时不带诊断", async () => {
+    const fake = fakeFace({ exitCode: 0, signal: null }, "pipeline: ok (rtk:posthook)\n");
+
+    const result = await runRtkPipelineValidate(validateOpts(fake.face));
+
+    assert.deepEqual(result, { ok: true, diagnostics: "" });
+    const [spec] = fake.calls;
+    assert.ok(spec !== undefined);
+    assert.deepEqual(spec.argv, ["rtk", "pipeline", "validate"]);
+    // stdin 不喂任何东西：validate 读的是配置目录里的文件，不是 hook 那条 JSON 管道。
+    assert.equal(spec.stdio.stdin, "ignore");
+    assert.deepEqual(spec.env, HOOK_ENV);
+    assert.equal(spec.graceMs, 3000);
+  });
+
+  it("rc=1 时把 stdout 的诊断原样带回（rtk 写 stdout 不写 stderr）", async () => {
+    const diagnostics =
+      "E000 not valid TOML\nW025 ... has errors and is not loaded — your other pipeline files stay active";
+    const fake = fakeFace({ exitCode: 1, signal: null }, `${diagnostics}\n`);
+
+    assert.deepEqual(await runRtkPipelineValidate(validateOpts(fake.face)), {
+      ok: false,
+      diagnostics,
+    });
+  });
+
+  it("被信号杀掉判失败；stdout 里若只有半截诊断就照实带回", async () => {
+    const fake = fakeFace({ exitCode: null, signal: "SIGTERM" }, "E000 not valid");
+
+    assert.deepEqual(await runRtkPipelineValidate(validateOpts(fake.face)), {
+      ok: false,
+      diagnostics: "E000 not valid",
+    });
+  });
+
+  it("spawn reject（rtk 没装）判失败但不编造 TOML 错误", async () => {
+    const brokenOpts = validateOpts(brokenFace());
+    assert.deepEqual(await runRtkPipelineValidate(brokenOpts), {
+      ok: false,
+      diagnostics: "",
+    });
+  });
+
+  it("超时 abort 判失败（失败不阻塞装配）", async () => {
+    const result = await runRtkPipelineValidate(validateOpts(stalledFace(), 5));
+
+    assert.equal(result.ok, false);
   });
 });
 

@@ -143,7 +143,7 @@ describe("真 AgentLoop 里的遮蔽层", () => {
     const fake = installFakeRtk(
       [cleanups],
       [
-        { exitCode: 0, stdout: "rtk 1.2.0" },
+        { exitCode: 0, stdout: "rtk 1.2.1" },
         { exitCode: 0, stdout: RTK_CARGO_TEST },
       ],
     );

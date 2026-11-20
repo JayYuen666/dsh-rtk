@@ -149,6 +149,12 @@ const BUSY_TIMEOUT_MS = 5000;
  * 常规写入（实测单行 INSERT 在毫秒级），读不到就如实报 unreadable，比卡住强。
  */
 const READ_BUSY_TIMEOUT_MS = 500;
+/**
+ * 本插件已知的 rtk tracking 库版本（`PRAGMA user_version`）。rtk 1.2.1 的
+ * `SchemaVersion` 是 Initial=1 / EngineTables=2 / InitialRecheck=3；只往上做加法时
+ * 旧列仍然读得到，所以这里只报「比我新」，不拒读。
+ */
+const KNOWN_RTK_SCHEMA_VERSION = 3;
 /** 「表/列不存在」的错误串判据：rtk 还没建过表，或库来自更老的 schema。 */
 const NO_SUCH_THING = /no such (?:table|column)/u;
 /** SQLite 的错误码（本层只认这一个）。 */
@@ -346,6 +352,16 @@ async function readRecallTally(
  * @param warn - 读失败时的诊断口（`unreadable` 的成因不止一种，别让它零线索）
  * @returns 聚合回执
  */
+function warnOnSchemaDrift(db: DatabaseFace, warn?: (line: string) => void): void {
+  const row = db.prepare("PRAGMA user_version").get<{ readonly user_version: number }>();
+  const version = row?.user_version ?? 0;
+  if (version > KNOWN_RTK_SCHEMA_VERSION) {
+    warn?.(
+      `[rtk] prefix: ledger schema is version ${String(version)}, newer than the ${String(KNOWN_RTK_SCHEMA_VERSION)} this plugin knows; insights may be incomplete`,
+    );
+  }
+}
+
 export async function readPrefixLedger(
   dbPath: string,
   recallDb: string,
@@ -365,6 +381,10 @@ export async function readPrefixLedger(
     if (present === undefined) {
       return emptyResult("missing");
     }
+    // rtk 1.2.1 起把自己的表版本写在 `PRAGMA user_version`（Initial=1 / EngineTables=2 /
+    // InitialRecheck=3）。本插件只读 `commands` 那一列面，列没变就能读；但版本继续往前时
+    // 列可能被改写，这里不猜、只把漂移说出来（读到旧列会静默少几列，比报错更难查）。
+    warnOnSchemaDrift(db, warn);
     // 窗口起点先在 JS 里算成 rtk 写下的那种时间串（`2026-11-18T00:30:56.951789+00:00`），
     // 再用列上的普通比较。**不要写 `WHERE date(timestamp,'localtime') >= ?`**：那等于对每一行
     // 调用一次 `date()`，而 `timestamp` 上没有索引可用（rtk 建表时没建），于是每次刷新都全表扫。
