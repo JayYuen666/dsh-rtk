@@ -1,10 +1,13 @@
 // 客户端读面的单测：remote 现读、挂载缓存、失败后重试、线上结果拆包、带参端点的 codec。
 //
-// 替身只实现 `RemoteHost` 的 `get` 一位（官方 `Context["get"]` 的最小投影），
-// 按名字查表——**不用 `??` 兜底**：`{ remote: null }` 要表达的是「remote 在场但形状不对」，
-// 用 `??` 会把它悄悄换成可用替身，于是「坏形状」那一支再也测不到。
-import { describe, it } from "vitest";
+// 命名空间替身由官方 `@deepseek-ai/dsh-remote-mock` 承载（端点表 + 调用日志 + 漏配断言），
+// 适配层把读取器的调用转发给 `mock.dispatch`；`RemoteHost` 的 `get` 与 `$mount` 两位仍是
+// 手写替身——那两位测的是读取器自己的投影契约（按名查表、挂载缓存），不是远端协议，
+// 官方 mock 也不实现 `$mount`。查表**不用 `??` 兜底**：`{ remote: null }` 要表达的是
+// 「remote 在场但形状不对」，用 `??` 会把它悄悄换成可用替身，坏形状那一支就测不到了。
+import { afterEach, describe, it } from "vitest";
 import assert from "node:assert/strict";
+import { RemoteMock, ok } from "@deepseek-ai/dsh-remote-mock";
 import { PACKAGE_NAME, STATS_DESCRIPTORS, createStatsReader } from "../src/stats-reader.ts";
 import type { RemoteHost } from "../src/stats-reader.ts";
 import type { InsightsRequest } from "../lib/insights-shape.ts";
@@ -19,11 +22,6 @@ const CARGO_FILTER = "cargo-test";
 const CARGO_FAMILY = "cargo test";
 const MISSING_NAMESPACE = /remote namespace remote\.rtkStats is missing/u;
 const REQUEST: InsightsRequest = { form: "pipe", rangeDays: 7, granularity: "day" };
-
-/** 一份形状正确的线上结果。 */
-function ok<Value>(value: Value): { ok: true; value: Value } {
-  return { ok: true, value };
-}
 
 /** 可编程替身：`remote` 与命名空间各自可换、`$mount` 结局可逐次给。 */
 interface StubOptions {
@@ -180,36 +178,59 @@ function statusOf(enabled: boolean): {
   };
 }
 
-/** 命名空间替身：四个方法各回一条线上结果，`insights` 记下收到的实参个数。 */
+/** RemoteMock 承载的命名空间替身：只把给出的方法挂成端点规则，四个方法位照常全部在表
+ * （适配层无条件转发）——读取器调到没给值的那一位时 `dispatch` 找不到规则会抛「no rule」
+ * 并把这次调用记成 unmatched，`afterEach` 的 `assertNoUnmatched` 当场点名，不会静默落成
+ * `ok(undefined)`。失败回执没有官方构造器（导出面只有 `ok`），保持字面量。 */
 interface NamespaceValues {
   readonly overview?: unknown;
   readonly insights?: unknown;
   readonly status?: unknown;
   readonly reset?: unknown;
   readonly overviewFails?: boolean;
-  readonly seen?: unknown[];
-  readonly argCounts?: number[];
 }
 
-function namespaceOf(
-  values: NamespaceValues,
-): Record<string, (...args: readonly unknown[]) => Promise<unknown>> {
-  return {
-    overview: () => {
-      values.argCounts?.push(0);
-      return Promise.resolve(
-        values.overviewFails === true
-          ? { ok: false, error: { code: "boom", message: "网关拒绝" } }
-          : ok(values.overview),
-      );
-    },
-    insights: (...args) => {
-      values.seen?.push(args[0]);
-      return Promise.resolve(ok(values.insights));
-    },
-    status: () => Promise.resolve(ok(values.status)),
-    reset: () => Promise.resolve(ok(values.reset)),
+/** 本文件造出的全部 mock：用 mock 的每组用例在 afterEach 里逐个跑漏配断言
+ * （lint 的 `require-top-level-describe` / `require-hook` 不收顶层钩子与包装函数）。 */
+const remoteMocks: RemoteMock[] = [];
+
+/** 该组用例造出的 mock 逐个跑漏配断言；有漏配即整组红。 */
+function assertNoMissedRules(): void {
+  for (const mock of remoteMocks.splice(0)) {
+    mock.assertNoUnmatched();
+  }
+}
+
+function namespaceOf(values: NamespaceValues): {
+  namespace: Record<string, (...args: readonly unknown[]) => Promise<unknown>>;
+  mock: RemoteMock;
+} {
+  const mock = RemoteMock.create();
+  remoteMocks.push(mock);
+  const answers: Record<string, unknown> = {
+    overview:
+      values.overviewFails === true
+        ? { ok: false, error: { code: "boom", message: "网关拒绝" } }
+        : ok(values.overview),
+    insights: ok(values.insights),
+    status: ok(values.status),
+    reset: ok(values.reset),
   };
+  const namespace: Record<string, (...args: readonly unknown[]) => Promise<unknown>> = {};
+  // 转发 `dispatch` 而不是直调 `mock.remote.*`：只有 dispatch 走的调用进 MockLog，
+  // `log.calls` 断言与 `assertNoUnmatched` 才覆盖得到读取器的真实调用。
+  for (const method of METHODS) {
+    namespace[method] = (...args: readonly unknown[]) =>
+      mock.dispatch(`${NAMESPACE}/${method}`, args);
+  }
+  for (const method of METHODS) {
+    // `overviewFails` 是 overview 的失败回执旗标：它给值时 overview 也算「给过」。
+    const isProvided = method in values || (method === "overview" && values.overviewFails === true);
+    if (isProvided) {
+      mock.unary(`${NAMESPACE}/${method}`, answers[method]);
+    }
+  }
+  return { namespace, mock };
 }
 
 describe("descriptor 与常量", () => {
@@ -273,6 +294,8 @@ describe("createStatsReader", () => {
 });
 
 describe("读取器：remote 现读与挂载缓存", () => {
+  afterEach(assertNoMissedRules);
+
   it("命名空间晚到时先报错、到场后同一个读取器就能用（读取不钉死在 apply 期）", async () => {
     // 显式给 `undefined` 而不是不给：不给会落进默认值 `{}`，那是个合法记录，
     // 报出来的就是 `namespace.overview is not a function`，"命名空间缺席"这一支反而不被测。
@@ -280,20 +303,20 @@ describe("读取器：remote 现读与挂载缓存", () => {
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     await assert.rejects(() => reader.overview(), MISSING_NAMESPACE);
-    setNamespace(namespaceOf({ overview: overviewOf(1) }));
+    const late = namespaceOf({ overview: overviewOf(1) });
+    setNamespace(late.namespace);
     const overview = await reader.overview();
     assert.deepEqual(overview, overviewOf(1));
   });
 
   it("$mount 只跑一次（成功结论被缓存），四个方法复用同一份挂载", async () => {
-    const { host, mountCalls } = hostOf({
-      namespace: namespaceOf({
-        overview: overviewOf(1),
-        insights: insightsOf(REQUEST),
-        status: statusOf(true),
-        reset: overviewOf(0),
-      }),
+    const { namespace } = namespaceOf({
+      overview: overviewOf(1),
+      insights: insightsOf(REQUEST),
+      status: statusOf(true),
+      reset: overviewOf(0),
     });
+    const { host, mountCalls } = hostOf({ namespace });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     await reader.overview();
@@ -304,9 +327,8 @@ describe("读取器：remote 现读与挂载缓存", () => {
   });
 
   it("并发调用只挂载一次（同一个 promise 被两处 await）", async () => {
-    const { host, mountCalls } = hostOf({
-      namespace: namespaceOf({ overview: overviewOf(1) }),
-    });
+    const { namespace } = namespaceOf({ overview: overviewOf(1) });
+    const { host, mountCalls } = hostOf({ namespace });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     const [first, second] = await Promise.all([reader.overview(), reader.overview()]);
@@ -317,9 +339,10 @@ describe("读取器：remote 现读与挂载缓存", () => {
 
   it("挂载失败不缓存 rejected promise：第二次调用会重新挂载并成功", async () => {
     const failure = new Error("gateway restarted");
+    const { namespace } = namespaceOf({ overview: overviewOf(3) });
     const { host, mountCalls } = hostOf({
       mounts: [failure, { mounted: true }],
-      namespace: namespaceOf({ overview: overviewOf(3) }),
+      namespace,
     });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
@@ -345,15 +368,19 @@ describe("读取器：remote 现读与挂载缓存", () => {
 });
 
 describe("读取器：带参端点", () => {
+  afterEach(assertNoMissedRules);
+
   it("insights 把请求原样发给命名空间，解包后过 schema 交回", async () => {
-    const seen: unknown[] = [];
-    const { host } = hostOf({
-      namespace: namespaceOf({ insights: insightsOf(REQUEST), seen }),
-    });
+    const { namespace, mock } = namespaceOf({ insights: insightsOf(REQUEST) });
+    const { host } = hostOf({ namespace });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     const response = await reader.insights(REQUEST);
-    assert.deepEqual(seen, [REQUEST], "实参就是调用方给的那个对象，读取器不替它补字段");
+    assert.deepEqual(
+      mock.log.calls(`${NAMESPACE}/insights`).map((call) => call.args),
+      [[REQUEST]],
+      "实参就是调用方给的那个对象，读取器不替它补字段",
+    );
     assert.equal(response.form, REQUEST.form);
     assert.equal(response.rangeDays, REQUEST.rangeDays);
     assert.equal(response.granularity, REQUEST.granularity);
@@ -361,26 +388,21 @@ describe("读取器：带参端点", () => {
   });
 
   it("无参方法一个实参都不传（空数组也不传）", async () => {
-    const argCounts: number[] = [];
-    const { host } = hostOf({
-      namespace: {
-        overview: (...args: readonly unknown[]) => {
-          argCounts.push(args.length);
-          return Promise.resolve(ok(overviewOf(1)));
-        },
-      },
-    });
+    const { namespace, mock } = namespaceOf({ overview: overviewOf(1) });
+    const { host } = hostOf({ namespace });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     await reader.overview();
-    assert.deepEqual(argCounts, [0]);
+    assert.deepEqual(
+      mock.log.calls(`${NAMESPACE}/overview`).map((call) => call.args),
+      [[]],
+    );
   });
 
   it("线上回执坏形状时点名缺哪个字段（读到坏形状就报错，不硬转）", async () => {
     // 只给请求位、没有 availability/totals：跨版本时网关可能只回旧形状。
-    const { host } = hostOf({
-      namespace: namespaceOf({ insights: { ...REQUEST } }),
-    });
+    const { namespace } = namespaceOf({ insights: { ...REQUEST } });
+    const { host } = hostOf({ namespace });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     await assert.rejects(() => reader.insights(REQUEST), /availability|totals/u);
@@ -388,8 +410,11 @@ describe("读取器：带参端点", () => {
 });
 
 describe("读取器：线上结果拆包", () => {
+  afterEach(assertNoMissedRules);
+
   it("result.ok 为真时交回 value", async () => {
-    const { host } = hostOf({ namespace: namespaceOf({ status: statusOf(false) }) });
+    const { namespace } = namespaceOf({ status: statusOf(false) });
+    const { host } = hostOf({ namespace });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     assert.deepEqual(await reader.status(), statusOf(false));
@@ -403,7 +428,8 @@ describe("读取器：线上结果拆包", () => {
   });
 
   it("result.ok 为假时把 code 与 message 一起抛出来（不吞成因）", async () => {
-    const { host } = hostOf({ namespace: namespaceOf({ overviewFails: true }) });
+    const { namespace } = namespaceOf({ overviewFails: true });
+    const { host } = hostOf({ namespace });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     await assert.rejects(() => reader.overview(), /boom: 网关拒绝/u);
@@ -418,14 +444,16 @@ describe("读取器：线上结果拆包", () => {
 
   it("概览回执合 schema 但字段类型不对时点名字段", async () => {
     const broken = { ...overviewOf(1), today: { prefix: 1, pipe: 2 } };
-    const { host } = hostOf({ namespace: namespaceOf({ overview: broken }) });
+    const { namespace } = namespaceOf({ overview: broken });
+    const { host } = hostOf({ namespace });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     await assert.rejects(() => reader.overview(), /today/u);
   });
 
   it("reset 交回的是概览形状（不是旧的 summary）", async () => {
-    const { host } = hostOf({ namespace: namespaceOf({ reset: overviewOf(0) }) });
+    const { namespace } = namespaceOf({ reset: overviewOf(0) });
+    const { host } = hostOf({ namespace });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     const after = await reader.reset();
@@ -435,11 +463,12 @@ describe("读取器：线上结果拆包", () => {
 });
 
 describe("读取器：明细行两套键", () => {
+  afterEach(assertNoMissedRules);
+
   it("filters 行按 name 归组，值原样过 schema", async () => {
     const filters = [filterOf(CARGO_FILTER, 600)];
-    const { host } = hostOf({
-      namespace: namespaceOf({ insights: { ...insightsOf(REQUEST), filters } }),
-    });
+    const { namespace } = namespaceOf({ insights: { ...insightsOf(REQUEST), filters } });
+    const { host } = hostOf({ namespace });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     const response = await reader.insights(REQUEST);
@@ -452,9 +481,8 @@ describe("读取器：明细行两套键", () => {
 
   it("commands 行按 family 归组（表头不能沿用 name）", async () => {
     const commands = [{ ...filterOf(CARGO_FAMILY, 600), family: CARGO_FAMILY }];
-    const { host } = hostOf({
-      namespace: namespaceOf({ insights: { ...insightsOf(REQUEST), commands } }),
-    });
+    const { namespace } = namespaceOf({ insights: { ...insightsOf(REQUEST), commands } });
+    const { host } = hostOf({ namespace });
     const reader = createStatsReader(host);
     assert.ok(reader !== undefined);
     const response = await reader.insights(REQUEST);

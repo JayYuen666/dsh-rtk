@@ -22,12 +22,19 @@ import type {
 import { cellsOf } from "../lib/insights-page-logic.ts";
 import type { SuggestionLine } from "../lib/insights-page-logic.ts";
 import { formatPct, formatTokens } from "../lib/insights-view.ts";
+import { Callout, DataTable, Meter } from "@jayyuen66/dsh-plugin-shared/client";
 import type { Translate } from "./ui-messages.ts";
 
 /** 三个反复出现的类名：`sonarjs(no-duplicate-string)` 数的是字面量，不是语义。 */
 const BLOCK = "rtkc-block";
 const NOTE = "rtkc-note";
 const SECTION_TITLE = "rtkc-subtitle";
+/**
+ * 单表展示行数上限。行数组在服务层只排序不截断（窗口内有多少个不同身份就多少行），
+ * 30 天窗口的 workdir 可能上百行——明细表是给人扫 Top 的，不是全量导出。
+ * 截断发生在渲染层：服务层的行数与 `rtk gain` 对账口径不变，被截掉的行只是不画。
+ */
+const TABLE_ROW_LIMIT = 12;
 
 /**
  * 一个单元格。
@@ -72,28 +79,14 @@ function ratioOf(value: number, peak: number): number {
   return Math.min(value / peak, 1);
 }
 
-/** 量条本身（纯装饰，读屏靠旁边的数字）。宽度是百分比。 */
-function barOf(ratio: number): ReactNode {
-  const width = `${String(Math.round(ratio * 100))}%`;
-  const fill = createElement("span", { className: "rtkc-meter-fill", style: { width } });
-  return createElement("span", { className: "rtkc-meter", "aria-hidden": true }, fill);
-}
-
-/** 数值格的量条 + 数值本身。量条宽度是百分比，`ratio` 为 0 时只剩数值。 */
+/** 数值格的量条 + 数值本身（shared Meter：track + 右对齐数值）。`ratio` 为 0 时只剩数值。 */
 function meterOf(text: string, ratio: number): ReactNode {
-  const value = createElement("span", { className: "rtkc-cell-value" }, text);
-  return createElement("span", { className: "rtkc-cell-metric" }, barOf(ratio), value);
-}
-
-/** `<table>` 本体：表头 + 全部行。单独一层是为了不让 `tableOf` 里叠四层调用。 */
-function wrapOf(head: ReactNode, body: readonly ReactNode[]): ReactNode {
-  const thead = createElement("thead", null, head);
-  const tbody = createElement("tbody", null, ...body);
-  return createElement("table", { className: "rtkc-table" }, thead, tbody);
+  return createElement(Meter, { ratio, label: text });
 }
 
 /** 表头 + 行的外壳。`empty` 是这张表没有数据时那一句话，不是空字符串。 */
 function tableOf(props: {
+  readonly t: Translate;
   readonly title: string;
   readonly columns: readonly Column[];
   readonly rows: readonly (readonly Cell[])[];
@@ -110,46 +103,35 @@ function tableOf(props: {
       createElement("p", { className: NOTE }, props.empty),
     );
   }
-  const head = createElement(
-    "tr",
-    null,
-    ...props.columns.map((column) =>
-      createElement(
-        "th",
-        {
-          key: column.key,
-          className: column.numeric ? "rtkc-num" : "rtkc-text",
-          scope: "col",
-        },
-        column.label,
-      ),
-    ),
-  );
-  const body = props.rows.map((row, index) =>
+  // 列与行交给 shared DataTable：身份列加粗并冻结在左（横向滚动时「这是哪一行」
+  // 不跟着数字滚走），数值列右对齐，量条列的格子是 shared Meter 元素。
+  // 身份列（第一列）单行省略：workdir 路径可能很长，悬停 title 看全文。
+  const columns = props.columns.map((column, index) => ({
+    key: column.key,
+    label: column.label,
+    numeric: column.numeric,
+    strong: !column.numeric,
+    ellipsis: index === 0,
+  }));
+  const allRows = props.rows.map((row, index) => ({
     // 行键用「第一格的值 + 序号」：同一张表里第一列就是身份，但它可能重复
     // （两个 path 只差尾斜杠），序号兜住重复。
-    createElement(
-      "tr",
-      { key: `${props.rowKeys[index] ?? ""}#${index}` },
-      ...row.map((cell, cellIndex) => {
-        const column = props.columns[cellIndex];
-        const numeric = column?.numeric === true;
-        return createElement(
-          "td",
-          {
-            key: `${column?.key ?? ""}#${cellIndex}`,
-            className: numeric ? "rtkc-num" : "rtkc-text",
-          },
-          column?.meter === true ? meterOf(cell.text, cell.ratio ?? 0) : cell.text,
-        );
-      }),
+    key: `${props.rowKeys[index] ?? ""}#${index}`,
+    cells: row.map((cell, cellIndex) =>
+      props.columns[cellIndex]?.meter === true ? meterOf(cell.text, cell.ratio ?? 0) : cell.text,
     ),
-  );
+  }));
+  const truncated = allRows.length > TABLE_ROW_LIMIT;
+  const rows = truncated ? allRows.slice(0, TABLE_ROW_LIMIT) : allRows;
+  // 表脚只在真被截断时出现：行数组按节省量/次数降序排好（见服务层），「前 N 行」就是 Top N。
+  const foot = truncated
+    ? props.t("tableTruncated", { total: String(allRows.length), limit: String(TABLE_ROW_LIMIT) })
+    : undefined;
   return createElement(
     "section",
     { className: `${BLOCK} rtkc-card` },
     title,
-    createElement("div", { className: "rtkc-table-wrap" }, wrapOf(head, body)),
+    createElement(DataTable, { columns, rows, stickyFirst: true, foot }),
   );
 }
 
@@ -210,6 +192,7 @@ export function FilterTable(props: {
     saved: peakOf(rows.map((row) => row.savedTokens)),
   };
   return tableOf({
+    t,
     title: t("tableFilters"),
     columns: [{ key: "name", label: t("colName"), numeric: false }, ...metricColumnsOf(t, "pipe")],
     rows: rows.map((row) => [{ text: row.name }, ...cellsRow(row, "pipe", peaks)]),
@@ -230,6 +213,7 @@ export function CommandTable(props: {
     saved: peakOf(rows.map((row) => row.savedTokens)),
   };
   return tableOf({
+    t,
     title: t("tableCommands"),
     columns: [
       { key: "family", label: t("colFamily"), numeric: false },
@@ -252,6 +236,7 @@ export function WorkdirTable(props: {
     saved: peakOf(rows.map((row) => row.savedTokens)),
   };
   return tableOf({
+    t,
     title: t("tableWorkdirs"),
     columns: [
       { key: "path", label: t("colWorkdir"), numeric: false },
@@ -284,6 +269,7 @@ export function ReasonsTable(props: {
   const { t, rows } = props;
   const peak = peakOf(rows.map((row) => row.count));
   return tableOf({
+    t,
     title: t("tableReasons"),
     columns: [
       { key: "reason", label: t("colReason"), numeric: false },
@@ -307,21 +293,23 @@ export function Suggestions(props: {
   if (lines.length === 0) {
     return createElement(
       "section",
-      { className: `${BLOCK} rtkc-card` },
+      { className: `${BLOCK} rtkc-card rtkc-suggest` },
       createElement("h3", { className: SECTION_TITLE }, t("suggestionsTitle")),
       createElement("p", { className: NOTE }, t("suggestionsEmpty")),
     );
   }
   return createElement(
     "section",
-    { className: `${BLOCK} rtkc-card` },
+    { className: `${BLOCK} rtkc-card rtkc-suggest` },
     createElement("h3", { className: SECTION_TITLE }, t("suggestionsTitle")),
     // 一句话就是一整句模板（`{filter}` 之类在客户端翻译时才替换）：拆成「粗体标题 + 说明」
     // 会让同一句在两种语言里断在不同的位置，而模板本身已经是通顺的一句。
+    // 一句话就是一整条警示（`{filter}` 之类在客户端翻译时才替换）：warn 档琥珀色、
+    // 其余信息蓝，颜色语义交给 shared 的色调映射。
     ...lines.map((line) =>
       createElement(
-        "p",
-        { key: line.key, className: line.warn ? "rtkc-suggestion rtkc-warn" : "rtkc-suggestion" },
+        Callout,
+        { key: line.key, tone: line.warn ? "warn" : "info" },
         t(line.messageKey, line.values),
       ),
     ),

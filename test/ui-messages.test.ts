@@ -99,6 +99,18 @@ describe("设置卡双语字典", () => {
       // `rtkSelfRecall` 是取回库的体检数：条数 + 磁盘占用。两个占位符都不能省——只印条数
       // 会让「这个库在悄悄长大」这件事看不见。
       rtkSelfRecall: ["entries", "size"],
+      // 明细表的表脚截断说明：总行数与上限两个位都要在，少了哪个「被截掉多少行」就读不出。
+      tableTruncated: ["total", "limit"],
+      // 页头最近刷新时间：时间位漏了页面会原样印出花括号。
+      updatedAtLabel: ["time"],
+      // KPI 涨跌标注：涨跌位漏了就原样印花括号。
+      kpiDeltaDay: ["delta"],
+      kpiDeltaWeek: ["delta"],
+      kpiDeltaMonth: ["delta"],
+      // 页头副标题：整句直出，无占位符；登记只为钉住两语同键。
+      panelSub: [],
+      // 小节字段计数徽章：字段数位漏了会原样印花括号。
+      fieldCount: ["count"],
     };
     for (const [key, expected] of Object.entries(EXPECTED) as [
       keyof UiMessages,

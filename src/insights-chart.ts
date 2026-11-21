@@ -90,11 +90,14 @@ export async function loadChartModule(): Promise<AnyFunction | undefined> {
 /** 图表模块是否已经成功加载过（`false` 时下一次挂载还会再请求一趟）。 */
 export const chartModuleLoaded = (): boolean => loaded;
 
-/** 画好之后那个句柄的最小形状：`update` 与 `dispose` 都得可调用。 */
+/** 画好之后那个句柄的最小形状：`update`、`resize` 与 `dispose` 都得可调用。 */
 const isChartHandle = (value: unknown): value is ChartHandle =>
-  isObject(value) && isFunction(value["update"]) && isFunction(value["dispose"]);
+  isObject(value) &&
+  isFunction(value["update"]) &&
+  isFunction(value["resize"]) &&
+  isFunction(value["dispose"]);
 
-/** 半张句柄：形状不对、但已经把 canvas 与 resize 监听建出来的返回值。 */
+/** 半张句柄：形状不对、但已经把 canvas 建出来的返回值。 */
 const isDisposable = (value: unknown): value is { readonly dispose: AnyFunction } =>
   isObject(value) && isFunction(value["dispose"]);
 
@@ -120,11 +123,11 @@ function releaseHalfHandle(drawn: unknown): void {
  * 把一个容器变成图表。
  *
  * 返回 `undefined` 表示这次没画成，调用方应保留占位（表格与数字本身不依赖它）。
- * 画完一定要在卸载时 `dispose`：ECharts 会往容器里塞 canvas 并挂 `resize` 监听。
+ * 画完一定要在卸载时 `dispose`：ECharts 会往容器里塞 canvas。
  *
  * **形状不对时也得收**：chunk 与入口各自构建，版本错配时 `mount` 可能返回一个没有 `update`
- * 的半个句柄。那种情况下 canvas 与 resize 监听**已经建出来了**，直接 `return undefined`
- * 会把它们永远留在页面上（每切一次页签多一份）。所以先尽力调它的 `dispose`，再判定失败。
+ * 的半个句柄。那种情况下 canvas **已经建出来了**，直接 `return undefined`
+ * 会把它永远留在页面上（每切一次页签多一份）。所以先尽力调它的 `dispose`，再判定失败。
  * @param container - 图表容器
  * @param spec - 要画的规格
  * @returns 句柄；没画成时 `undefined`
@@ -153,6 +156,8 @@ export interface ChartPalette {
   readonly colors: readonly [string, string];
   readonly textColor: string;
   readonly gridColor: string;
+  readonly tooltipBg: string;
+  readonly tooltipText: string;
 }
 
 /** CSS 没定义时的兜底色（与卡片样式里的两支同调）。 */
@@ -160,6 +165,8 @@ const FALLBACK_PALETTE: ChartPalette = {
   colors: ["#3b6ef6", "#e08a2e"],
   textColor: "#667085",
   gridColor: "#e4e7ec",
+  tooltipBg: "rgba(24,26,32,.94)",
+  tooltipText: "#f2f4f7",
 };
 
 /** 从容器读主题色；读不到就给兜底色，绝不抛。 */
@@ -176,5 +183,7 @@ export function paletteOf(container: HTMLElement): ChartPalette {
     ],
     textColor: read("--rtkc-chart-text", FALLBACK_PALETTE.textColor),
     gridColor: read("--rtkc-chart-grid", FALLBACK_PALETTE.gridColor),
+    tooltipBg: read("--rtkc-chart-tooltip-bg", FALLBACK_PALETTE.tooltipBg),
+    tooltipText: read("--rtkc-chart-tooltip-text", FALLBACK_PALETTE.tooltipText),
   };
 }

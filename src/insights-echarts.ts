@@ -135,10 +135,10 @@ function optionOf(spec: ChartSpec): Record<string, unknown> {
     tooltip: {
       trigger: "axis",
       confine: true,
-      // 深色主题下默认的白底 tooltip 会盖住半边图，颜色跟卡片对不上；这里跟着坐标轴文字色走。
-      backgroundColor: "rgba(24,26,32,.94)",
+      // tooltip 底色与文字色随主题（入口从 CSS 变量取好放进 spec）；浅色主题下不再是深底。
+      backgroundColor: spec.tooltipBg,
       borderColor: spec.gridColor,
-      textStyle: { color: "#f2f4f7", fontSize: 11 },
+      textStyle: { color: spec.tooltipText, fontSize: 11 },
       axisPointer: { type: "shadow", shadowStyle: { color: "rgba(127,127,127,.12)" } },
     },
     legend: {
@@ -169,6 +169,10 @@ function optionOf(spec: ChartSpec): Record<string, unknown> {
 function mountChart(container: HTMLElement, spec: ChartSpec): ChartHandle {
   const chart = echartsInit(container, undefined, { renderer: "canvas" });
   chart.setOption(optionOf(spec), true);
+  // 尺寸自适应走两条腿：window resize（真实窗口拉伸）+ 入口侧的容器 ResizeObserver
+  // （侧栏收起、面板分栏这类不动窗口的布局变化）。两条腿对同一帧各调一次 resize 是
+  // 幂等的，缺哪条哪类变化就没人接——实测嵌入环境里 ResizeObserver 回调可能不派发，
+  // window 那条是兜底。
   const onResize = (): void => {
     chart.resize();
   };
@@ -176,6 +180,9 @@ function mountChart(container: HTMLElement, spec: ChartSpec): ChartHandle {
   return {
     update: (next) => {
       chart.setOption(optionOf(next), true);
+    },
+    resize: () => {
+      chart.resize();
     },
     dispose: () => {
       globalThis.removeEventListener("resize", onResize);

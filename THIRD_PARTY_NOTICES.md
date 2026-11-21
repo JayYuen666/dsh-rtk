@@ -39,7 +39,7 @@ render time, through a CSS mask — the shape and alpha channel are the upstream
 
 | Package | License | Why it is here |
 | --- | --- | --- |
-| `@jayyuen66/dsh-plugin-shared`（catalog，伞根 ^0.2.11） | MIT | Shared build layer and settings-card primitives. The card components are supplied by the shared client row, externalized as `@jayyuen66/dsh-plugin-shared/client`; `react` and `zod` stay external to the host module table. |
+| `@jayyuen66/dsh-plugin-shared`（catalog，伞根 ^0.2.12） | MIT | Shared build layer and settings-card primitives. The card components are supplied by the shared client row, externalized as `@jayyuen66/dsh-plugin-shared/client`; `react` and `zod` stay external to the host module table. |
 | `zod` | MIT | Strict codecs for the settings card and the statistics records. Externalized in `client.js`; the host supplies the single instance. |
 
 ## Apache ECharts

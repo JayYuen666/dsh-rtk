@@ -31,6 +31,8 @@ import {
   granularityKeyOf,
   hasLatencyOf,
   isEmptyWindow,
+  kpiDeltaLabelKeyOf,
+  kpiDeltaOf,
   kpiRowsOf,
   lastEventLineOf,
   latencyLabelKeyOf,
@@ -278,6 +280,64 @@ describe("kpi 行", () => {
 function today(commands: number, savedTokens: number, savingsPct: number): FormToday {
   return { commands, savedTokens, savingsPct, compressed: 0, attempts: 0, coveragePct: 0 };
 }
+
+/** 两桶序列：commands/attempts/compressed/savedTokens 各自可调（缺省补 0）。 */
+function twoPoint(last: Partial<SeriesPoint>, prev: Partial<SeriesPoint>): SeriesPoint[] {
+  const base: SeriesPoint = {
+    key: "",
+    commands: 0,
+    bashCalls: 0,
+    attempts: 0,
+    compressed: 0,
+    originalTokens: 0,
+    compressedTokens: 0,
+    savedTokens: 0,
+    savingsPct: 0,
+    coveragePct: 0,
+  };
+  return [
+    { ...base, ...prev },
+    { ...base, ...last },
+  ];
+}
+
+describe("kpi 涨跌标注", () => {
+  it("涨=↑，跌=↓，幅度四舍五入到整数百分比", () => {
+    const up = kpiDeltaOf(twoPoint({ commands: 112 }, { commands: 100 }), "commands");
+    assert.deepEqual(up, { direction: "up", text: "↑12%" });
+    const down = kpiDeltaOf(twoPoint({ commands: 95 }, { commands: 100 }), "commands");
+    assert.deepEqual(down, { direction: "down", text: "↓5%" });
+  });
+
+  it("前置桶为 0（分母不存在）与持平都不出标注", () => {
+    assert.equal(kpiDeltaOf(twoPoint({ commands: 50 }, { commands: 0 }), "commands"), undefined);
+    assert.equal(kpiDeltaOf(twoPoint({ commands: 100 }, { commands: 100 }), "commands"), undefined);
+    // 舍入后 0%（999 → 1000 是 +0.1%）也无信息量，不出。
+    assert.equal(
+      kpiDeltaOf(twoPoint({ commands: 1000 }, { commands: 999 }), "commands"),
+      undefined,
+    );
+  });
+
+  it("序列不足两桶与末位异常都不出标注", () => {
+    const one = twoPoint({ commands: 10 }, {});
+    assert.equal(kpiDeltaOf([one[1]!], "commands"), undefined);
+    assert.equal(kpiDeltaOf([], "commands"), undefined);
+  });
+
+  it("字段直取：savedTokens 对 saved 行，bashCalls 对调用行", () => {
+    const up = kpiDeltaOf(twoPoint({ savedTokens: 2200 }, { savedTokens: 2000 }), "savedTokens");
+    assert.deepEqual(up, { direction: "up", text: "↑10%" });
+    const calls = kpiDeltaOf(twoPoint({ bashCalls: 30 }, { bashCalls: 20 }), "bashCalls");
+    assert.deepEqual(calls, { direction: "up", text: "↑50%" });
+  });
+
+  it("涨跌文案键按粒度换词", () => {
+    assert.equal(kpiDeltaLabelKeyOf("day"), "kpiDeltaDay");
+    assert.equal(kpiDeltaLabelKeyOf("week"), "kpiDeltaWeek");
+    assert.equal(kpiDeltaLabelKeyOf("month"), "kpiDeltaMonth");
+  });
+});
 
 describe("设置卡的两格今日摘要", () => {
   it("顺序固定改写在前、压缩在后，不按启用形态过滤", () => {

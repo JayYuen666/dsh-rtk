@@ -77,6 +77,8 @@ function themedOf(node: HTMLElement, spec: ChartSpec): ChartSpec {
     colors: palette.colors,
     textColor: palette.textColor,
     gridColor: palette.gridColor,
+    tooltipBg: palette.tooltipBg,
+    tooltipText: palette.tooltipText,
   };
 }
 
@@ -168,6 +170,7 @@ export function useChart(spec: ChartSpec | undefined): {
   const nodeRef = useRef<HTMLElement | null>(null);
   const specRef = useRef<ChartSpec | undefined>(spec);
   const stateRef = useRef<ChartState>(freshState(false));
+  const observerRef = useRef<ResizeObserver | undefined>(undefined);
   const [failed, setFailed] = useState(false);
 
   const containerRef = useCallback((node: HTMLElement | null): void => {
@@ -183,6 +186,15 @@ export function useChart(spec: ChartSpec | undefined): {
     previous.node = undefined;
     stateRef.current = freshState(node === null);
     nodeRef.current = node;
+    // 尺寸自适应观察**容器**而不是 window：侧栏收起、面板分栏这类不动窗口的布局变化
+    // 也要让图跟着变。观察器跟着节点走（换节点换观察对象，卸载即断开）。
+    observerRef.current?.disconnect();
+    if (node !== null) {
+      observerRef.current ??= new ResizeObserver(() => {
+        stateRef.current.handle?.resize();
+      });
+      observerRef.current.observe(node);
+    }
   }, []);
 
   useEffect(() => {
@@ -237,6 +249,8 @@ export function useChart(spec: ChartSpec | undefined): {
       state.handle?.dispose();
       state.handle = undefined;
       state.node = undefined;
+      observerRef.current?.disconnect();
+      observerRef.current = undefined;
     },
     [],
   );

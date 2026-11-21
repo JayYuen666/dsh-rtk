@@ -4,6 +4,16 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.5
+
+宿主基线抬到 `0.2.2-rc.5`；客户端统计读取的测试替身换官方 RemoteMock。
+
+### Changed
+
+- **宿主依赖线抬到 `0.2.2-rc.5`**：devDependencies 全族精确钉 rc.5，`engines.dsh` 与 dsh 家族 peer 同一条窗口；shared 经 catalog 抬到 `^0.2.12`，`pnpm-lock.yaml` 经 `pnpm install --lockfile-only` 重解到 registry 现量；devDependencies 补 `react-dom`（`^19.3.0`，与 react 相邻）——shared 0.2.12 的 card-ui 经 `createPortal` 引 `react-dom`，客户端测试经 ESM 链解析到它（与 danger-guard / dir-prep / session-rescue 的既有供应同形）。
+- **stats-reader 测试的命名空间替身换官方 `RemoteMock`**（`dsh-remote-mock` 由死依赖转为在用）：四个端点各挂一条 unary 规则、调用经 `mock.dispatch` 转发，实参透传与「无参方法一个实参都不传」改由 MockLog 断言，每组用例后跑 `assertNoUnmatched` 漏配断言；`get` / `$mount` 两位仍是手写替身——那两位测的是读取器自身的投影契约，官方 mock 不实现 `$mount`。
+- **`lib/rtk-hook.ts` 的 `isFieldBag` / `fieldOf` 与 stats-reader 的 `RemoteHost` / `isRemoteMounter` 收编 shared**（逐字同构副本，改用 `./lib/record` 与 `./lib/typert-client` 的正主）。
+
 ## 0.2.4
 
 Follows rtk 1.2.1. CI now installs 1.2.1 and the real CLI circuits run against it; the pipe

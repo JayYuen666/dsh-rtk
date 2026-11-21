@@ -17,6 +17,8 @@ import type {
   TypertCodec,
 } from "@deepseek-ai/dsh-typert-protocol";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/client";
+import { isRemoteMounter } from "@jayyuen66/dsh-plugin-shared/lib/typert-client";
+import type { RemoteHost } from "@jayyuen66/dsh-plugin-shared/lib/typert-client";
 import { z } from "zod";
 
 import {
@@ -27,6 +29,9 @@ import {
 import type { InsightsRequest, InsightsResponse, StatsOverview } from "../lib/insights-shape.ts";
 import { statsStatusSchema } from "../lib/stats-shape.ts";
 import type { StatsStatus } from "../lib/stats-shape.ts";
+/** 客户端上下文里本模块用到的那一位：显式读取一个可选服务（shared 收编的正主，
+ *  isRemoteMounter 一并来自同一模块——本仓此前与它逐字同构，参数名 α-等价）。 */
+export type { RemoteHost } from "@jayyuen66/dsh-plugin-shared/lib/typert-client";
 
 /** 卡片所在 bundle 的包名：`$mount` 的 `package` 位与插槽键同源（见 src/client-entry.ts）。 */
 export const PACKAGE_NAME = "@jayyuen66/dsh-rtk";
@@ -129,21 +134,6 @@ export interface StatsReader {
   readonly status: () => Promise<StatsStatus>;
   readonly reset: () => Promise<StatsOverview>;
 }
-
-/** 客户端上下文里本模块用到的那一位：显式读取一个可选服务。 */
-export interface RemoteHost {
-  get?: (name: string, strict?: boolean) => unknown;
-}
-
-interface RemoteMounter {
-  $mount: (config: {
-    package: string;
-    descriptors: readonly InvocationDescriptor[];
-  }) => Promise<unknown>;
-}
-
-const isRemoteMounter = (value: unknown): value is RemoteMounter =>
-  isRecord(value) && typeof value["$mount"] === "function";
 
 /**
  * 可调用的无参或多参函数。

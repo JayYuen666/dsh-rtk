@@ -36,6 +36,8 @@ export interface UiMessages {
   readonly resetCancel: string;
   readonly resetClose: string;
   readonly switchSection: string;
+  /// 小节标题旁的字段计数徽章（{count} 为字段数）。
+  readonly fieldCount: string;
   readonly enabledLabel: string;
   /** 仅改写形态的总开关说明。 */
   readonly enabledHintPrefix: string;
@@ -89,6 +91,8 @@ export interface UiMessages {
   // ---- Insights 页（左侧栏一级面板）----
   /** 侧栏行与页面标题。与设置分区的 `navLabel` 分开：一个进设置列表，一个进侧栏。 */
   readonly panelLabel: string;
+  /** Insights 页头标题下的那句副标题。 */
+  readonly panelSub: string;
   readonly tabPrefix: string;
   readonly tabPipe: string;
   readonly range7: string;
@@ -149,6 +153,12 @@ export interface UiMessages {
   readonly loadFailed: string;
   readonly loadingLabel: string;
   readonly refresh: string;
+  /** 页头的最近刷新时间（{time} 为 HH:mm）。 */
+  readonly updatedAtLabel: string;
+  /** KPI 瓦片的涨跌标注（{delta} 为 ↑12% 形态；粒度各自对应较前一日/周/月）。 */
+  readonly kpiDeltaDay: string;
+  readonly kpiDeltaWeek: string;
+  readonly kpiDeltaMonth: string;
   readonly tableFilters: string;
   readonly tableCommands: string;
   readonly tableWorkdirs: string;
@@ -163,6 +173,8 @@ export interface UiMessages {
   readonly colReason: string;
   readonly colCount: string;
   readonly tableEmpty: string;
+  /** 行数超过单表上限时表脚的说明（total=总行数，limit=展示的上限）。 */
+  readonly tableTruncated: string;
   readonly reasonsEmpty: string;
   readonly suggestionsTitle: string;
   readonly suggestionsEmpty: string;
@@ -219,6 +231,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     resetCancel: "取消",
     resetClose: "关闭",
     switchSection: "开关",
+    fieldCount: "{count} 字段",
     enabledLabel: "启用 rtk 压缩",
     enabledHintPrefix:
       "未手动设置时，检测到受支持的 rtk 才默认开启；手动切换会固定选择。打开后 bash 命令会先问 rtk 能否改写；问不到就原样执行。",
@@ -272,6 +285,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rtkTooOldHint: "探到的 rtk 是 {version}，低于支持的 {minimum}：请升级 rtk 后再打开压缩。",
     rtkReadyHint: "就绪：{version}（{path}）",
     panelLabel: "rtk 统计",
+    panelSub: "命令改写与结果压缩的效果统计",
     tabPrefix: "命令改写",
     tabPipe: "结果压缩",
     range7: "近 7 天",
@@ -316,6 +330,10 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     loadFailed: "统计读面没有响应：{reason}",
     loadingLabel: "读取中…",
     refresh: "刷新",
+    updatedAtLabel: "更新于 {time}",
+    kpiDeltaDay: "较前一日 {delta}",
+    kpiDeltaWeek: "较前一周 {delta}",
+    kpiDeltaMonth: "较前一月 {delta}",
     tableFilters: "按过滤器",
     tableCommands: "按命令",
     tableWorkdirs: "按目录",
@@ -330,6 +348,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     colReason: "原因",
     colCount: "次数",
     tableEmpty: "窗口内没有记录。",
+    tableTruncated: "共 {total} 行，只展示节省最多的前 {limit} 行",
     reasonsEmpty: "窗口内没有跳过记录。",
     suggestionsTitle: "建议",
     suggestionsEmpty: "没有需要调整的项。",
@@ -374,6 +393,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     resetCancel: "Cancel",
     resetClose: "Close",
     switchSection: "Switches",
+    fieldCount: "{count} fields",
     enabledLabel: "Enable rtk compression",
     enabledHintPrefix:
       "Until set explicitly, this follows rtk readiness: on only when a supported rtk is detected; a manual toggle pins the choice. When on, bash commands are first offered to rtk; if rtk declines, the command runs unchanged.",
@@ -432,6 +452,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
       "Found rtk {version}, below the supported {minimum}: upgrade rtk before enabling compression.",
     rtkReadyHint: "Ready: {version} ({path})",
     panelLabel: "rtk stats",
+    panelSub: "Effectiveness stats for command rewriting and output compression",
     tabPrefix: "Command rewrite",
     tabPipe: "Output compression",
     range7: "Last 7 days",
@@ -477,6 +498,10 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     loadFailed: "The stats channel did not respond: {reason}",
     loadingLabel: "Loading...",
     refresh: "Refresh",
+    updatedAtLabel: "Updated {time}",
+    kpiDeltaDay: "vs prior day {delta}",
+    kpiDeltaWeek: "vs prior week {delta}",
+    kpiDeltaMonth: "vs prior month {delta}",
     tableFilters: "By filter",
     tableCommands: "By command",
     tableWorkdirs: "By directory",
@@ -491,6 +516,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     colReason: "Reason",
     colCount: "Count",
     tableEmpty: "No records in this window.",
+    tableTruncated: "{total} rows total; showing the top {limit} by savings",
     reasonsEmpty: "No skips recorded in this window.",
     suggestionsTitle: "Suggestions",
     suggestionsEmpty: "Nothing to adjust.",

@@ -115,11 +115,18 @@ export type KpiLabelKey =
   | "kpiSaved"
   | "kpiSavings";
 
+/** 一格的涨跌标注：方向只决定着色，文案由调用方按粒度拼好（较前一日 ↑12%）。 */
+export interface KpiDelta {
+  readonly direction: "up" | "down";
+  readonly text: string;
+}
 /** KPI 行的一项。`labelKey` 是文案键，`value` 已经格式化好——组件不再判单位。 */
 export interface KpiRow {
   readonly key: string;
   readonly labelKey: KpiLabelKey;
   readonly value: string;
+  /** 窗口内最后一个桶对前一个桶的涨跌（序列不足两桶/前置为 0/持平时缺省）。 */
+  readonly delta?: KpiDelta;
   /**
    * 纯整数的原始值：只给前三格（次数类）填。
    *
@@ -168,6 +175,55 @@ export function kpiRowsOf(totals: Totals, form: InsightsForm): readonly KpiRow[]
     { key: "savings", labelKey: "kpiSavings", value: formatPct(totals.savingsPct) },
   ];
   return rows;
+}
+
+/**
+ * 序列里最后两个桶的涨跌（pure，可脱离 React 断言）。
+ *
+ * 口径刻意是「最后一桶对前一桶」而不是「本窗对上窗」：回执里没有上一窗的数据，硬算就是编。
+ * 前置桶为 0（分母不存在）与持平（涨跌无信息量）都不出标注——那两态显示 ↑0% 或 ∞% 会把
+ * 「没有可比数据」读成结论。
+ */
+export function kpiDeltaOf(
+  series: readonly {
+    readonly bashCalls: number;
+    readonly commands: number;
+    readonly attempts: number;
+    readonly compressed: number;
+    readonly savedTokens: number;
+  }[],
+  field: "bashCalls" | "commands" | "attempts" | "compressed" | "savedTokens",
+): KpiDelta | undefined {
+  const lastPoint = series.at(-1);
+  const prevPoint = series.at(-2);
+  const last = lastPoint === undefined ? undefined : lastPoint[field];
+  const prev = prevPoint === undefined ? undefined : prevPoint[field];
+  // 前置桶为 0（分母不存在）、持平、或序列异常 → pct 归 0，最后统一落 undefined。
+  const pct =
+    last === undefined || prev === undefined || prev === 0 || last === prev
+      ? 0
+      : Math.round(((last - prev) / prev) * 100);
+  // 三元而不是早退：`return undefined;` 语句在 `consistent-return` 与 `no-useless-undefined`
+  // 两条规则之间没有合法形态，表达式一次过（lastEventLineOf 同款）。
+  return last === undefined || prev === undefined || pct === 0
+    ? undefined
+    : {
+        direction: last > prev ? "up" : "down",
+        text: `${last > prev ? "↑" : "↓"}${String(Math.abs(pct))}%`,
+      };
+}
+
+/** 粒度 → 涨跌标注的文案键（日/周/月各自对应「较前一日/周/月」）。 */
+export function kpiDeltaLabelKeyOf(
+  granularity: "day" | "week" | "month",
+): "kpiDeltaDay" | "kpiDeltaWeek" | "kpiDeltaMonth" {
+  if (granularity === "day") {
+    return "kpiDeltaDay";
+  }
+  if (granularity === "week") {
+    return "kpiDeltaWeek";
+  }
+  return "kpiDeltaMonth";
 }
 
 /**

@@ -12,7 +12,7 @@
   <a href="https://github.com/JayYuen666/dsh-rtk/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-rtk/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%3E%3D24.9-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.2-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.5-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -69,8 +69,8 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 撤除用 `dsh plugin --profile web remove @jayyuen66/dsh-rtk`。包在公共 npm 上，不需要凭据，也不需要 scoped registry 那行。
 
 - **Node.js `>= 24.9`**（纯 ESM；这个地板正是 `require()` 一个 ESM 入口能成立的前提，所以 `engines.node` 写它）。
-- **宿主 `dsh` 在 `0.2.x` 这条线上、且不低于 `0.2.2-rc.2`。** 宿主读 `engines.dsh`（`^0.2.2-rc.2`）且**单独决定**——该字段在场时兼容性先于 `peerDependencies` 判定，prerelease 参与比较。`0.2.x` 里凡不低于 `0.2.2-rc.2` 的都通过宿主装载门；`0.2.2-rc.1` 及更早的不通过。npm 的严格 peer 解析同样不接受低于 `0.2.2-rc.2` 的版本，且 prerelease 一侧只收 `0.2.2` 这一元组的（`0.2.2-rc.2` 起）——更高小版本的预发布（如 `0.2.3-rc.1`）要等它的正式版。`0.3.0` 及以上需要风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <确切版本> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证（判据是宿主 `--dump-config` 里本包的层行；设置卡与它的命名空间调用另在发布基线上全量取证一次），窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
-- **`dependencies` 里没有 `@deepseek-ai/*`，这是契约**（`test/publish-manifest.test.ts`）。profile 用 `nodeLinker: hoisted` + `autoInstallPeers: false` 安装，放进去的宿主包会变成实打实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，于是那个 profile 里**每次原生工具调用都会抛**，而 build、typecheck、覆盖率全绿。`@deepseek-ai/dsh*` peer 携带同一个支持窗口（`^0.2.2-rc.2`），而 `devDependencies` 里的精确钉版是编译期纪律，不是「宿主会读它」的声明。
+- **宿主 `dsh` 在 `0.2.x` 这条线上、且不低于 `0.2.2-rc.5`。** 宿主读 `engines.dsh`（`^0.2.2-rc.5`）且**单独决定**——该字段在场时兼容性先于 `peerDependencies` 判定，prerelease 参与比较。`0.2.x` 里凡不低于 `0.2.2-rc.5` 的都通过宿主装载门；`0.2.2-rc.4` 及更早的不通过。npm 的严格 peer 解析同样不接受低于 `0.2.2-rc.5` 的版本，且 prerelease 一侧只收 `0.2.2` 这一元组的（`0.2.2-rc.5` 起）——更高小版本的预发布（如 `0.2.3-rc.1`）要等它的正式版。`0.3.0` 及以上需要风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <确切版本> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证（判据是宿主 `--dump-config` 里本包的层行；设置卡与它的命名空间调用另在发布基线上全量取证一次），窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
+- **`dependencies` 里没有 `@deepseek-ai/*`，这是契约**（`test/publish-manifest.test.ts`）。profile 用 `nodeLinker: hoisted` + `autoInstallPeers: false` 安装，放进去的宿主包会变成实打实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，于是那个 profile 里**每次原生工具调用都会抛**，而 build、typecheck、覆盖率全绿。`@deepseek-ai/dsh*` peer 携带同一个支持窗口（`^0.2.2-rc.5`），而 `devDependencies` 里的精确钉版是编译期纪律，不是「宿主会读它」的声明。
 - **`PATH` 上要有 `rtk >= 1.2.1`。** 这是 npm 之外唯一的运行时依赖：macOS/Linux 用 `brew install rtk`，Windows 用 `winget install rtk-ai.rtk`。没有它插件照常装载，所有压缩路径 fail-open。
 - **随包发布的内容**：`host.js`、`client.js`、包内按需 chunk `client.insights-echarts.js`、`cordis.patch.yml`、`icon.svg`、双份 README、`CHANGELOG.md`、`THIRD_PARTY_NOTICES.md`、`locale/zh.json` + `locale/en.json`，以及 `docs/`（两份 DETAIL）。产物由 `prepack` 重建，从不入库。
 
@@ -159,7 +159,7 @@ dsh plugin --profile web add @jayyuen66/dsh-rtk
 
 ## <img src="https://api.iconify.design/lucide/monitor.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 支持面
 
-`engines.dsh` 与 `@deepseek-ai/dsh*` peer 是 `^0.2.2-rc.2`（单条线，无并集）；`@deepseek-ai/schemastery` peer 是 `^3.19.0`；`engines.node` 是 `>=24.9.0`。
+`engines.dsh` 与 `@deepseek-ai/dsh*` peer 是 `^0.2.2-rc.5`（单条线，无并集）；`@deepseek-ai/schemastery` peer 是 `^3.19.0`；`engines.node` 是 `>=24.9.0`。
 
 测试套件与真实 rtk 回路在 macOS、Linux、Windows 三平台运行；只要 `rtk` 在 `PATH` 上，`prefix` 形态就会装配。CI 在三个 runner 上从官方 release 资产安装 rtk 1.2.1（sha256 校验）并以 `DSH_RTK_TEST_MODE=real` 跑真实 CLI 回路。
 

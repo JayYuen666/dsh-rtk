@@ -36,6 +36,9 @@ export interface ChartSpec {
   /** 轴文字与网格线的颜色（跟随主题）。 */
   readonly textColor: string;
   readonly gridColor: string;
+  /** tooltip 底色与文字色（跟随主题；深浅两套，由入口从计算样式取）。 */
+  readonly tooltipBg: string;
+  readonly tooltipText: string;
   /**
    * 紧凑档：设置卡里那张 132px 高的两柱图用。
    *
@@ -50,6 +53,8 @@ export interface ChartSpec {
 export interface ChartHandle {
   readonly update: (spec: ChartSpec) => void;
   readonly dispose: () => void;
+  /** 容器尺寸变化后重算画布（观察器在入口侧，chunk 只认这把钥匙）。 */
+  readonly resize: () => void;
 }
 
 /** 图表块的导出面（chunk 侧实现，入口侧按这个形状用）。 */

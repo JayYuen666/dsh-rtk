@@ -21,6 +21,8 @@ import {
   granularityKeyOf,
   hasLatencyOf,
   isEmptyWindow,
+  kpiDeltaLabelKeyOf,
+  kpiDeltaOf,
   kpiRowsOf,
   lastEventLineOf,
   latencyLabelKeyOf,
@@ -36,13 +38,15 @@ import {
   withGranularity,
   withRange,
 } from "../lib/insights-page-logic.ts";
-import type {
-  Granularity,
-  KpiRow as KpiRowSpec,
-  RangeDays,
-  ViewState,
-} from "../lib/insights-page-logic.ts";
+import type { Granularity, KpiDelta, RangeDays, ViewState } from "../lib/insights-page-logic.ts";
 import { zeroFillSeries } from "../lib/insights-view.ts";
+import {
+  Callout,
+  KpiGrid,
+  KpiTile,
+  Segmented,
+  StatusDot,
+} from "@jayyuen66/dsh-plugin-shared/client";
 
 import type { ChartSpec } from "./insights-chart-spec.ts";
 import { useChart } from "./insights-chart-hook.ts";
@@ -57,13 +61,17 @@ import {
 import type { StatsReader } from "./stats-reader.ts";
 import type { Translate, UiMessages } from "./ui-messages.ts";
 
+/** rtk 结局三态 → shared 状态点色调。 */
+const DOT_TONE_OF: Record<"ok" | "skip" | "fail", "ok" | "warn" | "err"> = {
+  ok: "ok",
+  skip: "warn",
+  fail: "err",
+};
+
 /** 三个反复出现的类名：`sonarjs(no-duplicate-string)` 数的是字面量，不是语义。 */
 const BLOCK = "rtkc-block";
 const SUBTITLE = "rtkc-subtitle";
 const NOTE = "rtkc-note";
-/** 退成柱子时那段说明的类名。与 `NOTE` 分开是刻意的：两者读起来不该是同一级信息。 */
-const SPARSE = "rtkc-sparse";
-
 /** 一次读面的结局。`error` 与 `data` 互斥：读失败时不留半份旧图，那会让人以为是最新读数。 */
 interface Loaded {
   readonly response: InsightsResponse | undefined;
@@ -113,36 +121,9 @@ function chartSpecOf(
     colors: ["", ""],
     textColor: "",
     gridColor: "",
+    tooltipBg: "",
+    tooltipText: "",
   };
-}
-
-/** 一组页签：当前项加 `data-active`，样式与禁用态都交给 CSS。 */
-function Tabs(props: {
-  readonly value: ViewState["form"];
-  readonly onChange: (form: ViewState["form"]) => void;
-  readonly labels: readonly { readonly key: ViewState["form"]; readonly label: string }[];
-}): ReactNode {
-  return createElement(
-    "div",
-    { className: "rtkc-tabs", role: "tablist" },
-    ...props.labels.map((entry) =>
-      createElement(
-        "button",
-        {
-          key: entry.key,
-          type: "button",
-          role: "tab",
-          className: "rtkc-tab",
-          "aria-selected": props.value === entry.key,
-          "data-active": props.value === entry.key ? "true" : "false",
-          onClick: () => {
-            props.onChange(entry.key);
-          },
-        },
-        entry.label,
-      ),
-    ),
-  );
 }
 
 /** 一个下拉：选项值原样回传，调用方自己收窄（窗口与粒度各一套）。 */
@@ -199,38 +180,47 @@ function useCountupOnce(): { readonly animate: boolean } {
   return { animate: firstMount.current };
 }
 
-/** 一格 KPI：标签在上、数值在下。抽出来是为了不在 `KpiRow` 里叠四层 createElement。 */
-function KpiCell(props: {
-  readonly t: Translate;
-  readonly row: KpiRowSpec;
-  readonly animate: boolean;
-}): ReactNode {
-  const { t, row, animate } = props;
-  const label = createElement("span", { className: "rtkc-kpi-label" }, t(row.labelKey));
-  // 只有次数格带 `count`：它是可数整数。省下的 token 与百分比都是格式化串（`4.0k`/`62%`），
-  // 反解析回来只是近似，拿去当动画目标等于把近似当精确，所以它们不播。
-  const counted = animate && row.count !== undefined;
-  const style = counted ? ({ "--rtkc-count-target": String(row.count) } as const) : undefined;
-  const value = createElement(
-    "strong",
-    {
-      className: "rtkc-kpi-value",
-      ...(counted ? { "data-count": row.count, style } : {}),
-    },
-    row.value,
-  );
-  return createElement("div", { className: "rtkc-kpi", key: row.key }, label, value);
-}
-
 /** KPI 行：六格，窄屏由 CSS 折行。文案键由 `kpiRowsOf` 按形态选好，这里不再判形态。 */
-function KpiRow(props: { readonly t: Translate; readonly response: InsightsResponse }): ReactNode {
-  const { t, response } = props;
+function KpiRow(props: {
+  readonly t: Translate;
+  readonly response: InsightsResponse;
+  readonly granularity: ViewState["granularity"];
+}): ReactNode {
+  const { t, response, granularity } = props;
   const { animate } = useCountupOnce();
   const rows = kpiRowsOf(response.totals, response.form);
+  // 涨跌标注：窗口内最后一桶对前一桶（口径见 kpiDeltaOf）。四种格各对到自己的序列字段，
+  // 序列不足两桶/前置为 0/持平时 kpiDeltaOf 缺省，那几格不显示标注。
+  const deltaLabel = t(kpiDeltaLabelKeyOf(granularity));
+  const DELTA_FIELD_OF: Record<
+    string,
+    "bashCalls" | "commands" | "attempts" | "compressed" | "savedTokens"
+  > = {
+    bashCalls: "bashCalls",
+    attempts: "attempts",
+    succeeded: "compressed",
+    saved: "savedTokens",
+  };
+  const deltaOf = (key: string): KpiDelta | undefined => {
+    const field = DELTA_FIELD_OF[key];
+    const delta = field === undefined ? undefined : kpiDeltaOf(response.series, field);
+    // 三元同 kpiDeltaOf：早退 return undefined 撞 consistent-return / no-useless-undefined。
+    return field === undefined || delta === undefined
+      ? undefined
+      : { ...delta, text: deltaLabel.replace("{delta}", delta.text) };
+  };
   const cells = createElement(
-    "div",
-    { className: "rtkc-kpis" },
-    ...rows.map((row) => createElement(KpiCell, { t, row, animate, key: row.key })),
+    KpiGrid,
+    null,
+    ...rows.map((row) =>
+      createElement(KpiTile, {
+        key: row.key,
+        label: t(row.labelKey),
+        value: row.value,
+        count: animate && row.count !== undefined ? row.count : undefined,
+        delta: deltaOf(row.key),
+      }),
+    ),
   );
   // 改写形态只有平均（日表没留峰值），压缩形态才连最大值一起报。
   // 一次都没量到就不画这一句：`formatDuration(0)` 会渲染成「平均改写耗时: 0 ms」，那读起来
@@ -269,13 +259,15 @@ function ChartBlock(props: {
     createElement("div", { className: "rtkc-chart", ref: containerRef }),
     // 原因不写死英文：`loadFailed` 的模板在 `ui-messages` 里，`{reason}` 也翻译过。
     failed ? createElement("p", { className: NOTE }, failedText) : null,
-    // 退成柱子时那句说明走**独立类名**：它回答的是「比率去哪了」，而 `rtkc-note` 是页脚、
-    // 空窗口、加载中那一族的灰色小字——同色同号会让这句话被一起跳过（真机上就是这样）。
-    spec.kind === "bars" ? createElement("p", { className: SPARSE }, t("chartSparseNote")) : null,
+    // 退成柱子时那句说明走警示条（warn 档）：它回答的是「比率去哪了」，而 `rtkc-note` 是
+    // 页脚、空窗口、加载中那一族的灰色小字——同色同号会让这句话被一起跳过（真机上就是这样）。
+    spec.kind === "bars" ? createElement(Callout, { tone: "warn" }, t("chartSparseNote")) : null,
   );
 }
 
-/** 「最近一次」：最近一条 + 一句说明。标题与模板都按形态分（见 `recentTitleKeyOf`）。 */
+/** 「最近一次」：最近一条 + 一句说明，裸条形态（设计稿 .why：左边框染色 + 淡底，
+ *  不再包一层带标题的卡片——标题缩成条内的语气标签，卡片少一层，节奏也少一拍）。
+ *  标题与模板都按形态分（见 `recentTitleKeyOf`）。 */
 function WhyBlock(props: {
   readonly t: Translate;
   readonly response: InsightsResponse;
@@ -298,29 +290,30 @@ function WhyBlock(props: {
   // 这里只做「有没有这一条」的判断——两件事分开写，嵌套三元就自然没了。
   const text =
     line === undefined || summary === undefined ? t("whyNone") : t(line.templateKey, summary);
-  const heading = createElement("h3", { className: SUBTITLE }, t(recentTitleKeyOf(response.form)));
   // 结局带一个色点：一屏数字里「上一次是成功还是跳过」要靠颜色一眼分开，读完那一长串
   // 「已跳过 · git status · too-small · 输入 tiny」才知道结论太慢。
+  // rtk 的结局三态（ok/skip/fail）映射到 shared 状态点的 ok/warn/err（表在模块级，渲染期不重建）。
   const dot =
-    line === undefined
-      ? null
-      : createElement("span", {
-          className: "rtkc-dot",
-          "data-tone": line.tone,
-          "aria-hidden": true,
-        });
+    line === undefined ? null : createElement(StatusDot, { tone: DOT_TONE_OF[line.tone] });
   // 结局整行染色：色点太轻，一屏数字里看不出上一次是成功还是跳过。颜色只做加强，
   // 文字仍是「已跳过 · git status · too-small · 输入 tiny」——不靠颜色单独表意。
-  const body = createElement(
+  // 语气标签先落成局部量：嵌套调用层数的上限挡住了内联写法。
+  const tone = line === undefined ? undefined : line.tone;
+  const toneLabel = createElement(
+    "span",
+    { className: "rtkc-whyTone" },
+    t(recentTitleKeyOf(response.form)),
+  );
+  return createElement(
     "p",
     {
       className: `${NOTE} rtkc-recent`,
-      ...(line === undefined ? {} : { "data-tone": line.tone }),
+      ...(tone === undefined ? {} : { "data-tone": tone }),
     },
+    toneLabel,
     dot,
     text,
   );
-  return createElement("section", { className: `${BLOCK} rtkc-card` }, heading, body);
 }
 
 /** 整页空窗口那一句：不摊六格 0 与三张空表。那堆 0 读起来像「插件坏了」，
@@ -391,25 +384,42 @@ function Footnote(props: {
   return createElement("p", { className: `${NOTE} rtkc-footnote` }, parts.join(" · "));
 }
 
-/** 页头：图标 + 标题 + 刷新。抽出来是为了让 `InsightsPage` 留在行数上限内。 */
+/** 页头：图标徽标 + 标题/副标题 + 刷新。抽出来是为了让 `InsightsPage` 留在行数上限内。 */
 function PageHeader(props: {
   readonly t: Translate;
   readonly busy: boolean;
+  readonly updatedAt: string | undefined;
   readonly onRefresh: () => void;
 }): ReactNode {
-  const { t, busy, onRefresh } = props;
-  const title = createElement(
-    "h2",
-    { className: "rtkc-page-title" },
-    createElement(RtkPanelIcon, { size: 18, active: true }),
-    t("panelLabel"),
+  const { t, busy, updatedAt, onRefresh } = props;
+  // 38px 徽标 + 两行标题（主标题/副标题）：整页唯一的标题区，数字页从这里建立层级。
+  const badge = createElement(
+    "span",
+    { className: "rtkc-page-badge", "aria-hidden": true },
+    createElement(RtkPanelIcon, { size: 20, active: true }),
   );
+  const titles = createElement(
+    "div",
+    { className: "rtkc-page-titles" },
+    createElement("h2", { className: "rtkc-page-title" }, t("panelLabel")),
+    createElement("p", { className: "rtkc-page-sub" }, t("panelSub")),
+  );
+  const title = createElement("div", { className: "rtkc-page-titlewrap" }, badge, titles);
+  // 最近一次成功读面的时间：数据不是实时的，读者要知道自己看的是几点的那一屏。
+  const updated =
+    updatedAt === undefined
+      ? null
+      : createElement(
+          "span",
+          { className: "rtkc-updated" },
+          t("updatedAtLabel", { time: updatedAt }),
+        );
   const button = createElement(
     "button",
     { type: "button", className: "rtkc-refresh", disabled: busy, onClick: onRefresh },
     busy ? t("loadingLabel") : t("refresh"),
   );
-  return createElement("header", { className: "rtkc-page-head" }, title, button);
+  return createElement("header", { className: "rtkc-page-head" }, title, updated, button);
 }
 
 /** 页面本体。`props.reader` 缺席时整页只显示一行「未连接」，不画空图。 */
@@ -421,6 +431,8 @@ export function InsightsPage(props: {
   const [state, setState] = useState<ViewState>(INITIAL_STATE);
   const [loaded, setLoaded] = useState<Loaded>({ response: undefined, error: undefined });
   const [busy, setBusy] = useState(true);
+  // 最近一次成功读面的时刻（HH:mm）：只有成功才更新，失败的尝试不改这一位。
+  const [updatedAt, setUpdatedAt] = useState<string | undefined>(undefined);
 
   // 请求代际号：切形态/窗口/粒度各发一条请求，而它们的回执可能**乱序**回来。没有代际号时
   // 慢的那条后到会把新的结果覆盖掉——用户切到「结果压缩」，屏幕上却是上一屏「命令改写」的
@@ -435,6 +447,11 @@ export function InsightsPage(props: {
       return;
     }
     setLoaded(next);
+    if (next.error === undefined) {
+      setUpdatedAt(
+        new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }),
+      );
+    }
     setBusy(false);
   }, [reader, state]);
 
@@ -446,21 +463,22 @@ export function InsightsPage(props: {
   const refresh = useCallback((): void => {
     void reload();
   }, [reload]);
-  const header = createElement(PageHeader, { t, busy, onRefresh: refresh });
+  const header = createElement(PageHeader, { t, busy, updatedAt, onRefresh: refresh });
 
   // 形态页签与时间筛选分成两行：页签回答「看哪一种」，时间回答「看哪一段」。挤在一行时它们
   // 看起来像同一组分段控件，用户会以为切页签也会换时间。
   const controls = createElement(
     "div",
     { className: "rtkc-controls" },
-    createElement(Tabs, {
-      value: state.form,
-      labels: [
-        { key: "prefix", label: t("tabPrefix") },
-        { key: "pipe", label: t("tabPipe") },
+    createElement(Segmented, {
+      options: [
+        { value: "prefix", label: t("tabPrefix") },
+        { value: "pipe", label: t("tabPipe") },
       ],
+      value: state.form,
       onChange: (form) => {
-        setState((prev) => withForm(prev, form));
+        const next = form === "pipe" ? "pipe" : "prefix";
+        setState((prev) => withForm(prev, next));
       },
     }),
   );
@@ -496,17 +514,24 @@ export function InsightsPage(props: {
     createElement(
       "div",
       { className: "rtkc-page", "data-panel": PANEL_ID },
-      header,
-      createElement("div", { className: "rtkc-page-controls" }, controls, timeFilter),
-      ...children,
+      // 内容列限宽居中（设计稿 860px）：滚动容器仍然吃满面板宽（滚动条贴面板右缘），
+      // 列宽与节奏都由这一层管。
+      createElement(
+        "div",
+        { className: "rtkc-column" },
+        header,
+        createElement("div", { className: "rtkc-page-controls" }, controls, timeFilter),
+        ...children,
+      ),
     );
 
   if (error !== undefined) {
+    const failedText = t("loadFailed", { reason: error });
     return shell(
       createElement(
-        "p",
-        { className: `${NOTE} rtkc-warn rtkc-card` },
-        t("loadFailed", { reason: error }),
+        "section",
+        { className: `${BLOCK} rtkc-card` },
+        createElement(Callout, { tone: "err" }, failedText),
       ),
     );
   }
@@ -522,7 +547,7 @@ export function InsightsPage(props: {
     );
   }
   return shell(
-    createElement(KpiRow, { t, response }),
+    createElement(KpiRow, { t, response, granularity: state.granularity }),
     createElement(ChartBlock, { t, response, state }),
     createElement(WhyBlock, { t, response }),
     createElement(TablesBlock, { t, response }),

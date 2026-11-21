@@ -42,6 +42,9 @@
  * 792 行构建日志的压缩结果**逐字节相同**（两种配置都是 23,288 B）——它省下的那点空间
  * 换的是不可逆的损失。
  */
+// 取一层对象字段经 shared 的正主（isFieldBag/fieldOf 此前是本文件私有副本，逐字同构）。
+import { fieldOf } from "@jayyuen66/dsh-plugin-shared/lib/record";
+
 const HOOK_CHAIN: readonly string[] = ["ansi", "progress", "dedup"];
 
 /**
@@ -132,16 +135,6 @@ export function buildHookPayload(input: HookPayloadInput): string {
     tool_input: { command: input.command },
     tool_response: { stdout: input.stdout, stderr: "", interrupted: false, isImage: false },
   });
-}
-
-/** 判「是能取字段的对象」：`typeof === "object"` 单独一条会把数组与 null 也放进来。 */
-function isFieldBag(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** 取一层对象字段；不是对象就给 `undefined`（三层判空只写一次）。 */
-function fieldOf(value: unknown, key: string): unknown {
-  return isFieldBag(value) ? value[key] : undefined;
 }
 
 /** 按三级路径取 `stdout`；只认非空字符串。 */

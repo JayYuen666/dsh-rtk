@@ -8,7 +8,9 @@ import { createElement, useCallback, useEffect, useMemo, useRef, useState } from
 import { RiskConfirmation } from "@deepseek-ai/dsh-client-ui-primitives";
 import type { ReactNode } from "react";
 import {
+  Callout,
   CardForm,
+  FieldTwoCol,
   ListField,
   NumberField,
   SaveBar,
@@ -83,8 +85,6 @@ const CARD_CSS = [
   ".rtkc-note{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary,inherit);margin:6px 0}",
   // 提示条：宿主没有「警告底色」这一档别名（`--dsw-alias-state-warn-primary` 是实心琥珀色，
   // 铺成底会把正文压死），所以这里用同色系淡底写死——深浅主题各看得清，也不冒充宿主的语义色。
-  ".rtkc-hint{font-size:12px;line-height:1.7;margin:6px 0;padding:6px 8px;border-radius:6px;background:rgba(224,166,58,.12);box-shadow:inset 0 0 0 1px rgba(224,166,58,.28);color:var(--dsw-alias-label-primary,inherit)}",
-  ".rtkc-ready{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary,inherit);margin:6px 0}",
   ".rtkc-actions{margin-top:8px}",
   // 今日摘要：卡片里的 KPI 格。**不复用洞察页那六格**：那是窗口总量、这是今日单形态，
   // 标签与量纲都不同；共用一套类名会让两处任何一次微调互相牵连。
@@ -132,7 +132,7 @@ const CARD_CSS = [
   //   hover 底 `--dsw-alias-interactive-bg-hover`（暗 #ffffff14 / 亮 #2631480f）
   //   层底     `--dsw-alias-bg-layer-1/2/3`（暗 #232324/#2c2c2e/#353638，亮三档都是 #fff）
   // 下面四个本包变量把「表面 / 内层 / 描边 / 悬停」收成一层间接：改主题只改这四行。
-  ":root{--rtkc-chart-bar:#3b6ef6;--rtkc-chart-line:#e08a2e;--rtkc-chart-text:#667085;--rtkc-chart-grid:#e4e7ec;--rtkc-ok:#3ec98a;--rtkc-skip:#e0a63a;--rtkc-fail:#e5645a;--rtkc-gap:12px}",
+  ":root{--rtkc-chart-bar:#3b6ef6;--rtkc-chart-line:#e08a2e;--rtkc-chart-text:#667085;--rtkc-chart-grid:#e4e7ec;--rtkc-chart-tooltip-bg:rgba(255,255,255,.96);--rtkc-chart-tooltip-text:#1c1d22;--rtkc-gap:12px}",
   // 四个表面变量必须挂在 **body** 上而不是 :root：宿主把 `--dsw-alias-*` 全定义在 body
   // （真机 `getComputedStyle(document.body).getPropertyValue("--dsw-alias-card-fill")` 有值，
   // `document.documentElement` 上是空串）。挂在 :root 时 `var()` 在 html 上求值就落到 fallback，
@@ -145,7 +145,7 @@ const CARD_CSS = [
   // 直接用在深色卡片上就是「深灰字压在 #212123 上」，对比度不足 4.5:1，真机上看不清刻度。
   // 这样写在 body 上而不是只在 :root 改一次，是因为宿主的主题切换只改 body 的属性、不重渲染
   // 本组件——`useChart` 里那条 MutationObserver 观察到属性变化后，会重新读这里取色再 update。
-  "body[data-ds-dark-theme]{--rtkc-chart-text:#9aa3b2;--rtkc-chart-grid:#ffffff1f}",
+  "body[data-ds-dark-theme]{--rtkc-chart-text:#9aa3b2;--rtkc-chart-grid:#ffffff1f;--rtkc-chart-tooltip-bg:rgba(24,26,32,.94);--rtkc-chart-tooltip-text:#f2f4f7}",
   ".rtkc-page{display:flex;flex-direction:column;gap:var(--rtkc-gap);padding:4px 0 12px}",
   // 洞察页是主面板里的一整页，而宿主给它的容器**自己不滚**：ui-layout 的 `.centerCol`
   // 声明 `overflow:hidden`（AppFrame.module.css），中间也没有任何带滚动能力的包装层——
@@ -160,9 +160,17 @@ const CARD_CSS = [
   // 0px 边框，在深色卡片面上几乎看不出有滚动条。官方任务页（`TaskManagerPage.module.css` 的
   // `.pageScroll`）也是 9px + 2px 内缩，这里跟它对齐：拇指实际 5px、离边 2px，才看得出「还能往下滚」。
   // 配色用 l2 一对——本页的底色是卡片面，l1 那对是给基础面的。
-  ".rtkc-page[data-panel]{flex:1 1 auto;min-height:0;box-sizing:border-box;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;--dsh-scrollbar-width:9px;--dsh-scrollbar-thumb-border:2px;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2)}",
-  ".rtkc-page-head{display:flex;align-items:center;justify-content:space-between;gap:12px}",
-  ".rtkc-page-title{display:flex;align-items:center;gap:8px;font-size:1.05em;font-weight:600;margin:0}",
+  ".rtkc-page[data-panel]{flex:1 1 auto;min-height:0;box-sizing:border-box;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;padding:0;--dsh-scrollbar-width:9px;--dsh-scrollbar-thumb-border:2px;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2)}",
+  // 内容列：左右排满（用户裁决：不做 860px 限宽居中），内边距 12px 一档。
+  ".rtkc-column{width:100%;margin:0;display:flex;flex-direction:column;gap:14px;padding:12px 24px}",
+  // 页头与控件的节奏照设计稿：头部下 18px、工具栏下 16px（列 gap 14 补差值）。
+  ".rtkc-page-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:4px}",
+  ".rtkc-page-titlewrap{display:flex;align-items:center;gap:14px;min-width:0}",
+  ".rtkc-page-badge{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;flex:none;background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 14%,transparent);color:var(--dsw-alias-state-business-primary)}",
+  ".rtkc-page-titles{display:flex;flex-direction:column;min-width:0}",
+  ".rtkc-page-title{font-size:18px;font-weight:650;margin:0;line-height:1.4}",
+  ".rtkc-page-sub{margin:1px 0 0;font-size:12px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+  ".rtkc-updated{font-size:11px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}",
   // 刷新按钮：hover 才显出边框与底色。常驻边框会让页头看起来比页身还重。
   ".rtkc-refresh{font:inherit;font-size:12px;padding:4px 12px;border-radius:7px;border:1px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer;transition:background .12s,border-color .12s,color .12s}",
   ".rtkc-refresh:hover:not(:disabled){background:var(--rtkc-hover);border-color:var(--rtkc-line);color:var(--dsw-alias-label-primary,inherit)}",
@@ -170,14 +178,8 @@ const CARD_CSS = [
   // 控件区：上行形态（换页签换的是**整种数据**）、下行时间（换的是同一种数据的一段）。
   // 两行之间留 12px、组内 8px：页签与时间栏不是同一级控件，挤成一行时用户会以为切页签
   // 也会换时间范围（真机反馈原话就是「时间作为筛选条件需单独设计位置」）。
-  ".rtkc-page-controls{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px 16px}",
+  ".rtkc-page-controls{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px 16px;margin-bottom:2px}",
   ".rtkc-controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px}",
-  ".rtkc-tabs{display:inline-flex;gap:2px;padding:3px;border-radius:9px;background:var(--rtkc-hover);border:1px solid var(--rtkc-line)}",
-  ".rtkc-tab{font:inherit;font-size:12px;line-height:1.5;padding:5px 18px;border-radius:6px;border:0;background:transparent;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer;transition:background .12s,color .12s}",
-  ".rtkc-tab:hover{color:var(--dsw-alias-label-primary,inherit);background:rgba(127,127,127,.12)}",
-  '.rtkc-tab[data-active="true"]{background:var(--rtkc-raised);color:var(--dsw-alias-label-primary,inherit);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.28)}',
-  '.rtkc-tab[data-active="true"]:hover{background:var(--rtkc-raised)}',
-  ".rtkc-tab:focus-visible{outline:2px solid var(--rtkc-chart-bar);outline-offset:1px}",
   // 时间栏：一组「标签 + 两个下拉」，自己一块浅底，与页签在视觉上分成两件不同的事。
   // 标签与下拉之间 8px、下拉之间 8px，两侧内边距不对称（左 10 右 6）——右边紧贴下拉的
   // 圆角，留同样的 10px 会让整块看起来右侧空了一块。
@@ -187,9 +189,10 @@ const CARD_CSS = [
   ".rtkc-select:hover{border-color:var(--rtkc-chart-bar);background:var(--rtkc-hover)}",
   ".rtkc-select:focus-visible{outline:2px solid var(--rtkc-chart-bar);outline-offset:1px}",
   // 每一块都是卡片：深色主题下只靠间距分块，信息一多就糊成一片。
-  ".rtkc-card{padding:14px 16px;border-radius:12px;border:1px solid var(--rtkc-line);background:var(--rtkc-surface)}",
+  // 内边距照设计稿 chart-card 的 16px 18px。
+  ".rtkc-card{padding:16px 18px;border-radius:12px;border:1px solid var(--rtkc-line);background:var(--rtkc-surface)}",
   ".rtkc-block{margin:0}",
-  ".rtkc-subtitle{font-size:12px;font-weight:600;letter-spacing:.02em;color:var(--dsw-alias-label-secondary,inherit);margin:0 0 12px}",
+  ".rtkc-subtitle{font-size:13.5px;font-weight:600;letter-spacing:.02em;color:var(--dsw-alias-label-secondary,inherit);margin:0 0 10px}",
   // KPI：数字大、标签小，卡片之间 10px。hover 时描边亮一档，让人知道这块是可以停下来看的。
   ".rtkc-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:10px}",
   ".rtkc-kpi{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border-radius:9px;background:var(--rtkc-tile);border:1px solid var(--rtkc-line);transition:border-color .12s,transform .12s}",
@@ -199,87 +202,49 @@ const CARD_CSS = [
   // ---- 数字滚动（只在前三格次数上播一次）----
   // 纯 CSS：注册一个整数型自定义属性让浏览器能对它插值，再用 `counter()` 把它画成文本。
   // 没有 JS 定时器、没有逐帧 setState —— 动画不占主线程。
-  '@property --rtkc-count-target{syntax:"<integer>";initial-value:0;inherits:false}',
   // 三条一起才成立：
   // ① `font-size:0` 让元素自身文本不可见（否则浏览器画的是最终值，动画看起来没发生）；
   // ② `counter-reset` 把计数器绑到那个自定义属性上，`::after` 用 `counter()` 画出来；
   // ③ `content: counter(x) / ""` —— 斜杠后是替代文本，写空串表示「它是装饰、别再念一遍」，
   //    否则读屏会把同一个数字念两次。
-  ".rtkc-kpi-value[data-count]{font-size:0;animation:rtkc-count-up 620ms cubic-bezier(.22,.61,.36,1) forwards;counter-reset:rtkc-count var(--rtkc-count-target)}",
-  '.rtkc-kpi-value[data-count]::after{content:counter(rtkc-count) / "";font-size:17px;font-variant-numeric:tabular-nums}',
-  "@keyframes rtkc-count-up{from{--rtkc-count-target:0}}",
   // 减少动效时**不能删掉动画**：起手的 0 是靠 keyframes 给的，删了动画就只剩
   // `initial-value:0`，数字会永远停在 0。把时长压到 1ms 等价于「直接给终值」。
-  "@media (prefers-reduced-motion:reduce){.rtkc-kpi-value[data-count]{animation-duration:1ms}}",
   ".rtkc-chart{width:100%;height:220px}",
   // 「退成柱子」那句说明（`chartSparseNote`）：它原来是灰色小字 `rtkc-note`，和页脚、空窗
   // 提示同色同号，于是「比率去哪了」这个真问题被读成「没画出来」。这里给它一条独立的琥珀色
-  // 提示条（复用 `.rtkc-hint` 的观感），左侧再借折线色点一下「本来这里会有一条线」。
-  ".rtkc-sparse{font-size:12px;line-height:1.65;margin:8px 0 0;padding:7px 9px;border-radius:7px;border-left:3px solid var(--rtkc-chart-line);background:rgba(224,166,58,.1);color:var(--dsw-alias-label-primary,inherit)}",
   // 卡片小图：**不能矮于 120px**。ECharts 的 `grid` 上下各留 28/24px 给刻度与轴标签，
   // 64px 高时绘图区只剩约 10px——真机上表现为「一条横线 + 两个看不见的柱」，
   // 看着像图坏了。162px 给柱子留出约 80px，两根柱子的高度差才读得出来。
   ".rtkc-card-chart{width:100%;height:162px;margin:10px 0 2px}",
   // 语义色点：成功绿 / 跳过黄 / 失败红。语义色在浅色主题下压暗一档（见下方覆盖）。
-  ".rtkc-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:7px;vertical-align:1px;background:var(--dsw-alias-label-secondary,#8a8f98)}",
-  '.rtkc-dot[data-tone="ok"]{background:var(--rtkc-ok)}',
-  '.rtkc-dot[data-tone="skip"]{background:var(--rtkc-skip)}',
-  '.rtkc-dot[data-tone="fail"]{background:var(--rtkc-fail)}',
   // 「最近一次」整行按结局染色：7px 的圆点在一屏数字里太轻，一眼扫过去分不出上一次是成功
   // 还是跳过。左边一条 2px 竖线 + 一层极淡底色，颜色与文字同时在场（不靠颜色单独表意——
   // 色弱用户读到的仍是那行「已跳过 · git status · too-small」）。
-  ".rtkc-recent{display:flex;align-items:center;margin:0;padding:8px 10px;border-radius:8px;border-left:2px solid transparent;background:var(--rtkc-tile)}",
-  '.rtkc-recent[data-tone="ok"]{border-left-color:var(--rtkc-ok);background:rgba(62,201,138,.09)}',
-  '.rtkc-recent[data-tone="skip"]{border-left-color:var(--rtkc-skip);background:rgba(224,166,58,.09)}',
-  '.rtkc-recent[data-tone="fail"]{border-left-color:var(--rtkc-fail);background:rgba(229,100,90,.1)}',
+  ".rtkc-recent{display:flex;align-items:center;gap:10px;margin:0;padding:9px 14px;border-radius:8px;border-left:3px solid transparent;background:var(--rtkc-tile)}",
+  '.rtkc-recent[data-tone="ok"]{border-left-color:var(--dsw-alias-state-success-primary);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 9%,transparent)}',
+  '.rtkc-recent[data-tone="skip"]{border-left-color:var(--dsw-alias-state-warn-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 9%,transparent)}',
+  '.rtkc-recent[data-tone="fail"]{border-left-color:var(--dsw-alias-state-error-primary);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent)}',
+  // 「最近一次」条内的语气标签：随结局染色（设计稿 .why 的 .w-tone）。
+  ".rtkc-whyTone{flex:none;font-size:11px;font-weight:600;color:var(--dsw-alias-label-secondary,inherit);white-space:nowrap}",
+  '.rtkc-recent[data-tone="ok"] .rtkc-whyTone{color:var(--dsw-alias-state-success-primary)}',
+  '.rtkc-recent[data-tone="skip"] .rtkc-whyTone{color:var(--dsw-alias-state-warn-primary)}',
+  '.rtkc-recent[data-tone="fail"] .rtkc-whyTone{color:var(--dsw-alias-state-error-primary)}',
+  // 明细区两张表卡之间的间距：rtkc-block 把 section 的 margin 清零后它们原本是贴死的。
+  // 表区相对上一块的设计稿节奏是 26px（列 gap 14 补 12）。
+  ".rtkc-tables{display:flex;flex-direction:column;gap:14px;margin-top:12px}",
+  // 建议区相对上一块的设计稿节奏是 22px（列 gap 14 补 8）；卡内条目纵向 8px 一档
+  // （设计稿的建议列就是 gap:8px 的纵向排布），小标题的下距交给 gap 统一管。
+  ".rtkc-suggest{margin-top:8px;display:flex;flex-direction:column;gap:8px;align-items:stretch}",
+  ".rtkc-suggest .rtkc-subtitle{margin:0}",
   // 表格：表头小一号大写、行 hover 提亮、首列吃余宽、数值列带量条。
   //
-  // 表头**必须有实底**：它带 `position:sticky`，透明底时行会从字后面穿过去（深色主题下
-  // 两行数字叠在一起）。底色用「半透明内层叠在不透明的卡片底上」——单用半透明层在浅色
-  // 主题里几乎看不出，单用卡片底又和表体连成一片；叠出来的这一条在深浅两边都比表体深半档。
-  // `overscroll-behavior:contain`：横向滚到底时不要把手势继续交给外层页面（否则表格滚完
-  // 还在滚的同时页面也在滚，两件事叠在一起）。
-  ".rtkc-tables{display:flex;flex-direction:column;gap:var(--rtkc-gap)}",
-  ".rtkc-table-wrap{overflow:auto;margin:0 -10px;overscroll-behavior:contain}",
-  ".rtkc-table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums}",
-  ".rtkc-table thead th{position:sticky;top:0;z-index:2;padding:7px 10px;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--dsw-alias-label-secondary,inherit);text-align:left;border-bottom:1px solid var(--rtkc-line);background:linear-gradient(var(--rtkc-tile),var(--rtkc-tile)),var(--rtkc-surface);white-space:nowrap}",
-  ".rtkc-table tbody td{padding:9px 10px;border-bottom:1px solid var(--rtkc-line);vertical-align:middle;transition:background .1s}",
-  // 斑马纹只给偶数行且比 hover 更淡：它是扫行时的辅助，hover 才是「我指着这一行」的反馈。
-  ".rtkc-table tbody tr:nth-child(even) td{background:rgba(127,127,127,.032)}",
-  ".rtkc-table tbody tr:last-child td{border-bottom:0}",
-  ".rtkc-table tbody tr:hover td{background:var(--rtkc-hover)}",
-  // 首列是「身份列」（命令 / 目录 / 原因），比数字重一档。宽度用 `width:1px + nowrap` 的
-  // 老办法「收到内容宽」：写在最后一列上吃余宽。**不能**给首列 `width:100%`——那会让它自己
-  // 变成整表的定宽列，表格永远不产生横向溢出，sticky 首列于是永远没有可粘的位移（真机实测：
-  // 内层宽度一旦绑死到 100%，`scrollWidth === clientWidth`，`position:sticky` 形同虚设）。
-  ".rtkc-table thead th:first-child,.rtkc-table tbody td:first-child{width:1px;white-space:nowrap}",
-  ".rtkc-table thead th:last-child,.rtkc-table tbody td:last-child{width:100%}",
-  ".rtkc-table tbody td:first-child{color:var(--dsw-alias-label-primary,inherit);font-weight:500}",
-  // 首列冻在左边：横滚时「这是哪一行」不该跟着数字一起滚走。
-  // 必须**不透明底**（sticky 元素的半透明底会让后面的字透过来），所以这里同样用
-  // 「半透明内层叠在不透明卡片底上」；右侧 1px 阴影是冻结面板的分界，粘住时才看得见。
-  // 角格（表头 × 首列）的 z-index 要压过两者：它同时满足两个 sticky，落单的那个会被盖住。
-  ".rtkc-table thead th:first-child,.rtkc-table tbody td:first-child{position:sticky;left:0;background:linear-gradient(var(--rtkc-tile),var(--rtkc-tile)),var(--rtkc-surface);box-shadow:inset -1px 0 0 var(--rtkc-line)}",
-  ".rtkc-table thead th:first-child{z-index:3}",
-  ".rtkc-table tbody td:first-child{z-index:1}",
-  ".rtkc-num{text-align:right!important;white-space:nowrap}",
-  ".rtkc-text{text-align:left}",
   // 数值格：细量条 + 数字**同一行**并排。量条压在数字上方时行高会被撑到 60px。
-  ".rtkc-cell-metric{display:inline-flex;align-items:center;gap:7px;justify-content:flex-end;width:100%}",
-  ".rtkc-meter{display:block;width:46px;height:4px;border-radius:2px;background:var(--dsw-alias-border-l3,rgba(127,127,127,.28));overflow:hidden;flex:none}",
-  ".rtkc-meter-fill{display:block;height:100%;border-radius:2px;background:var(--rtkc-chart-bar);transition:width .2s ease-out}",
-  ".rtkc-cell-value{font-variant-numeric:tabular-nums}",
   // 建议：卡片式，左边框按严重度换色（warn 用跳过黄，不用失败红——它是建议，不是错误）。
-  ".rtkc-suggestion{font-size:12px;line-height:1.6;margin:6px 0;padding:10px 12px;border-radius:9px;border-left:3px solid var(--rtkc-chart-bar);background:var(--rtkc-tile);transition:background .12s}",
-  ".rtkc-suggestion:hover{background:var(--rtkc-hover)}",
-  ".rtkc-suggestion-detail{display:block;margin-top:3px;color:var(--dsw-alias-label-secondary,inherit);opacity:.85}",
-  ".rtkc-warn{border-left-color:var(--rtkc-skip)!important}",
   ".rtkc-empty{text-align:center;padding:28px 16px;color:var(--dsw-alias-label-secondary,inherit)}",
-  ".rtkc-footnote{margin:0;color:var(--dsw-alias-label-secondary,inherit);opacity:.75;font-size:11px}",
+  ".rtkc-footnote{margin:8px 0 0;color:var(--dsw-alias-label-secondary,inherit);opacity:.75;font-size:11px}",
   // 浅色主题下的语义色：深色值在浅底上偏荧光，压暗一档才看得清又不刺眼。
   // 判据必须跟着宿主的 `body[data-ds-dark-theme]`（真机 body 上只有这一个属性，
   // 没有 `data-theme`），写成 `[data-theme="light"]` 会永不匹配、浅色下仍是深色那套。
-  "body:not([data-ds-dark-theme]){--rtkc-ok:#12855a;--rtkc-skip:#a6701a;--rtkc-fail:#c0433a}",
 ].join("\n");
 
 export const inject = ["slots", "configForms", "locale"];
@@ -341,17 +306,15 @@ function RtkHint(props: { t: Translate; status: StatsStatus | undefined }): Reac
   // 用警告底色会让正常状态看起来像出了问题（那是 missing/too-old 才该有的样子）。
   let node: ReactNode;
   if (hint.kind === "missing") {
-    node = createElement("p", { className: "rtkc-hint" }, t("rtkMissingHint"));
+    node = createElement(Callout, { tone: "err" }, t("rtkMissingHint"));
   } else if (hint.kind === "too-old") {
-    node = createElement(
-      "p",
-      { className: "rtkc-hint" },
-      t("rtkTooOldHint", { version: hint.version, minimum: MIN_RTK_VERSION }),
-    );
+    const tooOld = t("rtkTooOldHint", { version: hint.version, minimum: MIN_RTK_VERSION });
+    node = createElement(Callout, { tone: "warn" }, tooOld);
   } else {
+    // 就绪支保持中性：它要说的是「已装、版本够」，上色会让正常状态看起来像出了问题。
     node = createElement(
       "p",
-      { className: "rtkc-ready" },
+      { className: "dsu-hint" },
       t("rtkReadyHint", { version: hint.version, path: hint.path }),
     );
   }
@@ -480,6 +443,8 @@ function CardChart(props: { t: Translate; overview: StatsOverview | undefined })
             colors: ["", ""],
             textColor: "",
             gridColor: "",
+            tooltipBg: "",
+            tooltipText: "",
             // 这张图只有 132px 高（`.rtkc-card-chart`）：走紧凑档，刻线降到三条。
             compact: true,
           },
@@ -793,48 +758,69 @@ function cardFilterFields(props: FieldSectionProps): ReactNode[] {
   ];
 }
 
-/** 三个字节/比例阈值 + 提示开关 + 宿主环境变量。 */
+/** 数字阈值一行的公共形状：cardNumberFields 的五行只差字段名/标签/提示/边界，
+ *  越界上报与落态的接线逐字相同，抽一份避免抄五遍（其中两遍会漏接）。 */
+function thresholdField(
+  props: FieldSectionProps,
+  spec: {
+    readonly field: string;
+    readonly label: string;
+    readonly hint: string;
+    readonly value: number | undefined;
+    readonly min: number;
+    readonly max: number;
+    readonly step: number;
+  },
+): ReactNode {
+  const { t, writable, setField, resetToken, reportInvalid } = props;
+  return numberField({
+    t,
+    field: spec.field,
+    label: spec.label,
+    hint: spec.hint,
+    value: spec.value,
+    min: spec.min,
+    max: spec.max,
+    step: spec.step,
+    editable: writable,
+    resetToken,
+    onInvalidChange: (invalid) => {
+      reportInvalid(spec.field, invalid);
+    },
+    onChange: (next) => {
+      setField(spec.field, next);
+    },
+  });
+}
+
+/** 三个字节/比例阈值 + 提示开关 + 宿主环境变量。数字对按设计稿双列排布
+ *  （字节阈值与收益比一对、窗口头/尾一对），单出的输出上限独占整行。 */
 function cardNumberFields(props: FieldSectionProps): ReactNode[] {
-  const { t, view, writable, setField, resetToken, reportInvalid } = props;
+  const { t, view, setField } = props;
   return [
-    numberField({
-      t,
-      field: "minBytes",
-      label: t("minBytesLabel"),
-      hint: t("minBytesHint"),
-      value: view.minBytes,
-      min: 0,
-      max: 1_048_576,
-      step: 1,
-      editable: writable,
-      resetToken,
-      onInvalidChange: (invalid) => {
-        reportInvalid("minBytes", invalid);
-      },
-      onChange: (next) => {
-        setField("minBytes", next);
-      },
-    }),
-    numberField({
-      t,
-      field: "minGainRatio",
-      label: t("minGainLabel"),
-      hint: t("minGainHint"),
-      value: view.minGainRatio,
-      min: 0,
-      max: 1,
-      step: 0.01,
-      editable: writable,
-      resetToken,
-      onInvalidChange: (invalid) => {
-        reportInvalid("minGainRatio", invalid);
-      },
-      onChange: (next) => {
-        setField("minGainRatio", next);
-      },
-    }),
-    numberField({
-      t,
+    createElement(
+      FieldTwoCol,
+      null,
+      thresholdField(props, {
+        field: "minBytes",
+        label: t("minBytesLabel"),
+        hint: t("minBytesHint"),
+        value: view.minBytes,
+        min: 0,
+        max: 1_048_576,
+        step: 1,
+      }),
+      thresholdField(props, {
+        field: "minGainRatio",
+        label: t("minGainLabel"),
+        hint: t("minGainHint"),
+        value: view.minGainRatio,
+        min: 0,
+        max: 1,
+        step: 0.01,
+      }),
+    ),
+    thresholdField(props, {
       field: "stdoutCapBytes",
       label: t("stdoutCapLabel"),
       hint: t("stdoutCapHint"),
@@ -842,59 +828,37 @@ function cardNumberFields(props: FieldSectionProps): ReactNode[] {
       min: 1,
       max: 10_485_760,
       step: 1,
-      editable: writable,
-      resetToken,
-      onInvalidChange: (invalid) => {
-        reportInvalid("stdoutCapBytes", invalid);
-      },
-      onChange: (next) => {
-        setField("stdoutCapBytes", next);
-      },
     }),
     // 窗口那两位排在一起（头 / 尾），与它们在上游 `cap` method 里的相邻关系一致：
     // 分开摆会让「这两个数是同一件事的两半」读不出来。
-    numberField({
-      t,
-      field: "windowHeadLines",
-      label: t("windowHeadLabel"),
-      hint: t("windowHeadHint"),
-      value: view.windowHeadLines,
-      min: 0,
-      max: 5000,
-      step: 1,
-      editable: writable,
-      resetToken,
-      onInvalidChange: (invalid) => {
-        reportInvalid("windowHeadLines", invalid);
-      },
-      onChange: (next) => {
-        setField("windowHeadLines", next);
-      },
-    }),
-    numberField({
-      t,
-      field: "windowTailLines",
-      label: t("windowTailLabel"),
-      hint: t("windowTailHint"),
-      value: view.windowTailLines,
-      min: 0,
-      max: 5000,
-      step: 1,
-      editable: writable,
-      resetToken,
-      onInvalidChange: (invalid) => {
-        reportInvalid("windowTailLines", invalid);
-      },
-      onChange: (next) => {
-        setField("windowTailLines", next);
-      },
-    }),
+    createElement(
+      FieldTwoCol,
+      null,
+      thresholdField(props, {
+        field: "windowHeadLines",
+        label: t("windowHeadLabel"),
+        hint: t("windowHeadHint"),
+        value: view.windowHeadLines,
+        min: 0,
+        max: 5000,
+        step: 1,
+      }),
+      thresholdField(props, {
+        field: "windowTailLines",
+        label: t("windowTailLabel"),
+        hint: t("windowTailHint"),
+        value: view.windowTailLines,
+        min: 0,
+        max: 5000,
+        step: 1,
+      }),
+    ),
     toggleField({
       label: t("warnHintLabel"),
       hint: t("warnHintHint"),
       field: "warnHint",
       checked: view.warnHint,
-      editable: writable,
+      editable: props.writable,
       onChange: (next) => {
         setField("warnHint", next);
       },
@@ -904,7 +868,7 @@ function cardNumberFields(props: FieldSectionProps): ReactNode[] {
       hint: t("hostEnvHint"),
       field: "rewriteHostEnv",
       value: view.rewriteHostEnv,
-      editable: writable,
+      editable: props.writable,
       onChange: (next) => {
         setField("rewriteHostEnv", next);
       },
@@ -1056,7 +1020,8 @@ function RtkCard(props: CardSlotProps): ReactNode {
     createElement(StatsSection, { t, reader, overview, onReset: resetStats }),
     createElement(
       Section,
-      { title: t("switchSection") },
+      // 计数徽章照设计稿的「改写开关 · 11 字段」：字段增减时这一位要跟着改。
+      { title: t("switchSection"), count: t("fieldCount", { count: "11" }) },
       cardModeFields({ t, view, writable, setField, resetToken, reportInvalid }),
       cardFilterFields({ t, view, writable, setField, resetToken, reportInvalid }),
       cardNumberFields({ t, view, writable, setField, resetToken, reportInvalid }),
