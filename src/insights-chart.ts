@@ -9,7 +9,7 @@
 //
 // 这一段全是**结构核对**而不是类型断言：chunk 与入口分别构建、分别发布，版本错配时它可能
 // 只导出了半个模块。用谓词逐层判形状，错配就退化成「没有图表」，而不是在渲染中途抛。
-import type { ChartHandle, ChartSpec } from "./insights-chart-spec.ts";
+import type { ChartHandle, ChartSpec, PieSpec } from "./insights-chart-spec.ts";
 
 /** 宿主工厂注入的模块加载器；本文件只用到 `async`。 */
 declare const require: {
@@ -31,9 +31,18 @@ const isFunction = (value: unknown): value is AnyFunction => typeof value === "f
  * 里的类型。这里只确认「可调用」，结果形状由调用点核对——写一个跨产物的宽窄断言会假装
  * 我们知道得更多。返回 `undefined` 表示版本错配（chunk 在那、导出面不认识）。
  */
-function mountOf(loaded: unknown): AnyFunction | undefined {
+function chartModuleOf(loaded: unknown): Record<string, unknown> | undefined {
   const exported = isObject(loaded) ? loaded["chartModule"] : undefined;
-  const mount = isObject(exported) ? exported["mountChart"] : undefined;
+  return isObject(exported) && isFunction(exported["mountChart"]) ? exported : undefined;
+}
+
+function mountOf(module: Record<string, unknown> | undefined): AnyFunction | undefined {
+  const mount = module?.["mountChart"];
+  return isFunction(mount) ? mount : undefined;
+}
+
+function pieMountOf(module: Record<string, unknown> | undefined): AnyFunction | undefined {
+  const mount = module?.["mountPie"];
   return isFunction(mount) ? mount : undefined;
 }
 
@@ -44,7 +53,7 @@ function mountOf(loaded: unknown): AnyFunction | undefined {
  * 它可能只是那次请求抢在宿主模块表就绪之前，或者用户重载页面之后 chunk 已经在了。失败后
  * 清掉缓存，下一次挂载再试一趟；每趟失败都留一行诊断（否则「图一直不出来」没有任何线索）。
  */
-let loading: Promise<AnyFunction | undefined> | undefined;
+let loading: Promise<Record<string, unknown> | undefined> | undefined;
 let loaded = false;
 
 /**
@@ -54,37 +63,37 @@ let loaded = false;
  * `require.async` reject（宿主按 404 供，例如 package.json 的 `files` 漏了 chunk），以及
  * chunk 到了却没导出 `mountChart`（入口与 chunk 版本错配）。
  */
-async function loadOnce(): Promise<AnyFunction | undefined> {
-  let mount: AnyFunction | undefined;
+async function loadOnce(): Promise<Record<string, unknown> | undefined> {
+  let module: Record<string, unknown> | undefined;
   try {
     // 这串必须写成**字面量**：构建期与宿主比的都是字面量原文，模板串插值不算引用。
     const required: unknown = await require.async("./client.insights-echarts.js");
-    mount = mountOf(required);
+    module = chartModuleOf(required);
   } catch (error) {
     // 失败不缓存（见 `loading` 的注释），但要留一句：图表不出来时这是唯一能解释原因的记录。
     console.warn(
       `[rtk] chart chunk did not load: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  if (mount === undefined) {
+  if (module === undefined) {
     // chunk 到了、导出面却不认识：入口与 chunk 版本错配。这一条也该说出来，它和 404 的
     // 修法完全不同（一个是打包漏件，一个是重装）。
     console.warn("[rtk] chart chunk loaded but does not export mountChart (version mismatch?)");
   }
-  return mount;
+  return module;
 }
 
 /** 取图表模块的挂载函数；成功之后只发一趟请求，失败则下次重试。 */
-export async function loadChartModule(): Promise<AnyFunction | undefined> {
+export async function loadChartModule(): Promise<Record<string, unknown> | undefined> {
   loading ??= loadOnce();
-  const mount = await loading;
-  if (mount === undefined) {
+  const module = await loading;
+  if (module === undefined) {
     // 失败不留缓存：把这一趟清掉，下一次挂载重新试。
     loading = undefined;
   } else {
     loaded = true;
   }
-  return mount;
+  return module;
 }
 
 /** 图表模块是否已经成功加载过（`false` 时下一次挂载还会再请求一趟）。 */
@@ -136,7 +145,8 @@ export async function mountChartIn(
   container: HTMLElement,
   spec: ChartSpec,
 ): Promise<ChartHandle | undefined> {
-  const mount = await loadChartModule();
+  const module = await loadChartModule();
+  const mount = mountOf(module);
   let drawn: unknown;
   try {
     drawn = mount === undefined ? undefined : mount(container, spec);
@@ -151,13 +161,32 @@ export async function mountChartIn(
   return usable;
 }
 
-/** 主题相关的取色：从容器的计算样式里读，chunk 不认识本包的 CSS 变量。 */
-export interface ChartPalette {
-  readonly colors: readonly [string, string];
-  readonly textColor: string;
-  readonly gridColor: string;
-  readonly tooltipBg: string;
-  readonly tooltipText: string;
+/**
+ * 把一个容器变成饼图。与 `mountChartIn` 同一套失败口径：画不出来就退 `undefined`，
+ * 页面保留卡片头与下方全量表，不因为附加图形失败而整块消失。
+ * @param container - 饼图容器
+ * @param spec - 饼图规格
+ * @returns 句柄；没画成时 `undefined`
+ */
+export async function mountPieIn(
+  container: HTMLElement,
+  spec: PieSpec,
+): Promise<ChartHandle | undefined> {
+  const mount = pieMountOf(await loadChartModule());
+  if (mount === undefined) {
+    console.warn("[rtk] chart chunk loaded but does not export mountPie (version mismatch?)");
+  }
+  let drawn: unknown;
+  try {
+    drawn = mount === undefined ? undefined : mount(container, spec);
+  } catch {
+    drawn = undefined;
+  }
+  const usable = isChartHandle(drawn) ? drawn : undefined;
+  if (usable === undefined) {
+    releaseHalfHandle(drawn);
+  }
+  return usable;
 }
 
 /** CSS 没定义时的兜底色（与卡片样式里的两支同调）。 */
@@ -168,6 +197,74 @@ const FALLBACK_PALETTE: ChartPalette = {
   tooltipBg: "rgba(24,26,32,.94)",
   tooltipText: "#f2f4f7",
 };
+
+/** 饼图容器的主色：类别色序列必须从计算样式取，ECharts 不接受 CSS `var()` 字符串。 */
+export interface PiePalette {
+  readonly colors: readonly string[];
+  readonly textColor: string;
+  readonly labelColor: string;
+  readonly tooltipBg: string;
+  readonly tooltipText: string;
+  readonly gridColor: string;
+  readonly lineColor: string;
+  readonly cardColor: string;
+  readonly pageColor: string;
+  readonly pageInactiveColor: string;
+  readonly mutedColor: string;
+}
+
+const TERTIARY_LABEL = "--dsw-alias-label-tertiary";
+
+const FALLBACK_PIE_COLORS = [
+  "#3b6ef6",
+  "#8b5cf6",
+  "#06b6d4",
+  "#e08a2e",
+  "#22c55e",
+  "#ef4444",
+] as const;
+
+/** 读饼图主题色；取不到的位逐枚落兜底色，不整组放弃。 */
+export function piePaletteOf(container: HTMLElement): PiePalette {
+  const style = globalThis.getComputedStyle(container);
+  const read = (name: string, fallback: string): string => {
+    const value = style.getPropertyValue(name).trim();
+    return value === "" ? fallback : value;
+  };
+  const categoryNames = [
+    "--dsw-alias-state-business-primary",
+    "--dsw-alias-chart-tools",
+    "--dsw-alias-chart-messages",
+    "--dsw-alias-state-warn-primary",
+    "--dsw-alias-state-success-secondary",
+    "--dsw-alias-state-error-secondary",
+  ] as const;
+  return {
+    colors: categoryNames.map((name, index) => read(name, FALLBACK_PIE_COLORS[index] ?? "#3b6ef6")),
+    // 图例与片外标签都取 --t2（label-secondary）；引导线取 label-tertiary。设计稿
+    // `renderPie()` 的 `label.color` 就是 `cssVar('--t2')`，三档分开读，不能共用
+    // --rtkc-chart-text（主图轴字是 --t3）。
+    textColor: read("--dsw-alias-label-secondary", FALLBACK_PALETTE.textColor),
+    labelColor: read("--dsw-alias-label-secondary", FALLBACK_PALETTE.textColor),
+    tooltipBg: read("--rtkc-chart-tooltip-bg", FALLBACK_PALETTE.tooltipBg),
+    tooltipText: read("--rtkc-chart-tooltip-text", FALLBACK_PALETTE.tooltipText),
+    gridColor: read("--rtkc-chart-grid", FALLBACK_PALETTE.gridColor),
+    lineColor: read(TERTIARY_LABEL, FALLBACK_PALETTE.textColor),
+    cardColor: read("--rtkc-surface", "#1c1d20"),
+    pageColor: read("--dsw-alias-state-business-primary", FALLBACK_PIE_COLORS[0]),
+    pageInactiveColor: read(TERTIARY_LABEL, FALLBACK_PALETTE.textColor),
+    mutedColor: read(TERTIARY_LABEL, FALLBACK_PALETTE.textColor),
+  };
+}
+
+/** 主题相关的取色：从容器的计算样式里读，chunk 不认识本包的 CSS 变量。 */
+export interface ChartPalette {
+  readonly colors: readonly [string, string];
+  readonly textColor: string;
+  readonly gridColor: string;
+  readonly tooltipBg: string;
+  readonly tooltipText: string;
+}
 
 /** 从容器读主题色；读不到就给兜底色，绝不抛。 */
 export function paletteOf(container: HTMLElement): ChartPalette {

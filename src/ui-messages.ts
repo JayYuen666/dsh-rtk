@@ -87,10 +87,16 @@ export interface UiMessages {
   readonly rtkTooOldHint: string;
   /** 已装且版本够：写出解析到的二进制与版本（README 承诺的「就绪行」就是这一句）。 */
   readonly rtkReadyHint: string;
+  /** 就绪徽章的短文案（徽章 + 检测，不再用一行裸 hint 当状态）。 */
+  readonly rtkReadyBadge: string;
+  /** 手动补检 rtk 的按钮。轮询之外给一个用户可点、结果可重复的入口。 */
+  readonly rtkDetect: string;
 
   // ---- Insights 页（左侧栏一级面板）----
-  /** 侧栏行与页面标题。与设置分区的 `navLabel` 分开：一个进设置列表，一个进侧栏。 */
+  /** 侧栏行标题。与设置分区的 `navLabel` 分开：一个进设置列表，一个进侧栏。 */
   readonly panelLabel: string;
+  /** Insights 页头标题：侧栏行放得下短名，页头按设计稿写全称。 */
+  readonly panelPageTitle: string;
   /** Insights 页头标题下的那句副标题。 */
   readonly panelSub: string;
   readonly tabPrefix: string;
@@ -108,10 +114,18 @@ export interface UiMessages {
   readonly kpiSucceededPipe: string;
   readonly kpiCoveragePrefix: string;
   readonly kpiCoveragePipe: string;
+  /** 洞察页六格：改写/压缩次数、触发率、节省量、节省率、平均耗时、跳过次数。 */
+  readonly kpiRewriteCount: string;
+  readonly kpiCompressedCount: string;
+  readonly kpiTrigger: string;
+  readonly kpiTriggerHint: string;
+  readonly kpiAverageLatency: string;
+  readonly kpiLatencyHintPrefix: string;
+  readonly kpiLatencyHintPipe: string;
+  readonly kpiSkipped: string;
+  readonly kpiSkippedHint: string;
   readonly kpiSaved: string;
   readonly kpiSavings: string;
-  /** 时间筛选区的标题：窗口与粒度只属于时间，不该和形态页签挤在一行。 */
-  readonly timeFilterLabel: string;
   /** 两个下拉各自的无障碍名称：`<select>` 不能只有 `data-field`。 */
   readonly rangeLabel: string;
   readonly granularityLabel: string;
@@ -119,7 +133,15 @@ export interface UiMessages {
   readonly loadFailedChart: string;
   /** 窗口内该形态一次调用都没有：整页换这一句话，不摊一堆 0。`{form}` 是页签名。 */
   readonly emptyWindow: string;
-  readonly chartTitle: string;
+  /** 主图标题按形态分：柱子分别是「改写次数」与「压缩次数」。 */
+  readonly chartTitlePrefix: string;
+  readonly chartTitlePipe: string;
+  /** 主图的读屏名称：canvas 没有文字，容器必须说明它是什么、精确值在哪。 */
+  readonly chartAriaPrefix: string;
+  readonly chartAriaPipe: string;
+  /** 主图图例里那枚柱子的名称，与标题同源。 */
+  readonly barRewrite: string;
+  readonly barCompressed: string;
   readonly chartEmpty: string;
   /**
    * 有节省的桶少于 3 个时那句说明：只在退柱时出现。
@@ -132,15 +154,26 @@ export interface UiMessages {
   /** 「最近一次」那一块的标题：两种形态问的不是同一个问题。 */
   readonly recentTitlePrefix: string;
   readonly recentTitlePipe: string;
+  /** 账本里的 `command_family` 可能落成兜底串 `unknown`：给读屏与界面一句人话。 */
+  readonly commandFamilyUnknown: string;
   readonly whyNone: string;
   /** `{status}`/`{family}`/`{reason}`/`{size}` 四个位。 */
+  /** 跳过/失败且没量到耗时那条。 */
   readonly whyLast: string;
-  /** 同上但省掉 `{reason}`：status 与 reason 说同一件事的那两支（已改写 / 已压缩）用它。 */
+  /** 成功且只量到耗时。 */
+  readonly whyLastLatency: string;
+  /** 跳过/失败且量到耗时。 */
+  readonly whyLastReasonLatency: string;
+  /** 成功且两样都没量到（旧库尚未补出新列时的那一态）。 */
   readonly whyLastPlain: string;
-  /** 没量到字节时用这两条。改写形态量的是指令本身，落库恒为 `unknown`；照模板印出来
-   *  就是「输入 unknown」——没量到就整段不印，不要拿占位词伪装成量到的值。 */
-  readonly whyLastNoSize: string;
-  readonly whyLastPlainNoSize: string;
+  /** 成功且量到节省量、没量到耗时。 */
+  readonly whyLastSaved: string;
+  /** 成功且两样都量到：设计稿「最近一次」那一行的完整形态。 */
+  readonly whyLastSavedLatency: string;
+  readonly whenToday: string;
+  readonly whenYesterday: string;
+  /** 整页/整块空态的统一标题；正文由 `emptyWindow` / `tableEmpty` 给。 */
+  readonly emptyTitle: string;
   readonly lastCompressed: string;
   readonly lastSkipped: string;
   readonly lastRewritten: string;
@@ -150,6 +183,12 @@ export interface UiMessages {
   readonly latencyLabelPipe: string;
   readonly dataStartLabel: string;
   readonly dataStartUnknown: string;
+  /** 「数据自 YYYY-MM-DD 起」的尾字；英文不需要，留空串。 */
+  readonly dataStartSuffix: string;
+  /** 页脚窗口说明（{days} 为窗口天数）：设计稿写「窗口最近 14 天」。 */
+  readonly windowRange: string;
+  /** 可用性正常时的原因码说明；异常时改由 availability 原因码逐条给出。 */
+  readonly availabilityOk: string;
   readonly loadFailed: string;
   readonly loadingLabel: string;
   readonly refresh: string;
@@ -163,18 +202,44 @@ export interface UiMessages {
   readonly tableCommands: string;
   readonly tableWorkdirs: string;
   readonly tableReasons: string;
+  /** 明细区第二组（构成 + 排名）的分组标题，设计稿 D 写作「构成与排名：图 + 全量表」。 */
+  readonly compositionTitle: string;
   readonly colName: string;
   readonly colFamily: string;
   readonly colWorkdir: string;
   readonly colCommands: string;
   readonly colSaved: string;
   readonly colSavings: string;
+  /** 命令族表底注：账本里的负数不是渲染错误，是输出变长了。 */
+  readonly commandNegativeNote: string;
   readonly colCoverage: string;
   readonly colReason: string;
   readonly colCount: string;
+  /** 按目录表：该目录次数占最大目录的百分比（设计稿 D 的第三列）。 */
+  readonly colShare: string;
+  readonly colShareTotal: string;
   readonly tableEmpty: string;
+  /** 图 + 全量表并存：details 的摘要文案（图负责趋势，表负责精确值与读屏）。 */
+  readonly reasonsDetails: string;
+  readonly reasonsTableCaption: string;
+  readonly reasonsTableFoot: string;
+  readonly workdirTableCaption: string;
+  readonly filterTableCaption: string;
+  readonly workdirTableFoot: string;
+  readonly workdirDetails: string;
+  readonly filterDetails: string;
+  /** 跳过原因构成卡右上角的总次数（{total}）。 */
+  readonly pieTotal: string;
+  readonly pieTooltip: string;
+  readonly pieFailed: string;
   /** 行数超过单表上限时表脚的说明（total=总行数，limit=展示的上限）。 */
   readonly tableTruncated: string;
+  readonly tableShown: string;
+  readonly tableExpand: string;
+  readonly tableCollapse: string;
+  readonly reasonsOther: string;
+  readonly reasonsOtherCount: string;
+  readonly donutTotalLabel: string;
   readonly reasonsEmpty: string;
   readonly suggestionsTitle: string;
   readonly suggestionsEmpty: string;
@@ -196,6 +261,8 @@ export interface UiMessages {
   readonly rtkSelfFailures: string;
   readonly rtkSelfOversized: string;
   readonly rtkSelfRecall: string;
+  /** 这三个位全 0 时给设计稿那一句「对账一致」，而不是让页脚缺一段。 */
+  readonly rtkSelfAgree: string;
 }
 
 /** 本包的 locale 命名空间。必须与 `cordis.patch.yml` 的 `id` 一致（`rtk`）。 */
@@ -284,14 +351,17 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
       "rtk not found：PATH 上找不到 rtk，压缩不会生效。macOS 用 brew install rtk，Windows 用 winget install rtk-ai.rtk。",
     rtkTooOldHint: "探到的 rtk 是 {version}，低于支持的 {minimum}：请升级 rtk 后再打开压缩。",
     rtkReadyHint: "就绪：{version}（{path}）",
+    rtkReadyBadge: "就绪 · {version}",
+    rtkDetect: "检测",
     panelLabel: "rtk 统计",
+    panelPageTitle: "rtk 使用洞察",
     panelSub: "命令改写与结果压缩的效果统计",
-    tabPrefix: "命令改写",
-    tabPipe: "结果压缩",
-    range7: "近 7 天",
-    range30: "近 30 天",
-    range90: "近 90 天",
-    granularityDay: "按日",
+    tabPrefix: "命令改写（prefix）",
+    tabPipe: "结果压缩（pipe）",
+    range7: "最近 7 天",
+    range30: "最近 30 天",
+    range90: "最近 90 天",
+    granularityDay: "按天",
     granularityWeek: "按周",
     granularityMonth: "按月",
     kpiBashCalls: "bash 调用",
@@ -301,32 +371,54 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     kpiSucceededPipe: "压缩成功",
     kpiCoveragePrefix: "改写覆盖",
     kpiCoveragePipe: "压缩覆盖",
+    kpiRewriteCount: "改写次数",
+    kpiCompressedCount: "压缩次数",
+    kpiTrigger: "触发率",
+    kpiTriggerHint: "命中 / 拦截检查",
+    kpiAverageLatency: "平均耗时",
+    kpiLatencyHintPrefix: "改写相关命令",
+    kpiLatencyHintPipe: "压缩相关命令",
+    kpiSkipped: "跳过次数",
+    kpiSkippedHint: "低于阈值不改写",
     kpiSaved: "节省 token",
     kpiSavings: "节省率",
-    timeFilterLabel: "时间范围",
     rangeLabel: "时间范围",
-    granularityLabel: "聚合粒度",
+    granularityLabel: "粒度",
     loadFailedChart: "图表模块没有加载起来",
     emptyWindow: "近 {days} 天没有{form}记录。换一个时间范围，或先跑几条命令。",
-    chartTitle: "节省量与比率",
+    chartTitlePrefix: "改写次数与节省率",
+    chartTitlePipe: "压缩次数与节省率",
+    chartAriaPrefix: "改写次数与节省率组合图；精确值见下方命令族表",
+    chartAriaPipe: "压缩次数与节省率组合图；精确值见下方命令族表",
+    barRewrite: "改写次数",
+    barCompressed: "压缩次数",
     chartEmpty: "窗口内还没有数据。跑几条命令再回来。",
     chartSparseNote:
       "有节省的桶不足 3 个，所以只画柱子、不连折线（两个点连出来的线不是趋势，会当成走势读）。节省率没有丢：上面 KPI 行与下面的明细表里都有，只是没画成线。",
-    recentTitlePrefix: "最近一次改写",
-    recentTitlePipe: "最近一次压缩",
+    recentTitlePrefix: "最近一次",
+    recentTitlePipe: "最近一次",
+    commandFamilyUnknown: "未识别命令",
     whyNone: "窗口内还没有任何一次尝试。",
-    whyLast: "{status} · {family} · {reason} · 输入 {size}",
-    whyLastPlain: "{status} · {family} · 输入 {size}",
-    whyLastNoSize: "{status} · {family} · {reason}",
-    whyLastPlainNoSize: "{status} · {family}",
-    lastCompressed: "已压缩",
+    whyLast: "{time} · {family} · {status} · {reason}",
+    whyLastLatency: "{time} · {family} {status}，耗时 {latency}",
+    whyLastReasonLatency: "{time} · {family} · {status} · {reason}，耗时 {latency}",
+    whyLastPlain: "{time} · {family} {status}",
+    whyLastSaved: "{time} · {family} {status}，节省 {saved} token（{pct}）",
+    whyLastSavedLatency: "{time} · {family} {status}，节省 {saved} token（{pct}），耗时 {latency}",
+    whenToday: "今天",
+    whenYesterday: "昨天",
+    emptyTitle: "窗口内没有数据",
+    lastCompressed: "压缩成功",
     lastSkipped: "已跳过",
-    lastRewritten: "已改写",
+    lastRewritten: "改写成功",
     lastFailed: "已失败",
     latencyLabelPrefix: "平均改写耗时",
     latencyLabelPipe: "平均 / 最大耗时",
-    dataStartLabel: "数据起始",
+    dataStartLabel: "数据自",
     dataStartUnknown: "还没有数据",
+    dataStartSuffix: "起",
+    windowRange: "窗口最近 {days} 天",
+    availabilityOk: "可用性原因码 OK",
     loadFailed: "统计读面没有响应：{reason}",
     loadingLabel: "读取中…",
     refresh: "刷新",
@@ -334,21 +426,42 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     kpiDeltaDay: "较前一日 {delta}",
     kpiDeltaWeek: "较前一周 {delta}",
     kpiDeltaMonth: "较前一月 {delta}",
-    tableFilters: "按过滤器",
-    tableCommands: "按命令",
-    tableWorkdirs: "按目录",
-    tableReasons: "跳过原因 Top",
+    tableFilters: "按过滤器 · 次数（全量）",
+    tableCommands: "命令族排行",
+    tableWorkdirs: "按目录 · 次数（全量）",
+    tableReasons: "跳过原因构成",
+    compositionTitle: "构成与排名：图 + 全量表",
     colName: "过滤器",
-    colFamily: "命令",
+    colFamily: "命令族",
     colWorkdir: "目录",
     colCommands: "次数",
     colSaved: "节省 token",
     colSavings: "节省率",
+    commandNegativeNote: "负值表示改写后输出反而变长；量条从 0 起画，数字保留原值。",
     colCoverage: "覆盖率",
     colReason: "原因",
     colCount: "次数",
-    tableEmpty: "窗口内没有记录。",
+    colShare: "占最大目录",
+    colShareTotal: "占比",
+    tableEmpty: "这张表暂时没有记录；换个时间范围或粒度再试。",
+    reasonsDetails: "查看完整原因表（{total} 类，按次数降序）",
+    reasonsTableCaption: "跳过原因构成完整表",
+    reasonsTableFoot: "全量 {total} 类；表内滚动，不聚合「其他」。图与表共用同一数据源。",
+    workdirTableCaption: "按目录改写次数完整表",
+    workdirTableFoot: "全量降序；条形图与表同源，表负责精确值与读屏。",
+    workdirDetails: "查看完整目录表（{total} 行）",
+    filterDetails: "查看完整过滤器表（{total} 行）",
+    filterTableCaption: "按过滤器完整表",
+    pieTotal: "共 {total} 次",
+    pieTooltip: "{name}　{value} 次（{percent}%）",
+    pieFailed: "图表未能加载，精确值见下方明细",
     tableTruncated: "共 {total} 行，只展示节省最多的前 {limit} 行",
+    tableShown: "已展示 {shown} / 共 {total}",
+    tableExpand: "展开全量",
+    tableCollapse: "收起，只看前 {limit} 行",
+    reasonsOther: "其余",
+    reasonsOtherCount: "其他（剩余 {count} 类）",
+    donutTotalLabel: "跳过总次数",
     reasonsEmpty: "窗口内没有跳过记录。",
     suggestionsTitle: "建议",
     suggestionsEmpty: "没有需要调整的项。",
@@ -372,6 +485,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
       "另有 {oversized} 次输入超过 rtk 的汇总上限（7500 token），`rtk gain` 会把这些整行排除在本页之外；本页不排除。",
     rtkSelfRecall:
       "被折叠的输出另存了 {entries} 条在 dsh 自己的 recall 库里（占 {size}），尾部指针指向那里。",
+    rtkSelfAgree: "与 rtk gain 对账一致。",
   },
   en: {
     cardTitle: "rtk output compression",
@@ -451,10 +565,13 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rtkTooOldHint:
       "Found rtk {version}, below the supported {minimum}: upgrade rtk before enabling compression.",
     rtkReadyHint: "Ready: {version} ({path})",
+    rtkReadyBadge: "Ready · {version}",
+    rtkDetect: "Detect",
     panelLabel: "rtk stats",
+    panelPageTitle: "rtk insights",
     panelSub: "Effectiveness stats for command rewriting and output compression",
-    tabPrefix: "Command rewrite",
-    tabPipe: "Output compression",
+    tabPrefix: "Command rewrite (prefix)",
+    tabPipe: "Output compression (pipe)",
     range7: "Last 7 days",
     range30: "Last 30 days",
     range90: "Last 90 days",
@@ -468,33 +585,57 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     kpiSucceededPipe: "Compressed",
     kpiCoveragePrefix: "Rewrite coverage",
     kpiCoveragePipe: "Compression coverage",
+    kpiRewriteCount: "Rewrite count",
+    kpiCompressedCount: "Compression count",
+    kpiTrigger: "Trigger rate",
+    kpiTriggerHint: "hits / guard checks",
+    kpiAverageLatency: "Avg latency",
+    kpiLatencyHintPrefix: "rewrite-related commands",
+    kpiLatencyHintPipe: "compression-related commands",
+    kpiSkipped: "Skipped",
+    kpiSkippedHint: "below threshold",
     kpiSaved: "Tokens saved",
     kpiSavings: "Savings",
-    timeFilterLabel: "Time range",
     rangeLabel: "Time range",
     granularityLabel: "Granularity",
     loadFailedChart: "the chart module did not load",
     emptyWindow:
       "No {form} activity in the last {days} days. Try another range, or run a few commands first.",
-    chartTitle: "Tokens saved and rate",
+    chartTitlePrefix: "Rewrites and savings rate",
+    chartTitlePipe: "Compressions and savings rate",
+    chartAriaPrefix:
+      "Rewrite count and savings-rate chart; exact values in the command-family table below",
+    chartAriaPipe:
+      "Compression count and savings-rate chart; exact values in the command-family table below",
+    barRewrite: "Rewrites",
+    barCompressed: "Compressions",
     chartEmpty: "No data in this window yet. Run a few commands and come back.",
     chartSparseNote:
       "Fewer than 3 buckets have savings, so this is bars only — a line through two points reads as a trend that is not there. The rate is not missing: it is in the KPI row above and in the tables below, just not drawn as a line.",
-    recentTitlePrefix: "Latest rewrite",
-    recentTitlePipe: "Latest compression",
+    recentTitlePrefix: "Latest",
+    recentTitlePipe: "Latest",
+    commandFamilyUnknown: "Unknown command",
     whyNone: "No attempt in this window yet.",
-    whyLast: "{status} · {family} · {reason} · input {size}",
-    whyLastPlain: "{status} · {family} · input {size}",
-    whyLastNoSize: "{status} · {family} · {reason}",
-    whyLastPlainNoSize: "{status} · {family}",
+    whyLast: "{time} · {family} · {status} · {reason}",
+    whyLastLatency: "{time} · {family} {status}, {latency}",
+    whyLastReasonLatency: "{time} · {family} · {status} · {reason}, {latency}",
+    whyLastPlain: "{time} · {family} {status}",
+    whyLastSaved: "{time} · {family} {status}, saved {saved} tokens ({pct})",
+    whyLastSavedLatency: "{time} · {family} {status}, saved {saved} tokens ({pct}), {latency}",
+    whenToday: "today",
+    whenYesterday: "yesterday",
+    emptyTitle: "No data in this window",
     lastCompressed: "compressed",
     lastSkipped: "skipped",
     lastRewritten: "rewritten",
     lastFailed: "failed",
     latencyLabelPrefix: "Avg rewrite latency",
     latencyLabelPipe: "Avg / max latency",
-    dataStartLabel: "Data starts",
+    dataStartLabel: "Data since",
     dataStartUnknown: "no data yet",
+    dataStartSuffix: "onward",
+    windowRange: "window last {days} days",
+    availabilityOk: "availability reason OK",
     loadFailed: "The stats channel did not respond: {reason}",
     loadingLabel: "Loading...",
     refresh: "Refresh",
@@ -502,21 +643,45 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     kpiDeltaDay: "vs prior day {delta}",
     kpiDeltaWeek: "vs prior week {delta}",
     kpiDeltaMonth: "vs prior month {delta}",
-    tableFilters: "By filter",
-    tableCommands: "By command",
-    tableWorkdirs: "By directory",
-    tableReasons: "Top skip reasons",
+    tableFilters: "By filter · calls (all)",
+    tableCommands: "Command families",
+    tableWorkdirs: "By directory · calls (all)",
+    tableReasons: "Why calls were skipped",
+    compositionTitle: "Composition and ranking: charts + full tables",
     colName: "Filter",
-    colFamily: "Command",
+    colFamily: "Command family",
     colWorkdir: "Directory",
     colCommands: "Calls",
     colSaved: "Tokens saved",
     colSavings: "Savings",
+    commandNegativeNote:
+      "A negative value means the rewrite produced more output; bars start at 0 while the number keeps its sign.",
     colCoverage: "Coverage",
     colReason: "Reason",
     colCount: "Count",
-    tableEmpty: "No records in this window.",
+    colShare: "Share of largest",
+    colShareTotal: "Share",
+    tableEmpty: "No records in this table yet. Try another range or granularity.",
+    reasonsDetails: "Show the full reason table ({total} categories, by count)",
+    reasonsTableCaption: "Complete skip-reason breakdown",
+    reasonsTableFoot:
+      'All {total} categories; scrolls in place, no "Other" rollup. The pie and the table share one source.',
+    workdirTableFoot:
+      "All rows in descending order; the bars and the table share one source, and the table carries exact values and screen-reader text.",
+    workdirTableCaption: "Complete rewrite count by directory",
+    workdirDetails: "Show the full directory table ({total} rows)",
+    filterDetails: "Show the full filter table ({total} rows)",
+    filterTableCaption: "Complete by-filter table",
+    pieTotal: "{total} total",
+    pieTooltip: "{name}  {value} calls ({percent}%)",
+    pieFailed: "The chart did not load; exact values are in the table below",
     tableTruncated: "{total} rows total; showing the top {limit} by savings",
+    tableShown: "Showing {shown} of {total}",
+    tableExpand: "Show all",
+    tableCollapse: "Collapse to the top {limit}",
+    reasonsOther: "Other",
+    reasonsOtherCount: "Other ({count} categories)",
+    donutTotalLabel: "total skips",
     reasonsEmpty: "No skips recorded in this window.",
     suggestionsTitle: "Suggestions",
     suggestionsEmpty: "Nothing to adjust.",
@@ -543,5 +708,6 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
       "Another {oversized} calls had inputs above rtk's summary cap (7500 tokens); `rtk gain` excludes those rows entirely, this page does not.",
     rtkSelfRecall:
       "Folded output is kept in dsh's own recall database: {entries} entries, {size} on disk. The trailing pointers refer to it.",
+    rtkSelfAgree: "Reconciled with rtk gain.",
   },
 };

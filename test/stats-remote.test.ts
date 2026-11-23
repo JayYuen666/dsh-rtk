@@ -64,6 +64,7 @@ const insightsOf = (request: InsightsRequest): InsightsResponse => ({
     savingsPct: 0,
     coveragePct: 0,
     successPct: 0,
+    skipped: 0,
     latencyAvgMs: 0,
     latencyMaxMs: 0,
   },

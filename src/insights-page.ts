@@ -19,19 +19,14 @@ import {
   chartModeOf,
   dataStartOf,
   granularityKeyOf,
-  hasLatencyOf,
   isEmptyWindow,
-  kpiDeltaLabelKeyOf,
   kpiDeltaOf,
   kpiRowsOf,
   lastEventLineOf,
-  latencyLabelKeyOf,
-  latencyLineOf,
   rangeKeyOf,
   recentTitleKeyOf,
   requestOf,
   rtkSelfLinesOf,
-  savedValuesOf,
   savingsValuesOf,
   suggestionLinesOf,
   withForm,
@@ -42,10 +37,11 @@ import type { Granularity, KpiDelta, RangeDays, ViewState } from "../lib/insight
 import { zeroFillSeries } from "../lib/insights-view.ts";
 import {
   Callout,
+  EmptyState,
   KpiGrid,
   KpiTile,
   Segmented,
-  StatusDot,
+  SelectField,
 } from "@jayyuen66/dsh-plugin-shared/client";
 
 import type { ChartSpec } from "./insights-chart-spec.ts";
@@ -60,13 +56,6 @@ import {
 } from "./insights-tables.ts";
 import type { StatsReader } from "./stats-reader.ts";
 import type { Translate, UiMessages } from "./ui-messages.ts";
-
-/** rtk 结局三态 → shared 状态点色调。 */
-const DOT_TONE_OF: Record<"ok" | "skip" | "fail", "ok" | "warn" | "err"> = {
-  ok: "ok",
-  skip: "warn",
-  fail: "err",
-};
 
 /** 三个反复出现的类名：`sonarjs(no-duplicate-string)` 数的是字面量，不是语义。 */
 const BLOCK = "rtkc-block";
@@ -100,7 +89,7 @@ async function loadOnce(reader: StatsReader | undefined, state: ViewState): Prom
 function chartSpecOf(
   response: InsightsResponse,
   state: ViewState,
-  labels: { readonly saved: string; readonly savings: string },
+  labels: { readonly bar: string; readonly savings: string; readonly count: string },
 ): ChartSpec {
   const series = zeroFillSeries(
     response.series,
@@ -114,7 +103,14 @@ function chartSpecOf(
   return {
     kind: mode,
     labels: chartLabelsOf(series, state.granularity),
-    bar: { name: labels.saved, values: savedValuesOf(series) },
+    countAxisName: labels.count,
+    // 柱子画**改写/压缩成功次数**，和 KPI 第一格同一个口径；设计稿标题就叫
+    // 「改写次数与节省率」。取 savedTokens 会让 prefix 形态整天空白，取 attempts
+    // 则柱子和 KPI 对不上（尝试次数不等于改写成次数）。
+    bar: {
+      name: labels.bar,
+      values: series.map((point) => point.compressed),
+    },
     ...(mode === "combo"
       ? { line: { name: labels.savings, values: savingsValuesOf(series) } }
       : {}),
@@ -123,6 +119,9 @@ function chartSpecOf(
     gridColor: "",
     tooltipBg: "",
     tooltipText: "",
+    // 洞察页主图按设计稿 D 用 220px 标准档（设置卡才是 162px 紧凑档）：
+    // 折线、柱与三档以上的刻线都放得下。
+    compact: false,
   };
 }
 
@@ -135,28 +134,22 @@ function Picker<Value extends string | number>(props: {
   readonly options: readonly { readonly value: Value; readonly label: string }[];
   readonly onChange: (value: Value) => void;
 }): ReactNode {
-  return createElement(
-    "select",
-    {
-      className: "rtkc-select",
-      "data-field": props.name,
-      "aria-label": props.label,
-      value: String(props.value),
-      onChange: (event: { readonly target: { readonly value: string } }) => {
-        const picked = props.options.find((option) => String(option.value) === event.target.value);
-        if (picked !== undefined) {
-          props.onChange(picked.value);
-        }
-      },
+  return createElement(SelectField, {
+    bare: true,
+    label: props.label,
+    field: props.name,
+    value: String(props.value),
+    options: props.options.map((option) => ({
+      value: String(option.value),
+      label: option.label,
+    })),
+    onChange: (next: string) => {
+      const picked = props.options.find((option) => String(option.value) === next);
+      if (picked !== undefined) {
+        props.onChange(picked.value);
+      }
     },
-    ...props.options.map((option) =>
-      createElement(
-        "option",
-        { key: String(option.value), value: String(option.value) },
-        option.label,
-      ),
-    ),
-  );
+  });
 }
 
 /**
@@ -181,33 +174,21 @@ function useCountupOnce(): { readonly animate: boolean } {
 }
 
 /** KPI 行：六格，窄屏由 CSS 折行。文案键由 `kpiRowsOf` 按形态选好，这里不再判形态。 */
-function KpiRow(props: {
-  readonly t: Translate;
-  readonly response: InsightsResponse;
-  readonly granularity: ViewState["granularity"];
-}): ReactNode {
-  const { t, response, granularity } = props;
+function KpiRow(props: { readonly t: Translate; readonly response: InsightsResponse }): ReactNode {
+  const { t, response } = props;
   const { animate } = useCountupOnce();
   const rows = kpiRowsOf(response.totals, response.form);
   // 涨跌标注：窗口内最后一桶对前一桶（口径见 kpiDeltaOf）。四种格各对到自己的序列字段，
   // 序列不足两桶/前置为 0/持平时 kpiDeltaOf 缺省，那几格不显示标注。
-  const deltaLabel = t(kpiDeltaLabelKeyOf(granularity));
-  const DELTA_FIELD_OF: Record<
-    string,
-    "bashCalls" | "commands" | "attempts" | "compressed" | "savedTokens"
-  > = {
-    bashCalls: "bashCalls",
-    attempts: "attempts",
-    succeeded: "compressed",
+  // 胶囊里只放箭头与百分比（设计稿 `.k-delta` 的样表就是 `↑ 12%`）；「较前一日」这类
+  // 基线说明会说满 78px 宽的一格并折成两行——那是布局事故，不是更清楚的说明。
+  const DELTA_FIELD_OF: Record<string, "compressed" | "savedTokens"> = {
+    rewrites: "compressed",
     saved: "savedTokens",
   };
   const deltaOf = (key: string): KpiDelta | undefined => {
     const field = DELTA_FIELD_OF[key];
-    const delta = field === undefined ? undefined : kpiDeltaOf(response.series, field);
-    // 三元同 kpiDeltaOf：早退 return undefined 撞 consistent-return / no-useless-undefined。
-    return field === undefined || delta === undefined
-      ? undefined
-      : { ...delta, text: deltaLabel.replace("{delta}", delta.text) };
+    return field === undefined ? undefined : kpiDeltaOf(response.series, field);
   };
   const cells = createElement(
     KpiGrid,
@@ -217,22 +198,14 @@ function KpiRow(props: {
         key: row.key,
         label: t(row.labelKey),
         value: row.value,
+        unit: row.unit,
+        sub: row.subKey === undefined ? undefined : t(row.subKey),
         count: animate && row.count !== undefined ? row.count : undefined,
         delta: deltaOf(row.key),
       }),
     ),
   );
-  // 改写形态只有平均（日表没留峰值），压缩形态才连最大值一起报。
-  // 一次都没量到就不画这一句：`formatDuration(0)` 会渲染成「平均改写耗时: 0 ms」，那读起来
-  // 像「这条链路很快」，而事实是「没量」——`hasLatencyOf` 的口径见它自己的注释。
-  const latency = hasLatencyOf(response.totals)
-    ? createElement(
-        "p",
-        { className: NOTE },
-        `${t(latencyLabelKeyOf(response.form))}: ${latencyLineOf(response.totals, response.form)}`,
-      )
-    : null;
-  return createElement("section", { className: `${BLOCK} rtkc-card` }, cells, latency);
+  return createElement("section", { className: `${BLOCK} rtkc-card` }, cells);
 }
 
 /** 图 + 一句「为什么只有柱子」。数据为空时画画不出东西，直接给一句话。 */
@@ -243,26 +216,82 @@ function ChartBlock(props: {
 }): ReactNode {
   const { t, response, state } = props;
   const spec = useMemo(
-    () => chartSpecOf(response, state, { saved: t("kpiSaved"), savings: t("kpiSavings") }),
+    () =>
+      chartSpecOf(response, state, {
+        bar: t(state.form === "prefix" ? "barRewrite" : "barCompressed"),
+        savings: t("kpiSavings"),
+        count: t("colCommands"),
+      }),
     [response, state, t],
   );
   const { containerRef, failed } = useChart(spec);
   // 失败那一行先把内层翻译落成一个变量：`t("loadFailed", { reason: t(…) })` 写成一句会顶到
   // `unicorn(max-nested-calls)` 的上限（3 层），而拆开之后每一步都读得出来在翻什么。
   const failedText = t("loadFailed", { reason: t("loadFailedChart") });
+  // 设计稿的图例在卡头一行。柱子那枚**始终**出现；折线那枚只在 combo 时补上——
+  // 柱子单干时多一枚「节省率」色块会让读者去找一条并不存在的线。
+  const legend = createElement(
+    "div",
+    { className: "rtkc-chart-legend" },
+    createElement(
+      "span",
+      null,
+      createElement("i", { style: { background: "var(--dsw-alias-state-business-primary)" } }),
+      t(state.form === "prefix" ? "barRewrite" : "barCompressed"),
+    ),
+    ...(spec.kind === "combo"
+      ? [
+          createElement(
+            "span",
+            { key: "savings" },
+            createElement("i", {
+              style: { background: "var(--dsw-alias-state-warn-primary)" },
+            }),
+            t("kpiSavings"),
+          ),
+        ]
+      : []),
+  );
+  const head = createElement(
+    "div",
+    { className: "rtkc-chart-head" },
+    createElement(
+      "h3",
+      { className: SUBTITLE },
+      t(state.form === "prefix" ? "chartTitlePrefix" : "chartTitlePipe"),
+    ),
+    legend,
+  );
   // 空窗口由 `InsightsPage` 整页接管（它连图都不挂），所以这里不需要再判一次——原先那个
   // `empty` 分支永远走不到，`chartEmpty` 也就从来没有出现过。
   return createElement(
     "section",
     { className: `${BLOCK} rtkc-card` },
-    createElement("h3", { className: SUBTITLE }, t("chartTitle")),
-    createElement("div", { className: "rtkc-chart", ref: containerRef }),
+    head,
+    createElement("div", {
+      className: "rtkc-chart",
+      ref: containerRef,
+      role: "img",
+      "aria-label": t(state.form === "prefix" ? "chartAriaPrefix" : "chartAriaPipe"),
+    }),
     // 原因不写死英文：`loadFailed` 的模板在 `ui-messages` 里，`{reason}` 也翻译过。
     failed ? createElement("p", { className: NOTE }, failedText) : null,
-    // 退成柱子时那句说明走警示条（warn 档）：它回答的是「比率去哪了」，而 `rtkc-note` 是
-    // 页脚、空窗口、加载中那一族的灰色小字——同色同号会让这句话被一起跳过（真机上就是这样）。
+    // 退成柱子时那句说明用页脚那种灰色小字：它回答的是「比率去哪了」，属于图的注释，
+    // 不是一块需要先读的告警。设计稿 D 的卡片里图后没有警示块，卡片的节奏由 220px 图与
+    // 卡头一行图例承担。
     spec.kind === "bars" ? createElement(Callout, { tone: "warn" }, t("chartSparseNote")) : null,
   );
+}
+
+/** 「今天 / 昨天 / 具体日期」；三支拆成早退，避免规则把嵌套三元判成不可读。 */
+function whenTextOf(line: ReturnType<typeof lastEventLineOf>, t: Translate): string {
+  if (line === undefined) {
+    return "";
+  }
+  if (line.when === "date") {
+    return line.dateText;
+  }
+  return t(line.when === "today" ? "whenToday" : "whenYesterday");
 }
 
 /** 「最近一次」：最近一条 + 一句说明，裸条形态（设计稿 .why：左边框染色 + 淡底，
@@ -275,26 +304,27 @@ function WhyBlock(props: {
   const { t, response } = props;
   const line = lastEventLineOf(response.lastEvent);
   // 摘要参数先拼出来：直接内联会到四层调用（createElement → t → t → t），撞 lint 的层数上限。
+  const when = whenTextOf(line, t);
   const summary =
     line === undefined
       ? undefined
       : {
           // `line.status` 的四个取值就是文案键本身（`lastCompressed` 等），不必再映射一次。
+          time: `${when} ${line.clock}`,
           status: t(line.status),
-          family: line.family,
+          family: line.family === "unknown" ? t("commandFamilyUnknown") : line.family,
           reason: line.reason,
-          size: line.size,
+          ...(line.saved === undefined ? {} : { saved: line.saved }),
+          ...(line.pct === undefined ? {} : { pct: line.pct }),
+          ...(line.latency === undefined ? {} : { latency: line.latency }),
         };
   // 已改写/已压缩这两支的 reason 只是把 status 再说一遍（`rewritten` / `success`），
   // 走不带 reason 的短模板；跳过与失败才需要说明原因。模板键由 `line.templateKey` 给，
   // 这里只做「有没有这一条」的判断——两件事分开写，嵌套三元就自然没了。
   const text =
     line === undefined || summary === undefined ? t("whyNone") : t(line.templateKey, summary);
-  // 结局带一个色点：一屏数字里「上一次是成功还是跳过」要靠颜色一眼分开，读完那一长串
-  // 「已跳过 · git status · too-small · 输入 tiny」才知道结论太慢。
-  // rtk 的结局三态（ok/skip/fail）映射到 shared 状态点的 ok/warn/err（表在模块级，渲染期不重建）。
-  const dot =
-    line === undefined ? null : createElement(StatusDot, { tone: DOT_TONE_OF[line.tone] });
+  // 设计稿 `.why` 只在左侧给一个小号语气标签，不用状态点：结局色由整条左边框与语气字承担，
+  // 中间再放一枚圆点会把「时间 · 命令 · 结局」这一句读断。
   // 结局整行染色：色点太轻，一屏数字里看不出上一次是成功还是跳过。颜色只做加强，
   // 文字仍是「已跳过 · git status · too-small · 输入 tiny」——不靠颜色单独表意。
   // 语气标签先落成局部量：嵌套调用层数的上限挡住了内联写法。
@@ -311,7 +341,6 @@ function WhyBlock(props: {
       ...(tone === undefined ? {} : { "data-tone": tone }),
     },
     toneLabel,
-    dot,
     text,
   );
 }
@@ -322,7 +351,11 @@ function EmptyWindow(props: { readonly t: Translate; readonly state: ViewState }
   const { t, state } = props;
   const form = state.form === "prefix" ? t("tabPrefix") : t("tabPipe");
   const text = t("emptyWindow", { days: String(state.rangeDays), form });
-  return createElement("p", { className: `${NOTE} rtkc-card rtkc-empty` }, text);
+  return createElement(
+    "section",
+    { className: "rtkc-emptyPage" },
+    createElement(EmptyState, { title: t("emptyTitle"), plain: true }, text),
+  );
 }
 
 /** 明细区：按形态给不同的表（prefix 没有 filter 这一层，也没有覆盖率列）。 */
@@ -331,13 +364,20 @@ function TablesBlock(props: {
   readonly response: InsightsResponse;
 }): ReactNode {
   const { t, response } = props;
+  const groupTitle = t("compositionTitle");
   return createElement(
     "div",
     { className: "rtkc-tables" },
     response.form === "pipe" ? createElement(FilterTable, { t, rows: response.filters }) : null,
     createElement(CommandTable, { t, form: response.form, rows: response.commands }),
-    createElement(WorkdirTable, { t, rows: response.workdirs }),
+    // 设计稿 D 把「构成与排名」作为独立一组：图负责构成/排名，details 表负责精确值。
+    createElement(
+      "div",
+      { className: "rtkc-groupHead" },
+      createElement("h3", { className: "rtkc-subtitle" }, groupTitle),
+    ),
     createElement(ReasonsTable, { t, rows: response.skipReasons }),
+    createElement(WorkdirTable, { t, form: response.form, rows: response.workdirs }),
   );
 }
 
@@ -359,8 +399,12 @@ function Footnote(props: {
   const { t, response, state } = props;
   const start = dataStartOf(response);
   const parts = [
-    `${t("dataStartLabel")}: ${start === "" ? t("dataStartUnknown") : start}`,
-    t(rangeKeyOf(state.rangeDays)),
+    // 设计稿 `.footnote` 的样句是「数据自 2026-10-28 起」；未知时只留「数据自 还没有数据」，
+    // 不给未知值补一个「起」字。
+    start === ""
+      ? `${t("dataStartLabel")} ${t("dataStartUnknown")}`
+      : `${t("dataStartLabel")} ${start} ${t("dataStartSuffix")}`,
+    t("windowRange", { days: String(state.rangeDays) }),
     t(granularityKeyOf(state.granularity)),
   ];
   // 不可用的原因由 service 给**码**、这里按界面语言翻译（见 `AvailabilityReason`）。
@@ -369,11 +413,11 @@ function Footnote(props: {
   for (const reason of response.availability.reasons) {
     parts.push(t(AVAILABILITY_KEYS[reason]));
   }
-  if (
-    response.availability.reasons.length === 0 &&
-    availabilityKeyOf(response.availability) === "unavailable"
-  ) {
+  const availability = availabilityKeyOf(response.availability);
+  if (response.availability.reasons.length === 0 && availability === "unavailable") {
     parts.push(t("statsUnavailable"));
+  } else if (response.availability.reasons.length === 0 && availability === "ok") {
+    parts.push(t("availabilityOk"));
   }
   // 与 rtk 自己对账的那两句排在最后：它们解释的是「本页与 `rtk gain` 会不会对不上」，
   // 前提是先把「这一屏是什么窗口、数据从哪天开始」说清楚。判据全在 `rtkSelfLinesOf` 里
@@ -401,7 +445,7 @@ function PageHeader(props: {
   const titles = createElement(
     "div",
     { className: "rtkc-page-titles" },
-    createElement("h2", { className: "rtkc-page-title" }, t("panelLabel")),
+    createElement("h2", { className: "rtkc-page-title" }, t("panelPageTitle")),
     createElement("p", { className: "rtkc-page-sub" }, t("panelSub")),
   );
   const title = createElement("div", { className: "rtkc-page-titlewrap" }, badge, titles);
@@ -419,7 +463,8 @@ function PageHeader(props: {
     { type: "button", className: "rtkc-refresh", disabled: busy, onClick: onRefresh },
     busy ? t("loadingLabel") : t("refresh"),
   );
-  return createElement("header", { className: "rtkc-page-head" }, title, updated, button);
+  const actions = createElement("div", { className: "rtkc-page-actions" }, updated, button);
+  return createElement("header", { className: "rtkc-page-head" }, title, actions);
 }
 
 /** 页面本体。`props.reader` 缺席时整页只显示一行「未连接」，不画空图。 */
@@ -486,7 +531,7 @@ export function InsightsPage(props: {
   const timeFilter = createElement(
     "div",
     { className: "rtkc-timebar" },
-    createElement("span", { className: "rtkc-timebar-label" }, t("timeFilterLabel")),
+    createElement("label", { className: "rtkc-timebar-label" }, t("rangeLabel")),
     createElement(Picker<RangeDays>, {
       name: "rangeDays",
       label: t("rangeLabel"),
@@ -496,6 +541,7 @@ export function InsightsPage(props: {
         setState((prev) => withRange(prev, days));
       },
     }),
+    createElement("label", { className: "rtkc-timebar-label" }, t("granularityLabel")),
     createElement(Picker<Granularity>, {
       name: "granularity",
       label: t("granularityLabel"),
@@ -547,7 +593,7 @@ export function InsightsPage(props: {
     );
   }
   return shell(
-    createElement(KpiRow, { t, response, granularity: state.granularity }),
+    createElement(KpiRow, { t, response }),
     createElement(ChartBlock, { t, response, state }),
     createElement(WhyBlock, { t, response }),
     createElement(TablesBlock, { t, response }),

@@ -82,6 +82,16 @@ export interface RecallTally {
   readonly bytes: number;
 }
 
+/** 账本里最新的一行命令。只为「最近一次」补上 rtk 已经量到的节省量与耗时。 */
+export interface LedgerLastCommand {
+  /** rtk 写下的 RFC3339 UTC 时间串（与 `commands.timestamp` 同形）。 */
+  readonly ts: string;
+  readonly input: number;
+  readonly output: number;
+  readonly saved: number;
+  readonly originalCmd: string;
+}
+
 /**
  * 只读聚合的回执。
  *
@@ -94,6 +104,8 @@ export interface PrefixLedgerResult {
   readonly commands: readonly LedgerCommandRow[];
   readonly workdirs: readonly LedgerWorkdirRow[];
   readonly dataStart: string | null;
+  /** 库里的最新一行；空库或读不到时为 null。prefix 的「最近一次」用它补节省量。 */
+  readonly lastCommand?: LedgerLastCommand | null;
   readonly failures: ParseFailureTally;
   /**
    * 窗口内 input 超过 rtk 展示上限的行数。
@@ -176,6 +188,7 @@ function emptyResult(availability: PrefixLedgerResult["availability"]): PrefixLe
     commands: [],
     workdirs: [],
     dataStart: null,
+    lastCommand: null,
     failures: { total: 0, recovered: 0 },
     oversized: 0,
     recall: { entries: 0, bytes: 0 },
@@ -417,6 +430,14 @@ export async function readPrefixLedger(
     const first = db
       .prepare("SELECT MIN(timestamp) AS first FROM commands")
       .get<{ readonly first: string | null }>();
+    const lastCommand =
+      db
+        .prepare(
+          `SELECT timestamp AS ts, input_tokens AS input, output_tokens AS output,
+             saved_tokens AS saved, original_cmd AS originalCmd
+           FROM commands ORDER BY timestamp DESC, id DESC LIMIT 1`,
+        )
+        .get<LedgerLastCommand>() ?? null;
     // 下面两个数是「与 rtk 自己那两个视图对得上」的部分，读不出来就报 0、不把整页拖红：
     // `parse_failures` 是 rtk 后来才加的表，老库没有它（那时页脚写「解析失败 0 次」，
     // 与 rtk gain -F 在同一个老库上的结论一致——它也是 0）。
@@ -449,6 +470,7 @@ export async function readPrefixLedger(
       commands,
       workdirs,
       dataStart: first?.first ?? null,
+      lastCommand,
       failures,
       oversized,
       recall: await readRecallTally(recallDb),

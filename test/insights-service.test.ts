@@ -474,6 +474,7 @@ describe("insights：pipe 回声", () => {
     assert.equal(totals.savingsPct, 80);
     assert.equal(totals.coveragePct, 10, "2/20：分母是全窗口 bash 调用数");
     assert.equal(totals.successPct, 50, "2/4：compressed 只数 status=compressed 的事件行");
+    assert.equal(totals.skipped, 2, "两条 status=skipped 的事件行");
     // 四条事件的 latency 依次 30 / 90 / 0 / 0：均值只取 >0 的两条 → 60，峰值 90。
     assert.equal(totals.latencyAvgMs, 60);
     assert.equal(totals.latencyMaxMs, 90);
@@ -520,6 +521,106 @@ describe("insights：pipe 回声", () => {
     assert.equal(lastEvent.sizeBucket, "small");
     assert.equal(response.dataStart, YESTERDAY);
     assert.deepEqual(response.legacy, LEGACY);
+  });
+
+  it("lastEvent 的计量列是 null 时不带可选字段", async () => {
+    const response = await serviceWithStore(
+      storeOf({
+        lastEvents: [
+          lastEventRow({
+            saved_tokens: null,
+            savings_pct: null,
+            latency_ms: null,
+          }),
+        ],
+      }),
+    ).insights(PIPE_REQUEST);
+    const { lastEvent } = response;
+    assert.ok(lastEvent !== null);
+    assert.equal("savedTokens" in lastEvent, false);
+    assert.equal("savingsPct" in lastEvent, false);
+    assert.equal("latencyMs" in lastEvent, false);
+  });
+
+  it("lastEvent 的计量列有值时原样带上", async () => {
+    const response = await serviceWithStore(
+      storeOf({
+        lastEvents: [
+          lastEventRow({
+            saved_tokens: 3200,
+            savings_pct: 61,
+            latency_ms: 420,
+          }),
+        ],
+      }),
+    ).insights(PIPE_REQUEST);
+    const { lastEvent } = response;
+    assert.ok(lastEvent !== null);
+    assert.equal(lastEvent.savedTokens, 3200);
+    assert.equal(lastEvent.savingsPct, 61);
+    assert.equal(lastEvent.latencyMs, 420);
+  });
+
+  it("prefix 的 null 节省列由账本最新同族行补齐", async () => {
+    // prefix 改写事件落库时只有耗时；token 两列在 rtk 跑完后才写进 commands 表。
+    // 期望值独立写死：5000 input 省 3200 -> 64.00%，不从服务实现反推。
+    const response = await serviceWithStore(
+      storeOf({
+        lastEvents: [
+          lastEventRow({
+            form: "prefix",
+            status: "rewritten",
+            reason: "rewritten",
+            saved_tokens: null,
+            savings_pct: null,
+          }),
+        ],
+      }),
+      {
+        ledger: ledgerOf({
+          lastCommand: {
+            ts: new Date(NOW - 400).toISOString(),
+            input: 5000,
+            output: 1800,
+            saved: 3200,
+            originalCmd: FAMILY_CARGO,
+          },
+        }),
+      },
+    ).insights(PREFIX_REQUEST);
+    const { lastEvent } = response;
+    assert.ok(lastEvent !== null);
+    assert.equal(lastEvent.savedTokens, 3200);
+    assert.equal(lastEvent.savingsPct, 64);
+  });
+
+  it("prefix 的账本最新行不是同一家族时不补", async () => {
+    const response = await serviceWithStore(
+      storeOf({
+        lastEvents: [
+          lastEventRow({
+            form: "prefix",
+            status: "rewritten",
+            reason: "rewritten",
+            saved_tokens: null,
+            savings_pct: null,
+          }),
+        ],
+      }),
+      {
+        ledger: ledgerOf({
+          lastCommand: {
+            ts: new Date(NOW - 400).toISOString(),
+            input: 5000,
+            output: 1800,
+            saved: 3200,
+            originalCmd: FAMILY_GIT,
+          },
+        }),
+      },
+    ).insights(PREFIX_REQUEST);
+    assert.equal("savedTokens" in (response.lastEvent ?? {}), false);
+    assert.equal("savingsPct" in (response.lastEvent ?? {}), false);
   });
 
   it("series 按粒度落桶，日粒度按 key 升序（不受输入顺序影响）", async () => {
@@ -570,7 +671,7 @@ describe("insights：pipe 回声", () => {
       pipeEvent({
         id: index + 1,
         filter: FILTER_VERBOSE,
-        command_family: "cargo build",
+        command_family: FAMILY_CARGO,
         compressed_tokens: 900,
         saved_tokens: 100,
       }),
@@ -598,6 +699,26 @@ describe("insights：pipe 回声", () => {
       // 那句现在是客户端的事，service 里不该再出现一个中文字）。
       assert.ok(item.params.filter !== undefined || item.params.family !== undefined);
     }
+  });
+
+  it("低收益跌到 10% 以下升为 warn，建议区因此有第二种状态色", async () => {
+    // original 2000 / compressed 1900 / saved 100 => 节省率 5%，既过 LOW_YIELD 也过 WARN 线。
+    const lowYield = Array.from({ length: 5 }, (_unused, index) =>
+      pipeEvent({
+        id: index + 1,
+        filter: FILTER_VERBOSE,
+        command_family: FAMILY_CARGO,
+        original_tokens: 2000,
+        compressed_tokens: 1900,
+        saved_tokens: 100,
+      }),
+    );
+    const service = serviceWithStore(
+      storeOf({ pipeDays: [pipeDay(TODAY, { bash_calls: 5 })], pipeEvents: lowYield }),
+      { enabledFilters: () => [FILTER_VERBOSE] },
+    );
+    const response = await service.insights(PIPE_REQUEST);
+    assert.equal(response.suggestions[0]?.severity, "warn");
   });
 
   it("样本不足与已启用的 potential 都不出建议（噪声优先于召回）", async () => {
@@ -658,6 +779,7 @@ describe("insights：prefix 回声", () => {
     assert.equal(response.totals.savingsPct, 75);
     assert.equal(response.totals.coveragePct, 62.5);
     assert.equal(response.totals.successPct, 83.33);
+    assert.equal(response.totals.skipped, 4, "两天各 2 条 gate_skips");
     assert.equal(response.totals.latencyAvgMs, 20, "100ms / 5 次 + 100ms / 5 次 的平均");
     assert.equal(response.totals.latencyMaxMs, 0, "日表没留峰值，给 0 而不是拿均值冒充");
     // 两行 `cargo test …` 必须并成一个家族，且按节省量降序。

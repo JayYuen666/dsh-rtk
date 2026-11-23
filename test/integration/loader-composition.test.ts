@@ -94,6 +94,12 @@ async function loadRtk(dataDir: string): Promise<Loaded> {
   });
   ctx.baseUrl = `${pathToFileURL(path.resolve(import.meta.dirname, "../..")).href}/`;
   await ctx.plugin(Loader);
+  // SystemPrompt 的 `sessionProjections` 注入必须先有着落，否则 fiber 停在 PENDING。
+  ctx.provide("sessionProjections", {
+    register: (): (() => void) => () => {
+      void 0;
+    },
+  });
   await ctx.plugin(SystemPrompt, {});
   await ctx.plugin(ToolRuntime, {});
   await ctx.plugin({ inject: nativeExecutorInject, apply: applyNativeExecutor });

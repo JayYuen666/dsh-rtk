@@ -5,8 +5,9 @@
 // launch token 换 /connect 的 v2 签名 cookie，再带着这枚 cookie 调网关。响应形状按
 // lib/stats-shape.ts / lib/insights-shape.ts 的公开契约断言，不从本包实现反推。
 //
-// 计时与外部依赖：需要 PATH 上有 dsh（CI 没有，自动跳过）且 host.js 已构建；DSH_RTK_TEST_MODE=fake
-// 时也跳过。整条回路约十秒量级。
+// 计时与外部依赖：需要 PATH 上有与本包 engines.dsh 同线（0.2.3）的 dsh 且 host.js 已构建；
+// CI 没有 dsh、或本机 PATH 上还是 0.2.2 线时自动跳过（跨线装载会被宿主按确切版本拒绝，
+// 那不是本包缺陷）。DSH_RTK_TEST_MODE=fake 时也跳过。整条回路约十秒量级。
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -54,8 +55,9 @@ const runProcess = (
 
 const dshProbe = await runProcess(["dsh", "--version"], { cwd: repoRoot }).catch(() => null);
 const dshAvailable = dshProbe?.status === 0;
+const dshSameLine = dshAvailable && /0\.2\.3/u.test(dshProbe.stdout);
 const enabled =
-  dshAvailable &&
+  dshSameLine &&
   mode !== "fake" &&
   process.env["CI"] === undefined &&
   existsSync(path.join(repoRoot, "host.js"));

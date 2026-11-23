@@ -595,6 +595,13 @@ interface ShellRig {
  */
 async function mountShellRig(options: ShellRigOptions): Promise<ShellRig> {
   const root = new CordisContext();
+  // SystemPrompt 在 alpha.2 声明 `sessionProjections` 注入；投影注册表未在位时 fiber 保持
+  // PENDING，`ctx.systemPrompt` 根本不会构造。台架不验投影行为，只提供最小注册面。
+  root.provide("sessionProjections", {
+    register: (): (() => void) => () => {
+      void 0;
+    },
+  });
   await root.plugin(SystemPrompt);
   await root.plugin(ToolRuntime);
   await root.plugin({ inject: nativeExecutorInject, apply: applyNativeExecutor });
@@ -1038,6 +1045,11 @@ async function mountPipeRig(
   defineFixture: (name: string) => Record<string, unknown>,
 ): Promise<PipeRig> {
   const root = new CordisContext();
+  root.provide("sessionProjections", {
+    register: (): (() => void) => () => {
+      void 0;
+    },
+  });
   await root.plugin(SystemPrompt);
   await root.plugin(ToolRuntime);
   await root.plugin({ inject: nativeExecutorInject, apply: applyNativeExecutor });

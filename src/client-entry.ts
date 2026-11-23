@@ -8,6 +8,7 @@ import { createElement, useCallback, useEffect, useMemo, useRef, useState } from
 import { RiskConfirmation } from "@deepseek-ai/dsh-client-ui-primitives";
 import type { ReactNode } from "react";
 import {
+  Badge,
   Callout,
   CardForm,
   FieldTwoCol,
@@ -15,6 +16,7 @@ import {
   NumberField,
   SaveBar,
   Section,
+  SectionToggle,
   SelectField,
   TextField,
   ToggleField,
@@ -32,7 +34,6 @@ import {
   FORM_MODES,
   cardStore,
   draftFields,
-  enabledHintKeyOf,
   formModeOf,
   formsOf,
   hintOf,
@@ -50,7 +51,12 @@ import { RtkPanelIcon } from "./insights-icon.ts";
 import { InsightsPage } from "./insights-page.ts";
 import { useChart } from "./insights-chart-hook.ts";
 import type { ChartSpec } from "./insights-chart-spec.ts";
-import { PANEL_ID, PANEL_ORDER, cardKpiRowsOf } from "../lib/insights-page-logic.ts";
+import {
+  PANEL_ID,
+  PANEL_ORDER,
+  cardKpiRowsOf,
+  overviewHasData,
+} from "../lib/insights-page-logic.ts";
 import type { CardKpiRow } from "../lib/insights-page-logic.ts";
 import { UI_MESSAGES } from "./ui-messages.ts";
 import type { Translate, UiMessages } from "./ui-messages.ts";
@@ -85,7 +91,6 @@ const CARD_CSS = [
   ".rtkc-note{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary,inherit);margin:6px 0}",
   // 提示条：宿主没有「警告底色」这一档别名（`--dsw-alias-state-warn-primary` 是实心琥珀色，
   // 铺成底会把正文压死），所以这里用同色系淡底写死——深浅主题各看得清，也不冒充宿主的语义色。
-  ".rtkc-actions{margin-top:8px}",
   // 今日摘要：卡片里的 KPI 格。**不复用洞察页那六格**：那是窗口总量、这是今日单形态，
   // 标签与量纲都不同；共用一套类名会让两处任何一次微调互相牵连。
   ".rtkc-today-block{margin:8px 0 4px}",
@@ -137,7 +142,7 @@ const CARD_CSS = [
   // （真机 `getComputedStyle(document.body).getPropertyValue("--dsw-alias-card-fill")` 有值，
   // `document.documentElement` 上是空串）。挂在 :root 时 `var()` 在 html 上求值就落到 fallback，
   // 于是主题换了、卡片底纹却一直是写死的那个 #1c1d20。
-  "body{--rtkc-surface:var(--dsw-alias-card-fill,#1c1d20);--rtkc-tile:var(--dsw-alias-card-tile-fill,rgba(255,255,255,.06));--rtkc-line:var(--dsw-alias-border-l2,rgba(127,127,127,.22));--rtkc-hover:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));--rtkc-raised:var(--dsw-alias-bg-layer-2,#2c2c2e)}",
+  "body{--rtkc-surface:var(--dsw-alias-card-fill,#1c1d20);--rtkc-tile:var(--dsw-alias-card-tile-fill,rgba(255,255,255,.06));--rtkc-line:var(--dsw-alias-border-l2,rgba(127,127,127,.22));--rtkc-hover:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));--rtkc-raised:var(--dsw-alias-bg-layer-2,#2c2c2e);--rtkc-chart-bar:var(--dsw-alias-state-business-primary,#3b6ef6);--rtkc-chart-line:var(--dsw-alias-state-warn-primary,#e08a2e);--rtkc-chart-text:var(--dsw-alias-label-tertiary,#9aa3b2);--rtkc-chart-grid:var(--dsw-alias-border-l2,#ffffff1f);--rtkc-chart-tooltip-bg:var(--dsw-alias-tooltip-bg,rgba(24,26,32,.94));--rtkc-chart-tooltip-text:var(--dsw-alias-tooltip-label,#f2f4f7)}",
   // 图表配色走 CSS 变量：ECharts 在 chunk 里，读不到本包的样式表，只能由入口在挂载时
   // 用 getComputedStyle 从这里取（见 `./insights-chart.ts` 的 paletteOf）。
   //
@@ -145,7 +150,9 @@ const CARD_CSS = [
   // 直接用在深色卡片上就是「深灰字压在 #212123 上」，对比度不足 4.5:1，真机上看不清刻度。
   // 这样写在 body 上而不是只在 :root 改一次，是因为宿主的主题切换只改 body 的属性、不重渲染
   // 本组件——`useChart` 里那条 MutationObserver 观察到属性变化后，会重新读这里取色再 update。
-  "body[data-ds-dark-theme]{--rtkc-chart-text:#9aa3b2;--rtkc-chart-grid:#ffffff1f;--rtkc-chart-tooltip-bg:rgba(24,26,32,.94);--rtkc-chart-tooltip-text:#f2f4f7}",
+  // 主图轴与饼图的取色都走宿主语义令牌（设计稿 renderMain/renderPie 的同一组）：
+  // 轴字是 label-tertiary，网格是 border-l2，类目色是 state/chart-*，切主题时宿主改
+  // body 上的这几枚，`useChart` 的 MutationObserver 会重新读一遍。
   ".rtkc-page{display:flex;flex-direction:column;gap:var(--rtkc-gap);padding:4px 0 12px}",
   // 洞察页是主面板里的一整页，而宿主给它的容器**自己不滚**：ui-layout 的 `.centerCol`
   // 声明 `overflow:hidden`（AppFrame.module.css），中间也没有任何带滚动能力的包装层——
@@ -161,19 +168,29 @@ const CARD_CSS = [
   // `.pageScroll`）也是 9px + 2px 内缩，这里跟它对齐：拇指实际 5px、离边 2px，才看得出「还能往下滚」。
   // 配色用 l2 一对——本页的底色是卡片面，l1 那对是给基础面的。
   ".rtkc-page[data-panel]{flex:1 1 auto;min-height:0;box-sizing:border-box;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;padding:0;--dsh-scrollbar-width:9px;--dsh-scrollbar-thumb-border:2px;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2)}",
-  // 内容列：左右排满（用户裁决：不做 860px 限宽居中），内边距 12px 一档。
-  ".rtkc-column{width:100%;margin:0;display:flex;flex-direction:column;gap:14px;padding:12px 24px}",
+  // 内容列：设计稿 D 定 860px 内容宽（页头、工具栏、KPI、图与表同列）。列自身留 24px
+  // 横向内边距，所以外层限宽按 860 + 48 算；否则卡片只剩 812px，比设计稿窄一档。
+  ".rtkc-column{width:100%;max-width:908px;box-sizing:border-box;margin:0 auto;display:flex;flex-direction:column;gap:14px;padding:12px 24px;container-type:inline-size}",
+  // 设计稿 D 的六格 KPI 下限是 118px（`.insights .kpi-grid`）：860 内容宽刚好六列。
+  // 用容器查询而不是视口查询：侧栏收起后视口没变、内容列却从 730 变成 860，六格必须跟着变。
+  ".rtkc-column .dsu-kpiGrid{grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:10px}",
+  "@container (max-width:760px){.rtkc-column .dsu-kpiGrid{grid-template-columns:repeat(3,minmax(0,1fr))}}",
+  "@container (max-width:520px){.rtkc-column .dsu-kpiGrid{grid-template-columns:repeat(2,minmax(0,1fr))}}",
   // 页头与控件的节奏照设计稿：头部下 18px、工具栏下 16px（列 gap 14 补差值）。
-  ".rtkc-page-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:4px}",
+  ".rtkc-page-head{display:flex;align-items:center;gap:14px;margin-bottom:4px}",
+  ".rtkc-page-actions{margin-left:auto;display:flex;align-items:center;gap:10px}",
   ".rtkc-page-titlewrap{display:flex;align-items:center;gap:14px;min-width:0}",
   ".rtkc-page-badge{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;flex:none;background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 14%,transparent);color:var(--dsw-alias-state-business-primary)}",
+  ".rtkc-cliRow{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}",
+  ".rtkc-cliPath{min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;color:var(--dsw-alias-label-tertiary,inherit)}",
   ".rtkc-page-titles{display:flex;flex-direction:column;min-width:0}",
   ".rtkc-page-title{font-size:18px;font-weight:650;margin:0;line-height:1.4}",
   ".rtkc-page-sub{margin:1px 0 0;font-size:12px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-  ".rtkc-updated{font-size:11px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}",
-  // 刷新按钮：hover 才显出边框与底色。常驻边框会让页头看起来比页身还重。
-  ".rtkc-refresh{font:inherit;font-size:12px;padding:4px 12px;border-radius:7px;border:1px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer;transition:background .12s,border-color .12s,color .12s}",
-  ".rtkc-refresh:hover:not(:disabled){background:var(--rtkc-hover);border-color:var(--rtkc-line);color:var(--dsw-alias-label-primary,inherit)}",
+  ".rtkc-updated{font-size:12px;color:var(--dsw-alias-label-tertiary,inherit);white-space:nowrap}",
+  // 刷新按钮照设计稿 D 的 `.btn btn-secondary btn-sm`：28px 高、常驻 0.5px 描边，
+  // 页头右侧要能一眼看出这是可点的动作，而不是一行灰字。
+  ".rtkc-refresh{font:inherit;font-size:12px;box-sizing:border-box;height:28px;line-height:1;padding:0 10px;border-radius:6px;border:.5px solid var(--rtkc-line);background:var(--rtkc-surface);color:var(--dsw-alias-label-secondary,inherit);cursor:pointer;transition:background .12s,border-color .12s,color .12s}",
+  ".rtkc-refresh:hover:not(:disabled){background:var(--rtkc-hover);border-color:var(--dsw-alias-border-l3,rgba(127,127,127,.42));color:var(--dsw-alias-label-primary,inherit)}",
   ".rtkc-refresh:disabled{opacity:.55;cursor:default}",
   // 控件区：上行形态（换页签换的是**整种数据**）、下行时间（换的是同一种数据的一段）。
   // 两行之间留 12px、组内 8px：页签与时间栏不是同一级控件，挤成一行时用户会以为切页签
@@ -183,16 +200,15 @@ const CARD_CSS = [
   // 时间栏：一组「标签 + 两个下拉」，自己一块浅底，与页签在视觉上分成两件不同的事。
   // 标签与下拉之间 8px、下拉之间 8px，两侧内边距不对称（左 10 右 6）——右边紧贴下拉的
   // 圆角，留同样的 10px 会让整块看起来右侧空了一块。
-  ".rtkc-timebar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:5px 6px 5px 10px;border-radius:9px;background:var(--rtkc-tile);border:1px solid var(--rtkc-line)}",
-  ".rtkc-timebar-label{font-size:11px;line-height:1.5;letter-spacing:.06em;text-transform:uppercase;color:var(--dsw-alias-label-secondary,inherit);opacity:.75;white-space:nowrap}",
-  ".rtkc-select{font:inherit;font-size:12px;line-height:1.5;min-height:28px;padding:4px 8px;border-radius:6px;border:1px solid var(--rtkc-line);background:var(--rtkc-surface);color:var(--dsw-alias-label-primary,inherit);cursor:pointer;transition:border-color .12s,background .12s}",
-  ".rtkc-select:hover{border-color:var(--rtkc-chart-bar);background:var(--rtkc-hover)}",
-  ".rtkc-select:focus-visible{outline:2px solid var(--rtkc-chart-bar);outline-offset:1px}",
+  ".rtkc-timebar{display:flex;flex-wrap:wrap;align-items:center;flex:0 0 auto;gap:8px}",
+  ".rtkc-timebar-label{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary,inherit);white-space:nowrap}",
+  // 时间栏下拉：外观照设计稿 `.select .input`——appearance:none 去掉系统白箭头，
+  // 自绘右侧 8px 折角；28px 高、14px 字、min-width 96px，底色取宿主输入框的 bg-layer-3。
   // 每一块都是卡片：深色主题下只靠间距分块，信息一多就糊成一片。
   // 内边距照设计稿 chart-card 的 16px 18px。
-  ".rtkc-card{padding:16px 18px;border-radius:12px;border:1px solid var(--rtkc-line);background:var(--rtkc-surface)}",
+  ".rtkc-card{padding:16px 18px;border-radius:12px;border:.5px solid var(--rtkc-line);background:var(--rtkc-surface)}",
   ".rtkc-block{margin:0}",
-  ".rtkc-subtitle{font-size:13.5px;font-weight:600;letter-spacing:.02em;color:var(--dsw-alias-label-secondary,inherit);margin:0 0 10px}",
+  ".rtkc-subtitle{font-size:14px;font-weight:600;letter-spacing:.02em;color:var(--dsw-alias-label-primary,inherit);margin:0 0 10px}",
   // KPI：数字大、标签小，卡片之间 10px。hover 时描边亮一档，让人知道这块是可以停下来看的。
   ".rtkc-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:10px}",
   ".rtkc-kpi{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border-radius:9px;background:var(--rtkc-tile);border:1px solid var(--rtkc-line);transition:border-color .12s,transform .12s}",
@@ -209,39 +225,100 @@ const CARD_CSS = [
   //    否则读屏会把同一个数字念两次。
   // 减少动效时**不能删掉动画**：起手的 0 是靠 keyframes 给的，删了动画就只剩
   // `initial-value:0`，数字会永远停在 0。把时长压到 1ms 等价于「直接给终值」。
+  // 洞察页主图 220px（设计稿 D 的标准档；设置卡是 `.rtkc-card-chart` 的 162px 紧凑档）。
   ".rtkc-chart{width:100%;height:220px}",
-  // 「退成柱子」那句说明（`chartSparseNote`）：它原来是灰色小字 `rtkc-note`，和页脚、空窗
-  // 提示同色同号，于是「比率去哪了」这个真问题被读成「没画出来」。这里给它一条独立的琥珀色
-  // 卡片小图：**不能矮于 120px**。ECharts 的 `grid` 上下各留 28/24px 给刻度与轴标签，
-  // 64px 高时绘图区只剩约 10px——真机上表现为「一条横线 + 两个看不见的柱」，
-  // 看着像图坏了。162px 给柱子留出约 80px，两根柱子的高度差才读得出来。
+  // 图头与图例：标题左、图例右；色块 8px。柱子那枚始终在场，折线那枚只在 combo 时补上。
+  ".rtkc-chart-head{display:flex;align-items:center;gap:12px;margin-bottom:10px}",
+  ".rtkc-chart-head .rtkc-subtitle{margin:0}",
+  ".rtkc-chart-legend{margin-left:auto;display:flex;gap:14px;font-size:12px;color:var(--dsw-alias-label-secondary,inherit)}",
+  ".rtkc-chart-legend span{display:flex;align-items:center;gap:6px}",
+  ".rtkc-chart-legend i{width:8px;height:8px;border-radius:2px;display:inline-block;background:var(--rtkc-chart-bar)}",
+  // 设置卡里的那张小图（`.rtkc-card-chart`）是 162px 紧凑档：洞察页的 220px 到了卡片里
+  // 会顶掉字段节奏。ECharts 的 `grid` 上下各留边给刻度与轴标签，64px 时绘图区只剩约 10px
+  // ——真机上表现为「一条横线 + 两个看不见的柱」，看着像图坏了。
   ".rtkc-card-chart{width:100%;height:162px;margin:10px 0 2px}",
   // 语义色点：成功绿 / 跳过黄 / 失败红。语义色在浅色主题下压暗一档（见下方覆盖）。
   // 「最近一次」整行按结局染色：7px 的圆点在一屏数字里太轻，一眼扫过去分不出上一次是成功
   // 还是跳过。左边一条 2px 竖线 + 一层极淡底色，颜色与文字同时在场（不靠颜色单独表意——
   // 色弱用户读到的仍是那行「已跳过 · git status · too-small」）。
-  ".rtkc-recent{display:flex;align-items:center;gap:10px;margin:0;padding:9px 14px;border-radius:8px;border-left:3px solid transparent;background:var(--rtkc-tile)}",
+  ".rtkc-recent{display:flex;align-items:center;gap:10px;margin:0;padding:10px 14px;border-radius:8px;border-left:4px solid transparent;background:var(--rtkc-tile);font-size:14px;line-height:1.5}",
   '.rtkc-recent[data-tone="ok"]{border-left-color:var(--dsw-alias-state-success-primary);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 9%,transparent)}',
   '.rtkc-recent[data-tone="skip"]{border-left-color:var(--dsw-alias-state-warn-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 9%,transparent)}',
   '.rtkc-recent[data-tone="fail"]{border-left-color:var(--dsw-alias-state-error-primary);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent)}',
   // 「最近一次」条内的语气标签：随结局染色（设计稿 .why 的 .w-tone）。
-  ".rtkc-whyTone{flex:none;font-size:11px;font-weight:600;color:var(--dsw-alias-label-secondary,inherit);white-space:nowrap}",
+  ".rtkc-whyTone{flex:none;font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary,inherit);white-space:nowrap}",
   '.rtkc-recent[data-tone="ok"] .rtkc-whyTone{color:var(--dsw-alias-state-success-primary)}',
   '.rtkc-recent[data-tone="skip"] .rtkc-whyTone{color:var(--dsw-alias-state-warn-primary)}',
   '.rtkc-recent[data-tone="fail"] .rtkc-whyTone{color:var(--dsw-alias-state-error-primary)}',
   // 明细区两张表卡之间的间距：rtkc-block 把 section 的 margin 清零后它们原本是贴死的。
   // 表区相对上一块的设计稿节奏是 26px（列 gap 14 补 12）。
   ".rtkc-tables{display:flex;flex-direction:column;gap:14px;margin-top:12px}",
+  // 设计稿 D 的「构成与排名：图 + 全量表」是独立分组标题，位于命令族表之后。
+  ".rtkc-groupHead{margin-top:10px}",
+  ".rtkc-groupHead .rtkc-subtitle{margin:0}",
+  ".rtkc-navCount{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-secondary,inherit);font-variant-numeric:tabular-nums;white-space:nowrap}",
+  ".rtkc-panelSection{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--dsw-alias-label-secondary,inherit)}",
+  ".rtkc-panelSection strong{color:var(--dsw-alias-label-primary,inherit);font-variant-numeric:tabular-nums;font-weight:600}",
+  ".rtkc-tableFoot{display:flex;align-items:center;gap:10px;flex-wrap:wrap}",
+  ".rtkc-expand{appearance:none;border:0;background:transparent;color:var(--dsw-alias-state-business-primary);font:inherit;font-size:12px;padding:0;cursor:pointer}",
+  ".rtkc-expand:hover{text-decoration:underline}",
+  ".rtkc-expand:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px;border-radius:2px}",
+  // 跳过原因构成：实心饼 + 右侧图例（前 6 大 + 其余）。饼 240px，图例限高 240 内部滚动。
+  ".rtkc-pieEchartWrap{position:relative;width:100%;min-width:0}",
+  ".rtkc-pieEchart{width:100%;height:320px}",
+  // 图 + 全量表：details 收起时卡内只留图形，展开后给精确值与全量行（表内 300px 滚动）。
+  ".rtkc-card-head{display:flex;align-items:center;gap:12px;margin-bottom:10px}",
+  ".rtkc-card-head .rtkc-subtitle{margin:0}",
+  ".rtkc-total{margin-left:auto;font-size:12px;color:var(--dsw-alias-label-tertiary,inherit);font-variant-numeric:tabular-nums}",
+  ".rtkc-details{border-top:1px solid var(--rtkc-line);margin-top:12px;padding-top:8px}",
+  ".rtkc-details summary{font-size:12px;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer;list-style:none;display:inline-flex;align-items:center;gap:6px;padding:4px 0;border-radius:4px}",
+  ".rtkc-details summary::-webkit-details-marker{display:none}",
+  '.rtkc-details summary::before{content:"▸";color:var(--dsw-alias-label-tertiary,inherit);font-size:10px}',
+  '.rtkc-details[open] summary::before{content:"▾"}',
+  ".rtkc-details summary:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}",
+  ".rtkc-details[open] summary{margin-bottom:8px}",
+  ".rtkc-details .dsu-tblWrap{border:0;border-top:.5px solid var(--rtkc-line);border-radius:0;max-height:300px;overflow:auto}",
+  // 排名比较：12px 圆角轨道、业务色填充、值右对齐；列表全量降序、限高 420px 内部滚动。
+  ".rtkc-hbars{display:flex;flex-direction:column;gap:10px;max-height:420px;overflow-y:auto;margin:2px 0 0}",
+  ".rtkc-hbar{display:grid;grid-template-columns:minmax(0,220px) 1fr 56px;gap:12px;align-items:center;font-size:12px}",
+  ".rtkc-hbName{color:var(--dsw-alias-label-secondary,inherit);font-family:var(--dsw-font-mono,monospace);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+  ".rtkc-hbTrack{height:12px;border-radius:999px;background:var(--rtkc-hover);overflow:hidden}",
+  ".rtkc-hbFill{display:block;height:100%;border-radius:999px;background:var(--rtkc-chart-bar)}",
+  ".rtkc-hbVal{text-align:right;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary,inherit)}",
+  // 明细表照设计稿 .tbl：正文 14px、格 10px 12px、表头/表脚用卡片内层底 `--tile`。
+  // shared 的 DataTable 默认 12px（设置卡那一档），洞察页是阅读面，字号大一档。
+  ".rtkc-page[data-panel] .dsu-tbl{font-size:14px}",
+  // 表头一律单行：命令族表五列里「次数」只有两字，允许折行会变成「次/数」两行，
+  // 既抬高表头又打断对齐。设计稿的表头都是单行。
+  // 背景必须是**不透底**的卡片色叠 tile：只写 `background:var(--rtkc-tile)`（5% 白）
+  // 在 sticky 表头下会透出滚动到下面的行，看起来像两行字压在一起。
+  ".rtkc-page[data-panel] .dsu-tbl th{white-space:nowrap;padding:8px 12px;background-color:var(--rtkc-surface);background-image:linear-gradient(var(--rtkc-tile),var(--rtkc-tile))}",
+  ".rtkc-page[data-panel] .dsu-tbl td{padding:10px 12px}",
+  ".rtkc-page[data-panel] .dsu-tblSticky td:first-child{background:var(--rtkc-surface)}",
+  ".rtkc-page[data-panel] .dsu-tblSticky th:first-child{background-color:var(--rtkc-surface);background-image:linear-gradient(var(--rtkc-tile),var(--rtkc-tile))}",
+  ".rtkc-page[data-panel] .dsu-tblFoot{font-size:12px;padding:8px 12px;background:var(--rtkc-tile);color:var(--dsw-alias-label-tertiary,inherit)}",
+
   // 建议区相对上一块的设计稿节奏是 22px（列 gap 14 补 8）；卡内条目纵向 8px 一档
   // （设计稿的建议列就是 gap:8px 的纵向排布），小标题的下距交给 gap 统一管。
   ".rtkc-suggest{margin-top:8px;display:flex;flex-direction:column;gap:8px;align-items:stretch}",
   ".rtkc-suggest .rtkc-subtitle{margin:0}",
+  // 建议条目：一行一张安静的小卡，底色只比页面高半档；语气色只落在 3px 左边线和图标上。
+  // 5 条建议若每条都铺整块 callout 底色，蓝/琥珀会变成五条「警报」，反而看不出哪条更急。
+  ".rtkc-suggestItem{--rtkc-suggest-tone:var(--dsw-alias-state-business-primary);width:100%}",
+  '.rtkc-suggestItem[data-tone="warn"]{--rtkc-suggest-tone:var(--dsw-alias-state-warn-primary)}',
+  '.rtkc-suggestItem[data-tone="muted"]{--rtkc-suggest-tone:var(--dsw-alias-label-tertiary)}',
+  ".rtkc-suggestItem .dsu-callout{width:100%;box-sizing:border-box;background:var(--rtkc-tile);border:.5px solid var(--rtkc-line);border-left:3px solid var(--rtkc-suggest-tone);border-radius:8px;padding:9px 12px;font-size:13px;line-height:1.6;color:var(--dsw-alias-label-primary,inherit)}",
+  '.rtkc-suggestItem[data-tone="muted"] .dsu-callout{color:var(--dsw-alias-label-secondary,inherit)}',
+  // 建议条目还有自己的 muted 档（启用但未命中），所以图标按 --rtkc-suggest-tone 收一次；
+  // 普通 Callout（图表稀疏提示等）直接用 shared 的语义色，不再在本页叠一层兜底。
+  ".rtkc-page[data-panel] .rtkc-suggestItem .dsu-calloutIcon{width:16px;height:16px;border-radius:999px;background:color-mix(in srgb,var(--rtkc-suggest-tone) 16%,transparent);color:var(--rtkc-suggest-tone);margin-top:2px}",
+  // 页级空窗：设计稿 D 的页级接管用 36px 纵向内边距（与块级的 26px 区分开）。
+  ".rtkc-emptyPage .dsu-empty{padding:36px 26px}",
   // 表格：表头小一号大写、行 hover 提亮、首列吃余宽、数值列带量条。
   //
   // 数值格：细量条 + 数字**同一行**并排。量条压在数字上方时行高会被撑到 60px。
   // 建议：卡片式，左边框按严重度换色（warn 用跳过黄，不用失败红——它是建议，不是错误）。
-  ".rtkc-empty{text-align:center;padding:28px 16px;color:var(--dsw-alias-label-secondary,inherit)}",
-  ".rtkc-footnote{margin:8px 0 0;color:var(--dsw-alias-label-secondary,inherit);opacity:.75;font-size:11px}",
+  ".rtkc-footnote{margin:8px 0 0;color:var(--dsw-alias-label-tertiary,inherit);font-size:12px;line-height:1.7}",
   // 浅色主题下的语义色：深色值在浅底上偏荧光，压暗一档才看得清又不刺眼。
   // 判据必须跟着宿主的 `body[data-ds-dark-theme]`（真机 body 上只有这一个属性，
   // 没有 `data-theme`），写成 `[data-theme="light"]` 会永不匹配、浅色下仍是深色那套。
@@ -296,14 +373,19 @@ function numberField(props: {
  * 「这台机器上没装」，该给安装命令；`supported === false` 是「装了但太旧」，该说升到几。
  * `rtkVersion` 分不开它们——探测失败也交 `null`，所以判据取 `supported`。
  */
-function RtkHint(props: { t: Translate; status: StatsStatus | undefined }): ReactNode {
-  const { t, status } = props;
+function RtkHint(props: {
+  t: Translate;
+  status: StatsStatus | undefined;
+  detecting: boolean;
+  onDetect: () => void;
+}): ReactNode {
+  const { t, status, detecting, onDetect } = props;
   const hint = hintOf(status);
   if (hint === undefined) {
     return null;
   }
-  // 三支各自一句话，且就绪支用中性样式：它要说的是「已装、版本够」，
-  // 用警告底色会让正常状态看起来像出了问题（那是 missing/too-old 才该有的样子）。
+  // 三支各自一句话：缺失与过旧是错误/警告，就绪支不再是裸 hint——设计稿 C 决定
+  // 「徽章 + 检测」与 ocrReview 的状态件对齐，手动检测补足 5s 轮询；四态文案仍按现码口径。
   let node: ReactNode;
   if (hint.kind === "missing") {
     node = createElement(Callout, { tone: "err" }, t("rtkMissingHint"));
@@ -311,11 +393,32 @@ function RtkHint(props: { t: Translate; status: StatsStatus | undefined }): Reac
     const tooOld = t("rtkTooOldHint", { version: hint.version, minimum: MIN_RTK_VERSION });
     node = createElement(Callout, { tone: "warn" }, tooOld);
   } else {
-    // 就绪支保持中性：它要说的是「已装、版本够」，上色会让正常状态看起来像出了问题。
     node = createElement(
-      "p",
-      { className: "dsu-hint" },
-      t("rtkReadyHint", { version: hint.version, path: hint.path }),
+      "div",
+      { className: "rtkc-cliRow" },
+      createElement(
+        Badge,
+        { tone: "ok", dot: "ok", field: "rtk-cli-badge" },
+        t("rtkReadyBadge", { version: hint.version }),
+      ),
+      createElement(
+        "span",
+        {
+          className: "rtkc-cliPath",
+          title: t("rtkReadyHint", { version: hint.version, path: hint.path }),
+        },
+        hint.path,
+      ),
+      createElement(
+        "button",
+        {
+          type: "button",
+          className: "dsu-btn dsu-btnSm",
+          disabled: detecting,
+          onClick: onDetect,
+        },
+        t("rtkDetect"),
+      ),
     );
   }
   return node;
@@ -436,6 +539,7 @@ function CardChart(props: { t: Translate; overview: StatsOverview | undefined })
         : {
             kind: "bars",
             labels: [t("todayPrefix"), t("todayPipe")],
+            countAxisName: t("kpiSaved"),
             bar: {
               name: t("kpiSaved"),
               values: [overview.today.prefix.savedTokens, overview.today.pipe.savedTokens],
@@ -450,12 +554,25 @@ function CardChart(props: { t: Translate; overview: StatsOverview | undefined })
           },
     [overview, t],
   );
-  const { containerRef } = useChart(spec);
-  // 两形态都还没省下任何东西时不画空图：两根零高度的柱子看起来像「画坏了」。
+  const { containerRef, failed } = useChart(spec);
+  // 两形态都还没跑过命令时不画空图：两根零高度的柱子看起来像「画坏了」。
+  // 判据跟 KPI 的 idle 口径同源（commands），不看 savedTokens：命令跑过但收益为 0
+  // 是「今天没有省下钱」，不是「今天没有数据」。
   const empty =
     overview === undefined ||
-    (overview.today.prefix.savedTokens === 0 && overview.today.pipe.savedTokens === 0);
-  return empty ? null : createElement("div", { className: "rtkc-card-chart", ref: containerRef });
+    (overview.today.prefix.commands === 0 && overview.today.pipe.commands === 0);
+  if (empty) {
+    return null;
+  }
+  // chunk 没加载起来时不能留一个空白图位：图位空着与「数据为 0」在视觉上同义，
+  // 用户会以为统计已读而图坏了。这里落一句原因（与 Insights 页同一条文案）。
+  return failed
+    ? createElement(
+        "p",
+        { className: "rtkc-note" },
+        t("loadFailed", { reason: t("loadFailedChart") }),
+      )
+    : createElement("div", { className: "rtkc-card-chart", ref: containerRef });
 }
 
 /**
@@ -526,7 +643,8 @@ function StatsSection(props: {
           "button",
           {
             type: "button",
-            className: "rtkc-actions",
+            className: "dsu-btn dsu-btnSm dsu-btnDanger",
+            disabled: overview === undefined || !overviewHasData(overview),
             onClick: () => {
               setConfirming(true);
             },
@@ -545,12 +663,11 @@ function StatsSection(props: {
     : null;
   return createElement(
     Section,
-    { title: t("statusSection") },
+    { title: t("statusSection"), actions: reset },
     createElement(StatsSummaryLine, { t, overview }),
     // 两柱图只吃 overview 已经带回来的数：卡上多一条请求就是每次开设置都多付一次扫描。
     createElement(CardChart, { t, overview }),
     createElement("p", { className: "rtkc-note" }, t("statsNote")),
-    reset,
     dialog,
   );
 }
@@ -702,16 +819,6 @@ function cardModeFields(props: FieldSectionProps): ReactNode[] {
     { value: FORM_MODES[2], label: t("formPipeOnly") },
   ];
   return [
-    toggleField({
-      label: t("enabledLabel"),
-      hint: t(enabledHintKeyOf(view.forms)),
-      field: "enabled",
-      checked: view.enabled,
-      editable: writable,
-      onChange: (next) => {
-        setField("enabled", next);
-      },
-    }),
     createElement(SelectField, {
       label: t("formsLabel"),
       ...splitHint(t("formsHint")),
@@ -888,10 +995,13 @@ function cardNumberFields(props: FieldSectionProps): ReactNode[] {
 function useStatsRefresh(reader: StatsReader | undefined): {
   readonly overview: StatsOverview | undefined;
   readonly status: StatsStatus | undefined;
+  readonly detecting: boolean;
+  readonly detectStatus: () => Promise<void>;
   readonly resetStats: () => Promise<void>;
 } {
   const [overview, setOverview] = useState<StatsOverview | undefined>(undefined);
   const [status, setStatus] = useState<StatsStatus | undefined>(undefined);
+  const [detecting, setDetecting] = useState(false);
   const refreshing = useRef(false);
 
   const refresh = useCallback(async (): Promise<void> => {
@@ -904,14 +1014,13 @@ function useStatsRefresh(reader: StatsReader | undefined): {
         setOverview(await reader.overview());
       } catch {
         // 读面报错不清空已显示的数字：保留上一次成功的读数，比闪成「未连接」更少误导。
-        setOverview(undefined);
       }
       // 状态与统计各读各的：一条失败不该把另一条也抹掉（统计读面缺席时压缩照常，
       // 而 rtk 装没装正是用户最需要看到的那一句）。
       try {
         setStatus(await reader.status());
       } catch {
-        setStatus(undefined);
+        // 同上：轮询失败不代表 rtk 被卸载，保留上一份状态直到下一次成功读到。
       }
     } finally {
       refreshing.current = false;
@@ -933,6 +1042,24 @@ function useStatsRefresh(reader: StatsReader | undefined): {
     };
   }, [refresh]);
 
+  /**
+   * 手动检测只读 status（fs 探测，不起 rtk 进程），不捎带 overview：
+   * 轮询失败时用户点「检测」要的是「到底装没装、版本够不够」，不该顺带再扫一遍统计表。
+   */
+  const detectStatus = useCallback(async (): Promise<void> => {
+    if (reader === undefined) {
+      return;
+    }
+    setDetecting(true);
+    try {
+      setStatus(await reader.status());
+    } catch {
+      // 探测失败保留上一份状态：按钮的可重复点击本身就是反馈，不把已显示的就绪行抹掉。
+    } finally {
+      setDetecting(false);
+    }
+  }, [reader]);
+
   const resetStats = useCallback(async (): Promise<void> => {
     if (reader === undefined) {
       return;
@@ -944,7 +1071,7 @@ function useStatsRefresh(reader: StatsReader | undefined): {
     }
   }, [reader]);
 
-  return { overview, status, resetStats };
+  return { overview, status, detecting, detectStatus, resetStats };
 }
 
 function RtkCard(props: CardSlotProps): ReactNode {
@@ -954,7 +1081,7 @@ function RtkCard(props: CardSlotProps): ReactNode {
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const { statsRemote: reader, t } = props;
-  const { overview, status, resetStats } = useStatsRefresh(reader);
+  const { overview, status, detecting, detectStatus, resetStats } = useStatsRefresh(reader);
   // 越界集与重置信号由 shared 的 `useInvalidFields()` 提供（多个消费仓共用同一套判定）。
   const invalid = useInvalidFields();
   const { blocked, fields: invalidFields, resetToken, reportInvalid } = invalid;
@@ -1009,19 +1136,40 @@ function RtkCard(props: CardSlotProps): ReactNode {
     },
   });
 
+  const enabledToggle = createElement(SectionToggle, {
+    field: "enabled",
+    label: t("enabledLabel"),
+    checked: view.enabled,
+    disabled: !writable,
+    onChange: (next: boolean) => {
+      setField("enabled", next);
+    },
+  });
+  // 计数跟着 `CardFields` 的实际投影走：`draftFields` 每次返回完整的一枚对象，字段增减只改那一处。
+  // 先算成局部量，避免 createElement 参数里的嵌套调用超过 lint 上限。
+  const switchFieldCount = t("fieldCount", { count: String(Object.keys(view).length) });
   return createElement(
     CardForm,
     null,
-    createElement("h2", null, t("cardTitle")),
+    // 宿主 settings.section 的标题由左侧选中项承担；卡内不画 h1/h2 页头，只留 Section 小标题。
     // 引导行在说明之前：rtk 不在 PATH 时下面所有开关都不会有效果，先说这件事。
-    createElement(RtkHint, { t, status }),
-    createElement("p", { className: "rtkc-note" }, t("saveHint")),
+    createElement(RtkHint, {
+      t,
+      status,
+      detecting,
+      onDetect: () => {
+        void detectStatus();
+      },
+    }),
     // 直接把 resetStats 交下去：确认弹窗要等它真的清完才关，包一层 void 就丢了那个 promise。
     createElement(StatsSection, { t, reader, overview, onReset: resetStats }),
     createElement(
       Section,
-      // 计数徽章照设计稿的「改写开关 · 11 字段」：字段增减时这一位要跟着改。
-      { title: t("switchSection"), count: t("fieldCount", { count: "11" }) },
+      {
+        title: t("switchSection"),
+        count: switchFieldCount,
+        toggle: enabledToggle,
+      },
       cardModeFields({ t, view, writable, setField, resetToken, reportInvalid }),
       cardFilterFields({ t, view, writable, setField, resetToken, reportInvalid }),
       cardNumberFields({ t, view, writable, setField, resetToken, reportInvalid }),
@@ -1070,6 +1218,98 @@ function PanelIconSlot(props: { readonly size: number; readonly active: boolean 
   return createElement(RtkPanelIcon, { size: props.size, active: props.active });
 }
 
+/** 侧栏读数压缩：百万给 M、千给 k，其余原样；三段早退，不用嵌套三元。 */
+function shortTokensOf(saved: number): string {
+  if (saved >= 1_000_000) {
+    return `${(saved / 1_000_000).toFixed(1)}M`;
+  }
+  if (saved >= 1000) {
+    return `${(saved / 1000).toFixed(1)}k`;
+  }
+  return String(saved);
+}
+
+/** 导航行尾的今日节省量：非交互，只在侧栏展开时显示。 */
+function RtkTrailing(props: {
+  readonly t: Translate;
+  readonly reader: StatsReader | undefined;
+  readonly wide: boolean;
+}): ReactNode {
+  const [saved, setSaved] = useState<number | undefined>(undefined);
+  useEffect(() => {
+    let alive = true;
+    const read = async (): Promise<void> => {
+      if (props.reader === undefined) {
+        return;
+      }
+      try {
+        const overview = await props.reader.overview();
+        if (alive) {
+          setSaved(overview.today.prefix.savedTokens + overview.today.pipe.savedTokens);
+        }
+      } catch {
+        // 导航尾只是附加信息：读不到就保持上一次的读数或空着。
+      }
+    };
+    void read();
+    return () => {
+      alive = false;
+    };
+  }, [props.reader]);
+  if (!props.wide || saved === undefined || saved <= 0) {
+    return null;
+  }
+  return createElement("span", { className: "rtkc-navCount" }, shortTokensOf(saved));
+}
+
+/** 会话侧栏的 rtk 小节：只读今日概览，不重复 Insights 页的明细。 */
+function RtkPanelSection(props: {
+  readonly reader: StatsReader | undefined;
+  readonly t: Translate;
+}): ReactNode {
+  const [overview, setOverview] = useState<
+    Awaited<ReturnType<StatsReader["overview"]>> | undefined
+  >(undefined);
+  useEffect(() => {
+    let alive = true;
+    const read = async (): Promise<void> => {
+      if (props.reader === undefined) {
+        return;
+      }
+      try {
+        const value = await props.reader.overview();
+        if (alive) {
+          setOverview(value);
+        }
+      } catch {
+        // 侧栏小节可缺席，读不到就不画。
+      }
+    };
+    void read();
+    return () => {
+      alive = false;
+    };
+  }, [props.reader]);
+  if (overview === undefined) {
+    return null;
+  }
+  const saved = overview.today.prefix.savedTokens + overview.today.pipe.savedTokens;
+  const attempts = overview.today.prefix.attempts + overview.today.pipe.attempts;
+  const savedLine = createElement(
+    "span",
+    null,
+    `${props.t("kpiSaved")} `,
+    createElement("strong", null, String(saved)),
+  );
+  const attemptsLine = createElement(
+    "span",
+    null,
+    `${props.t("kpiAttemptsPrefix")} `,
+    createElement("strong", null, String(attempts)),
+  );
+  return createElement("div", { className: "rtkc-panelSection" }, savedLine, attemptsLine);
+}
+
 /** 客户端上下文里本模块用到的那几位（方法子集投影：官方的服务类带私有字段，替身满足不了）。 */
 interface ClientCtx {
   effect: (run: () => () => void, label: string) => void;
@@ -1085,7 +1325,8 @@ interface ClientCtx {
   get?: (name: string, strict?: boolean) => unknown;
 }
 
-function apply(ctx: ClientCtx): void {
+/** 样式只装一次；拆成独立函数是 apply 的行数上限（129 行里这一段就占十行）。 */
+function installStyles(ctx: ClientCtx): void {
   ctx.effect(() => {
     const disposeShared = ensureCardUiCss();
     const tag = document.createElement("style");
@@ -1097,6 +1338,10 @@ function apply(ctx: ClientCtx): void {
       disposeShared();
     };
   }, "rtk-card: styles");
+}
+
+function apply(ctx: ClientCtx): void {
+  installStyles(ctx);
 
   // 本条目的共享表单：条目 id == cordis.patch.yml 里的裸 id `rtk`（settings 命名空间即条目 id），
   // 与 host 侧隐式注册的命名空间同源，故直接复用 NS。表单生命周期归 provider。
@@ -1219,6 +1464,31 @@ function apply(ctx: ClientCtx): void {
         label: () => t("panelLabel"),
       },
       PanelIconSlot,
+    ),
+  );
+
+  ctx.slots.inject("sidebar.panellist.trailing", () =>
+    ctx.slots.register(
+      {
+        name: "sidebar.panellist.trailing",
+        id: PANEL_ID,
+        order: PANEL_ORDER,
+        inject: panelInject,
+      },
+      RtkTrailing,
+    ),
+  );
+
+  ctx.slots.inject("conversation.session.panel.section", () =>
+    ctx.slots.register(
+      {
+        name: "conversation.session.panel.section",
+        id: "rtk-stats",
+        order: 100,
+        label: () => t("panelLabel"),
+        inject: panelInject,
+      },
+      RtkPanelSection,
     ),
   );
 }

@@ -29,6 +29,8 @@ export interface ChartSpec {
   readonly labels: readonly string[];
   /** 柱序列；`combo` 下是第一根柱。 */
   readonly bar: ChartSeries;
+  /** 左轴名（设计稿 renderMain 的「次数」）；由入口按界面语言给，chunk 不写死中文。 */
+  readonly countAxisName: string;
   /** `combo` 的折线序列；`bars` 下不传。 */
   readonly line?: ChartSeries;
   /** `[柱, 折线]` 两个颜色（`bars` 只用第一个）。 */
@@ -49,9 +51,48 @@ export interface ChartSpec {
   readonly compact?: boolean;
 }
 
+/** 饼图一片：名字就是原因原文，值是该原因的命中次数。 */
+export interface PieSlice {
+  readonly name: string;
+  readonly value: number;
+  /** 超过 40 类时聚合出来的「其他」用弱色收尾，不参与类别色循环。 */
+  readonly muted?: boolean;
+}
+
+/** 设计稿 `renderPie()` 的饼图规格：不是环形，前 6 大片外置标签，右侧图例滚动分页。 */
+export interface PieSpec {
+  readonly kind: "pie";
+  readonly slices: readonly PieSlice[];
+  /** 类别色序列：业务 → chart-tools → chart-messages → warn → success-secondary → error-secondary。 */
+  readonly colors: readonly string[];
+  readonly textColor: string;
+  /** 片外标签文字色（设计稿 `renderPie()` 取 `--t2`，与图例同一档）。 */
+  readonly labelColor: string;
+  readonly tooltipBg: string;
+  readonly tooltipText: string;
+  /** tooltip 描边（设计稿取 `--l2`）；标签引导线取 `--t3`。 */
+  readonly gridColor: string;
+  readonly lineColor: string;
+  /** 扇区之间的 1px 缝取卡片底色，不能取页面底色。 */
+  readonly cardColor: string;
+  /** 图例翻页箭头（业务色）与非当前页箭头。 */
+  readonly pageColor: string;
+  readonly pageInactiveColor: string;
+  readonly mutedColor: string;
+  readonly formatTooltip: (slice: {
+    readonly name: string;
+    readonly value: number;
+    readonly percent: number;
+  }) => string;
+  readonly formatLegend: (slice: PieSlice) => string;
+}
+
+/** 两种图的规格：主图（柱/组合）与饼图共用一条挂载管线。 */
+export type ChartInput = ChartSpec | PieSpec;
+
 /** 挂上去之后的把手：更新数据 / 拆掉。 */
 export interface ChartHandle {
-  readonly update: (spec: ChartSpec) => void;
+  readonly update: (spec: ChartInput) => void;
   readonly dispose: () => void;
   /** 容器尺寸变化后重算画布（观察器在入口侧，chunk 只认这把钥匙）。 */
   readonly resize: () => void;
@@ -60,4 +101,6 @@ export interface ChartHandle {
 /** 图表块的导出面（chunk 侧实现，入口侧按这个形状用）。 */
 export interface ChartModule {
   readonly mountChart: (container: HTMLElement, spec: ChartSpec) => ChartHandle;
+  /** 饼图与柱图同在一个延迟 chunk；两者都注册才能共用一趟下载。 */
+  readonly mountPie: (container: HTMLElement, spec: PieSpec) => ChartHandle;
 }

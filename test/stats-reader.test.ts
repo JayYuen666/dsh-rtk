@@ -145,6 +145,7 @@ function insightsOf(request: InsightsRequest): Record<string, unknown> {
       savingsPct: 80,
       coveragePct: 20,
       successPct: 50,
+      skipped: 2,
       latencyAvgMs: 30,
       latencyMaxMs: 90,
     },

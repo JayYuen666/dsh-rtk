@@ -10,6 +10,7 @@ import type {
   InsightsRequest,
   LastEvent,
   SeriesPoint,
+  StatsOverview,
   Suggestion,
   Totals,
 } from "./insights-shape.ts";
@@ -105,15 +106,17 @@ export function savingsValuesOf(series: readonly SeriesPoint[]): readonly number
  * bash 调用，但分子是压成的次数）。共用一句话会把两个不同的比率说成同一个指标。
  */
 export type KpiLabelKey =
-  | "kpiBashCalls"
-  | "kpiAttemptsPrefix"
-  | "kpiAttemptsPipe"
-  | "kpiSucceededPrefix"
-  | "kpiSucceededPipe"
-  | "kpiCoveragePrefix"
-  | "kpiCoveragePipe"
+  | "kpiRewriteCount"
+  | "kpiCompressedCount"
+  | "kpiTrigger"
+  | "kpiTriggerHint"
   | "kpiSaved"
-  | "kpiSavings";
+  | "kpiSavings"
+  | "kpiAverageLatency"
+  | "kpiLatencyHintPrefix"
+  | "kpiLatencyHintPipe"
+  | "kpiSkipped"
+  | "kpiSkippedHint";
 
 /** 一格的涨跌标注：方向只决定着色，文案由调用方按粒度拼好（较前一日 ↑12%）。 */
 export interface KpiDelta {
@@ -124,7 +127,11 @@ export interface KpiDelta {
 export interface KpiRow {
   readonly key: string;
   readonly labelKey: KpiLabelKey;
+  /** 数值下方的一行事实说明（设计稿的 `k-sub`）；与 `delta` 二选一。 */
+  readonly subKey?: KpiLabelKey | undefined;
   readonly value: string;
+  /** 单位后缀（`%` / `k` / `ms`）：设计稿里单位比数值小一档，单独交给 KpiTile。 */
+  readonly unit?: string | undefined;
   /** 窗口内最后一个桶对前一个桶的涨跌（序列不足两桶/前置为 0/持平时缺省）。 */
   readonly delta?: KpiDelta;
   /**
@@ -143,38 +150,64 @@ export interface KpiRow {
  * 分母为 0 时覆盖率给 `0%` 而不是 `—`：那是「一次都没试过」，不是「不知道」。六格两种形态
  * 一一对齐，唯中间三格的文案与语义按形态换（见 `KpiLabelKey`）。
  */
+/** 把格式化串拆成「数值 + 小号单位」：设计稿 `.k-value small` 只给单位降一档。 */
+type KpiCell = Pick<KpiRow, "value" | "unit">;
+function kpiPctCell(raw: string): KpiCell {
+  return { value: raw.slice(0, -1), unit: "%" };
+}
+function kpiTokenCell(raw: string): KpiCell {
+  const unit = raw.at(-1);
+  return unit === "k" || unit === "M" ? { value: raw.slice(0, -1), unit } : { value: raw };
+}
+function kpiDurationCell(raw: string): KpiCell {
+  const [value = raw, unit] = raw.split(" ");
+  return unit === undefined ? { value } : { value, unit };
+}
+
+/**
+ * 洞察页 KPI 六格：改写/压缩次数、触发率、节省 token、节省率、平均耗时、跳过次数。
+ * @param totals - 窗口内总量
+ * @param form - prefix 或 pipe，只影响第一格的词与耗时说明
+ * @returns 六项按设计稿顺序排列
+ */
 export function kpiRowsOf(totals: Totals, form: InsightsForm): readonly KpiRow[] {
   const prefix = form === "prefix";
-  const rows: KpiRow[] = [
-    // 前三格是**计数**，写个位原文；`formatTokens` 会把 1500 写成 `1.5k`，而调用次数是精确
-    // 可数的，折成近似值等于把「1500 次」说成「1500 上下」。
+  // 触发率 = 真正发出改写/命中 filter 的次数 / 全部 bash 调用。设计稿把「改写次数」
+  // 与「触发率」分成两格：前者是成功数，后者是「有多少调用进入了这条链路」。
+  const triggerPct = totals.bashCalls === 0 ? 0 : (totals.attempts / totals.bashCalls) * 100;
+  return [
     {
-      key: "bashCalls",
-      labelKey: "kpiBashCalls",
-      value: String(totals.bashCalls),
-      count: totals.bashCalls,
-    },
-    {
-      key: "attempts",
-      labelKey: prefix ? "kpiAttemptsPrefix" : "kpiAttemptsPipe",
-      value: String(totals.attempts),
-      count: totals.attempts,
-    },
-    {
-      key: "succeeded",
-      labelKey: prefix ? "kpiSucceededPrefix" : "kpiSucceededPipe",
+      key: "rewrites",
+      labelKey: prefix ? "kpiRewriteCount" : "kpiCompressedCount",
       value: String(totals.compressed),
       count: totals.compressed,
     },
     {
-      key: "coverage",
-      labelKey: prefix ? "kpiCoveragePrefix" : "kpiCoveragePipe",
-      value: formatPct(totals.coveragePct),
+      key: "trigger",
+      labelKey: "kpiTrigger",
+      subKey: "kpiTriggerHint",
+      ...kpiPctCell(formatPct(triggerPct)),
     },
-    { key: "saved", labelKey: "kpiSaved", value: formatTokens(totals.savedTokens) },
-    { key: "savings", labelKey: "kpiSavings", value: formatPct(totals.savingsPct) },
+    { key: "saved", labelKey: "kpiSaved", ...kpiTokenCell(formatTokens(totals.savedTokens)) },
+    { key: "savings", labelKey: "kpiSavings", ...kpiPctCell(formatPct(totals.savingsPct)) },
+    {
+      key: "latency",
+      labelKey: "kpiAverageLatency",
+      subKey: prefix ? "kpiLatencyHintPrefix" : "kpiLatencyHintPipe",
+      ...kpiDurationCell(
+        totals.attempts > 0 && (totals.latencyAvgMs > 0 || totals.latencyMaxMs > 0)
+          ? formatDuration(totals.latencyAvgMs)
+          : "—",
+      ),
+    },
+    {
+      key: "skipped",
+      labelKey: "kpiSkipped",
+      subKey: "kpiSkippedHint",
+      value: String(totals.skipped),
+      count: totals.skipped,
+    },
   ];
-  return rows;
 }
 
 /**
@@ -298,6 +331,22 @@ export function cardKpiRowsOf(today: {
   });
 }
 
+/**
+ * 设置卡上的“清零统计”有没有东西可清。
+ *
+ * 今日两形态都是 `idle`、旧账本也不存在时，按下它只会走一趟确认弹窗再清一次空库。
+ * 按钮该在那时禁用，让状态与卡片上的「今天还没有记录」一致；旧账本仍算数据——清零
+ * 本来就会连迁移快照一起删掉，不能因为今天没动过就把它锁在库里。
+ *
+ * @param overview - 设置卡的今日概览
+ * @returns 是否存在可清的数据
+ */
+export function overviewHasData(overview: StatsOverview): boolean {
+  const { today, legacy } = overview;
+  const todayHasData = cardKpiRowsOf(today).some((row) => !row.idle);
+  return todayHasData || (legacy !== null && legacy.commands > 0);
+}
+
 /** 可用性文案：`ok` 时不占位，其余情况各有一句话（具体原因由 service 的 `message` 补）。 */
 export type AvailabilityKey = "ok" | "unavailable";
 
@@ -345,7 +394,7 @@ export function dataStartOf(response: { readonly dataStart: string | null }): st
 
 /** 页脚里一条「与 rtk 自己对账」的说明：文案键 + 参数，句子归字典。 */
 export interface RtkSelfLine {
-  readonly messageKey: "rtkSelfFailures" | "rtkSelfOversized" | "rtkSelfRecall";
+  readonly messageKey: "rtkSelfFailures" | "rtkSelfOversized" | "rtkSelfRecall" | "rtkSelfAgree";
   readonly values: Record<string, string>;
 }
 
@@ -377,6 +426,9 @@ export function rtkSelfLinesOf(response: {
   }
   const { parseFailures, recovered, oversized, recallEntries, recallBytes } = response.rtkSelf;
   const lines: RtkSelfLine[] = [];
+  if (parseFailures === 0 && oversized === 0) {
+    lines.push({ messageKey: "rtkSelfAgree", values: {} });
+  }
   if (parseFailures > 0) {
     lines.push({
       messageKey: "rtkSelfFailures",
@@ -412,7 +464,16 @@ export interface LastEventLine {
   readonly tone: LastEventTone;
   readonly family: string;
   readonly reason: string;
-  readonly size: string;
+  /** 事件发生在哪一天：今天的写「今天」，昨天的写「昨天」，更早的写 `MM-DD`。 */
+  readonly when: "today" | "yesterday" | "date";
+  /** 本地 24 小时制 `HH:mm`。 */
+  readonly clock: string;
+  /** `when === "date"` 时用的日期文本（`MM-DD`）。 */
+  readonly dateText: string;
+  /** 量到的节省量/比率/耗时；没量到就不带，模板里那一整段也不会出现。 */
+  readonly saved?: string;
+  readonly pct?: string;
+  readonly latency?: string;
   /** 用哪条模板。两个维度各去掉一段，于是有四条：
    *
    *  - `reason`：改写成功与压缩成功这两支的 reason 只是 `rewritten` / `success`，和左边的
@@ -420,7 +481,13 @@ export interface LastEventLine {
    *  - `size`：改写形态量的是指令本身，没有「输入多少字节」这回事，落库就是 `unknown`。
    *    把它照模板印出来是「输入 unknown」——一个没见过这串字的人只会以为统计坏了。
    *    没量到就整段不印，不要用一个占位词伪装成量到的值。 */
-  readonly templateKey: "whyLast" | "whyLastPlain" | "whyLastNoSize" | "whyLastPlainNoSize";
+  readonly templateKey:
+    | "whyLast"
+    | "whyLastLatency"
+    | "whyLastReasonLatency"
+    | "whyLastPlain"
+    | "whyLastSaved"
+    | "whyLastSavedLatency";
 }
 
 /** 最近一条事件的结局文案键。 */
@@ -445,32 +512,79 @@ function toneOf(status: LastEvent["status"]): LastEventTone {
   return status === "skipped" ? "skip" : "fail";
 }
 
-/** 两个维度各去掉一段：reason 与 status 重复的那两支，以及没量到字节的那一支。 */
-function templateKeyOf(event: LastEvent): LastEventLine["templateKey"] {
-  const plain = event.status === "compressed" || event.status === "rewritten";
-  // 改写形态不量字节（量的是指令），落库恒为 `unknown`：整段省掉，别印成「输入 unknown」。
-  const sized = event.sizeBucket !== "unknown";
-  if (plain) {
-    return sized ? "whyLastPlain" : "whyLastPlainNoSize";
+/** 模板选择只看两件事：这条结局需不需要 reason，以及这次有没有量到节省量与耗时。 */
+function templateKeyOf(props: {
+  readonly plain: boolean;
+  readonly saved: boolean;
+  readonly latency: boolean;
+}): LastEventLine["templateKey"] {
+  if (!props.plain) {
+    return props.latency ? "whyLastReasonLatency" : "whyLast";
   }
-  return sized ? "whyLast" : "whyLastNoSize";
+  if (props.saved) {
+    return props.latency ? "whyLastSavedLatency" : "whyLastSaved";
+  }
+  return props.latency ? "whyLastLatency" : "whyLastPlain";
+}
+
+/** `HH:mm`：固定 24 小时制，不跟系统 locale 走（en 宿主上也不该出现 `2:02 PM`）。 */
+function clockOf(ts: number): string {
+  const date = new Date(ts);
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${hours}:${minutes}`;
+}
+
+/** 事件与「现在」是不是同一个本地日。跨日边界按本地日算，不用毫秒差（夏令时那天会差一小时）。 */
+function whenOf(ts: number, now: number): LastEventLine["when"] {
+  const day = localDayKey(ts);
+  if (day === localDayKey(now)) {
+    return "today";
+  }
+  return day === localDayKey(now - 86_400_000) ? "yesterday" : "date";
+}
+
+/** 非空事件的投影；`lastEventLineOf` 只在这一支里做字段判断。 */
+function lastEventLineOfEvent(event: LastEvent, now: number): LastEventLine {
+  // 0 与缺省都算「没量到」：0 token 不是一条能让人做决定的读数，印出来只会挤掉真正有用的耗时。
+  const saved =
+    event.savedTokens !== undefined && event.savedTokens > 0
+      ? formatTokens(event.savedTokens)
+      : undefined;
+  const pct =
+    saved !== undefined && event.savingsPct !== undefined ? formatPct(event.savingsPct) : undefined;
+  const latency =
+    event.latencyMs !== undefined && event.latencyMs > 0
+      ? formatDuration(event.latencyMs)
+      : undefined;
+  const plain = event.status === "compressed" || event.status === "rewritten";
+  const day = localDayKey(event.ts);
+  return {
+    status: statusKeyOf(event.status),
+    tone: toneOf(event.status),
+    // 空家族/空目录落「unknown」由 service 保证过，这里只兜空串。
+    family: event.commandFamily === "" ? "unknown" : event.commandFamily,
+    reason: event.reason,
+    when: whenOf(event.ts, now),
+    clock: clockOf(event.ts),
+    dateText: day.slice(5),
+    ...(saved === undefined ? {} : { saved }),
+    ...(pct === undefined ? {} : { pct }),
+    ...(latency === undefined ? {} : { latency }),
+    templateKey: templateKeyOf({
+      plain,
+      saved: saved !== undefined,
+      latency: latency !== undefined,
+    }),
+  };
 }
 
 /** 最近一条：`null` 表示窗口内一次都没有（组件显示 `whyNone`）。 */
-export function lastEventLineOf(event: LastEvent | null): LastEventLine | undefined {
-  // 三元而不是早退：`return undefined;` 语句在 `consistent-return` 与 `no-useless-undefined`
-  // 两条规则之间没有合法形态，表达式一次过。
-  return event === null
-    ? undefined
-    : {
-        status: statusKeyOf(event.status),
-        tone: toneOf(event.status),
-        // 空家族/空目录落「unknown」由 service 保证过，这里只兜空串。
-        family: event.commandFamily === "" ? "unknown" : event.commandFamily,
-        reason: event.reason,
-        size: event.sizeBucket,
-        templateKey: templateKeyOf(event),
-      };
+export function lastEventLineOf(
+  event: LastEvent | null,
+  now: number = Date.now(),
+): LastEventLine | undefined {
+  return event === null ? undefined : lastEventLineOfEvent(event, now);
 }
 
 /** 「最近一次」那一块的标题键：两种形态问的不是同一个问题。
@@ -501,7 +615,12 @@ export interface SuggestionLine {
     readonly matches?: number;
     readonly savingsPct?: string;
   };
-  readonly warn: boolean;
+  /**
+   * 三档语气，不是「警告/非警告」两档：
+   * `warn` 是低收益到接近白改，`info` 是普通可优化项，`muted` 是「启用了但没命中」这种
+   * 没有代价、无需动作的观察。三档共用同一行版式，颜色只落在左边线和图标上。
+   */
+  readonly tone: "info" | "warn" | "muted";
 }
 
 /** `params` → 模板参数。百分比先格式化成两位小数：模板里不该出现浮点原始值。 */
@@ -524,13 +643,19 @@ const SUGGESTION_KEYS: Readonly<Record<Suggestion["kind"], SuggestionLine["messa
   "low-yield-command": "suggestLowYieldCommand",
 };
 
-/** 建议 → 行。`severity` 只影响样式，文案里不重复「警告」二字。 */
+/** 建议 → 行。`severity` 只影响语气色，文案里不重复「警告」二字。 */
 export function suggestionLineOf(suggestion: Suggestion): SuggestionLine {
+  let tone: SuggestionLine["tone"] = "info";
+  if (suggestion.kind === "unused-filter") {
+    tone = "muted";
+  } else if (suggestion.severity === "warn") {
+    tone = "warn";
+  }
   return {
     key: suggestion.key,
     messageKey: SUGGESTION_KEYS[suggestion.kind],
     values: valuesOf(suggestion.params),
-    warn: suggestion.severity === "warn",
+    tone,
   };
 }
 

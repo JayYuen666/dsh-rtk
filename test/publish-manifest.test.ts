@@ -176,7 +176,7 @@ describe("宿主依赖的版本形状（升级防线）", () => {
     const bare = peers["@deepseek-ai/dsh"];
     assert.ok(bare !== undefined, "裸 dsh 的 peer 缺失：支持窗口就失去基准了");
     assert.equal(bare, window);
-    // 只比 dsh 家族：@deepseek-ai/schemastery 也有 peer，但它是 ^3.19.0，按自己那条线走。
+    // 只比 dsh 家族：@deepseek-ai/schemastery 也有 peer，但它是 ^3.20.0-alpha.1，按自己那条线走。
     // 按 `@deepseek-ai/` 前缀筛会把它误判成离群。
     const offPolicy = Object.entries(peers)
       .filter(([name, range]) => name.startsWith("@deepseek-ai/dsh") && range !== window)
@@ -185,7 +185,7 @@ describe("宿主依赖的版本形状（升级防线）", () => {
   });
 
   it("engines.node 取宿主自己的地板", () => {
-    assert.equal(manifest.engines?.["node"], ">=24.9.0");
+    assert.equal(manifest.engines?.["node"], "^24.22.3 || >=26.13.1");
   });
 
   it("exports 声明宿主与客户端真正会解析的那三个子路径", () => {

@@ -145,6 +145,11 @@ export interface LastEventRow {
   readonly workdir: string;
   readonly filter: string | null;
   readonly size_bucket: SizeBucket;
+  /** 最近一次落库时量到的节省量；`null`/缺列表示这一形态不量（prefix）。 */
+  readonly saved_tokens?: number | null;
+  readonly savings_pct?: number | null;
+  /** 这一次的耗时；`null`/缺列表示没量到。 */
+  readonly latency_ms?: number | null;
 }
 
 /**
@@ -243,7 +248,8 @@ CREATE TABLE IF NOT EXISTS dsh_potential_filters (
 CREATE TABLE IF NOT EXISTS dsh_last_events (
   id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, form TEXT NOT NULL, status TEXT NOT NULL,
   reason TEXT NOT NULL, command_family TEXT NOT NULL, workdir TEXT NOT NULL,
-  filter TEXT, size_bucket TEXT NOT NULL
+  filter TEXT, size_bucket TEXT NOT NULL,
+  saved_tokens INTEGER, savings_pct REAL, latency_ms INTEGER
 );
 `;
 
@@ -296,8 +302,8 @@ const SQL_PIPE_EVENT_INSERT = `INSERT INTO dsh_pipe_events(ts,day,filter,command
 const SQL_PREFIX_EVENT_INSERT = `INSERT INTO dsh_prefix_events(ts,day,reason,command_family,workdir,latency_ms)
   VALUES(?,?,?,?,?,?)`;
 
-const SQL_LAST_EVENT_INSERT = `INSERT INTO dsh_last_events(ts,form,status,reason,command_family,workdir,filter,size_bucket)
-  VALUES(?,?,?,?,?,?,?,?)`;
+const SQL_LAST_EVENT_INSERT = `INSERT INTO dsh_last_events(ts,form,status,reason,command_family,workdir,filter,size_bucket,saved_tokens,savings_pct,latency_ms)
+  VALUES(?,?,?,?,?,?,?,?,?,?,?)`;
 
 /** 显式取写锁：多 host 同库时"先看再写"必须是原子的（deferred 会让两边都读到旧值）。 */
 const BEGIN_IMMEDIATE = "BEGIN IMMEDIATE";
@@ -472,6 +478,10 @@ interface LastEventWrite {
   readonly workdir: string;
   readonly filter: string | null;
   readonly sizeBucket: string;
+  /** 量到的节省量；没有就不写，读面也不会造一个 0 出来。 */
+  readonly savedTokens?: number | null;
+  readonly savingsPct?: number | null;
+  readonly latencyMs?: number | null;
 }
 
 /**
@@ -491,6 +501,9 @@ function pushLastEvent(ctx: WriteContext, event: LastEventWrite): void {
       event.workdir,
       event.filter,
       event.sizeBucket,
+      event.savedTokens ?? null,
+      event.savingsPct ?? null,
+      event.latencyMs ?? null,
     );
 }
 
@@ -534,6 +547,9 @@ function applyPipeSuccess(
     workdir: record.workdir,
     filter: record.filter,
     sizeBucket: sizeBucketOf(record.originalBytes),
+    savedTokens: record.savedTokens,
+    savingsPct: record.originalTokens > 0 ? (record.savedTokens / record.originalTokens) * 100 : 0,
+    latencyMs: record.latencyMs,
   });
 }
 
@@ -580,6 +596,7 @@ function applyPipeSkip(
     workdir: record.workdir,
     filter: record.filter ?? null,
     sizeBucket: sizeBucketOf(record.originalBytes),
+    latencyMs: record.latencyMs ?? null,
   });
 }
 
@@ -631,6 +648,7 @@ function applyPrefixOutcome(
     workdir: record.workdir,
     filter: null,
     sizeBucket: "unknown",
+    latencyMs: record.latencyMs,
   });
 }
 
@@ -663,6 +681,7 @@ function applyPrefix(ctx: WriteContext, record: PrefixRecord): void {
       workdir: record.workdir,
       filter: null,
       sizeBucket: "unknown",
+      latencyMs: record.latencyMs,
     });
     return;
   }
@@ -1069,11 +1088,35 @@ function createStore(
  * @param options - 入参
  * @returns store
  */
+
+/** 旧库的 `dsh_last_events` 只有八列；「最近一次」要显示时间、耗时与节省量，这三列在旧库上
+ *  由这一次打开补出来。`CREATE TABLE IF NOT EXISTS` 不会给既有表加列，所以迁移必须自己查
+ *  `PRAGMA table_info` 再逐列 `ALTER TABLE`——把新列只写进建表语句，旧用户升级后那三格恒为空。 */
+function ensureLastEventColumns(db: DatabaseFace): void {
+  const names = new Set(
+    db
+      .prepare("PRAGMA table_info(dsh_last_events)")
+      .all<{ readonly name: string }>()
+      .map((column) => column.name),
+  );
+  const columns: readonly (readonly [string, string])[] = [
+    ["saved_tokens", "INTEGER"],
+    ["savings_pct", "REAL"],
+    ["latency_ms", "INTEGER"],
+  ];
+  for (const [name, type] of columns) {
+    if (!names.has(name)) {
+      db.exec(`ALTER TABLE dsh_last_events ADD COLUMN ${name} ${type}`);
+    }
+  }
+}
+
 function prepareStore(db: DatabaseFace, options: OpenInsightsStoreOptions): InsightsStore {
   // WAL 是 rtk 自己给这个库设的模式（`src/core/tracking.rs:2083`），这里再设一次是幂等的：
   // 共用一个文件之后，两个进程的连接参数必须一致，否则我们会在它写的时候拿到 SQLITE_BUSY。
   db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=${String(BUSY_TIMEOUT_MS)};`);
   db.exec(SCHEMA);
+  ensureLastEventColumns(db);
   if (readMeta(db, "schemaVersion") === undefined) {
     writeMeta(db, "schemaVersion", "1");
   }

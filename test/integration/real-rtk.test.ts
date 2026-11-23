@@ -44,6 +44,12 @@ const exec = (): Record<string, unknown> => ({
   signal: new AbortController().signal,
 });
 
+/** 同一个执行上下文，只换命令；用于同一组里逐条探真 CLI。 */
+const execFor = (command: string): Record<string, unknown> => ({
+  ...exec(),
+  arguments: { command },
+});
+
 /** 从 PostToolDecision 里取结果面正文（成功支的 value.stdout.text）。 */
 const stdoutText = (decision: unknown): string => {
   if (typeof decision !== "object" || decision === null) {
@@ -128,6 +134,38 @@ describe("真实 rtk CLI 回路", () => {
     } finally {
       await host.disposeFiber();
     }
+  });
+
+  it("rtk 1.2.1 的工具级前缀仍被改写：cargo +nightly / git --no-pager 都按子命令分家", async () => {
+    const cases = [
+      { command: "cargo +nightly test", family: "cargo test", id: "sess-toolchain" },
+      { command: "git --no-pager log", family: "git log", id: "sess-global-flag" },
+    ] as const;
+    await Promise.all(
+      cases.map(async ({ command, family, id }) => {
+        const subprocess = realSubprocess();
+        const host = await startPrefixHost({ subprocess });
+        try {
+          const shadow = host.withAgent(id);
+          await shadow.execute({ command }, execFor(command));
+          const [spawn] = subprocess.spawns;
+          assert.ok(spawn !== undefined);
+          assert.deepEqual(spawn.argv, ["rtk", "rewrite", command]);
+          assert.equal(host.fake.received.length, 1);
+          const executed = host.fake.received[0] ?? "";
+          assert.ok(executed.startsWith("rtk "), `实际执行的命令是 ${executed}`);
+          assert.ok(executed.includes(command), `实际执行的命令是 ${executed}`);
+          const rewritten = host.prefixRecords.find((record) => record.kind === REWRITTEN_RECORD);
+          assert.ok(rewritten !== undefined, "改写成功要落一条 prefix-rewritten 账");
+          assert.ok(
+            rewritten.families.includes(family),
+            `families=${JSON.stringify(rewritten.families)}`,
+          );
+        } finally {
+          await host.disposeFiber();
+        }
+      }),
+    );
   });
 
   it("真 rtk 的 pipe 过滤结果被采用：正文变短、结论行与 marker 都还在", async () => {

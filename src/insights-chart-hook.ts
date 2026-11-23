@@ -21,8 +21,8 @@
 // 渲染本组件。只依赖 `spec` 的 effect 察觉不到这件事，于是切一次主题图表就留着上一套配色。
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import type { ChartHandle, ChartSpec } from "./insights-chart-spec.ts";
-import { mountChartIn, paletteOf } from "./insights-chart.ts";
+import type { ChartHandle, ChartInput } from "./insights-chart-spec.ts";
+import { mountChartIn, mountPieIn, paletteOf, piePaletteOf } from "./insights-chart.ts";
 
 /** 一个容器上的图：已经挂上的句柄、正在挂的那一趟、以及「这个容器还算不算数」。 */
 interface ChartState {
@@ -40,7 +40,7 @@ interface ChartState {
   /** 容器已经作废（组件卸载或 ref 换节点）：await 回来时用它决定要不要立刻拆掉。 */
   disposed: boolean;
   /** 还没挂上时最近一次要画的规格：让挂上那一刻直接用最新的一份，而不是排队时的那份。 */
-  latest: ChartSpec | undefined;
+  latest: ChartInput | undefined;
 }
 
 const freshState = (disposed: boolean): ChartState => ({
@@ -70,7 +70,24 @@ const pendingOf = (state: ChartState): Promise<ChartHandle | undefined> | undefi
  * @param spec - 调用方给的规格
  * @returns 叠好主题色的规格
  */
-function themedOf(node: HTMLElement, spec: ChartSpec): ChartSpec {
+function themedOf(node: HTMLElement, spec: ChartInput): ChartInput {
+  if (spec.kind === "pie") {
+    const palette = piePaletteOf(node);
+    return {
+      ...spec,
+      colors: palette.colors,
+      textColor: palette.textColor,
+      labelColor: palette.labelColor,
+      tooltipBg: palette.tooltipBg,
+      tooltipText: palette.tooltipText,
+      gridColor: palette.gridColor,
+      lineColor: palette.lineColor,
+      cardColor: palette.cardColor,
+      pageColor: palette.pageColor,
+      pageInactiveColor: palette.pageInactiveColor,
+      mutedColor: palette.mutedColor,
+    };
+  }
   const palette = paletteOf(node);
   return {
     ...spec,
@@ -82,6 +99,11 @@ function themedOf(node: HTMLElement, spec: ChartSpec): ChartSpec {
   };
 }
 
+/** 两种图走同一条挂载管线，只有 chunk 内的装配函数不同。 */
+async function mountIn(node: HTMLElement, spec: ChartInput): Promise<ChartHandle | undefined> {
+  return spec.kind === "pie" ? mountPieIn(node, spec) : mountChartIn(node, spec);
+}
+
 /**
  * 已经有图就地更新色与数据；没图就把新规格记下来，等挂上那一刻用最新的一份。
  *
@@ -91,7 +113,7 @@ function themedOf(node: HTMLElement, spec: ChartSpec): ChartSpec {
  * @param node - 本次要画的容器
  * @param spec - 要画的规格
  */
-function updateChart(state: ChartState, node: HTMLElement, spec: ChartSpec): void {
+function updateChart(state: ChartState, node: HTMLElement, spec: ChartInput): void {
   const handle = handleOf(state);
   if (handle === undefined || state.node !== node) {
     state.latest = spec;
@@ -118,7 +140,7 @@ function updateChart(state: ChartState, node: HTMLElement, spec: ChartSpec): voi
 async function attachChart(
   node: HTMLElement,
   state: ChartState,
-  spec: ChartSpec,
+  spec: ChartInput,
   report: (failed: boolean) => void,
 ): Promise<void> {
   if (disposedOf(state)) {
@@ -129,7 +151,7 @@ async function attachChart(
     updateChart(state, node, themed);
     return;
   }
-  state.pending ??= mountChartIn(node, themed);
+  state.pending ??= mountIn(node, themed);
   const pending = pendingOf(state);
   const mounted = await pending;
   if (pendingOf(state) !== pending) {
@@ -163,12 +185,12 @@ async function attachChart(
  * @param spec - 要画的图；`undefined` 表示这一屏暂时没有图
  * @returns 容器 ref 与「这次没画成」的标记
  */
-export function useChart(spec: ChartSpec | undefined): {
+export function useChart(spec: ChartInput | undefined): {
   readonly containerRef: (node: HTMLElement | null) => void;
   readonly failed: boolean;
 } {
   const nodeRef = useRef<HTMLElement | null>(null);
-  const specRef = useRef<ChartSpec | undefined>(spec);
+  const specRef = useRef<ChartInput | undefined>(spec);
   const stateRef = useRef<ChartState>(freshState(false));
   const observerRef = useRef<ResizeObserver | undefined>(undefined);
   const [failed, setFailed] = useState(false);

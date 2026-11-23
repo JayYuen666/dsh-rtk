@@ -448,6 +448,17 @@ describe("readPrefixLedger", () => {
     );
     assert.equal(ledger.workdirs.length, 2);
     assert.notEqual(ledger.dataStart, null);
+    // 最新一行按 timestamp 取，字段名按界面消费的形状投影；期望值来自上面第三行种子。
+    assert.deepEqual(
+      { ...ledger.lastCommand },
+      {
+        ts: new Date(now).toISOString(),
+        input: 300,
+        output: 50,
+        saved: 250,
+        originalCmd: GIT_ORIGINAL,
+      },
+    );
   });
 
   it("窗口外的行不进聚合，但 dataStart 仍看全库", async () => {

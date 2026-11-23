@@ -43,6 +43,7 @@ import type {
 } from "./insights-store.ts";
 import type {
   LedgerCommandRow,
+  LedgerLastCommand,
   LedgerWorkdirRow,
   PrefixLedgerResult,
   RtkLedger,
@@ -59,6 +60,12 @@ const SUGGESTION_WINDOW_DAYS = 30;
 const MIN_SAMPLES = 5;
 /** 低收益判据的节省率门槛（百分比）。 */
 const LOW_YIELD_PCT = 30;
+/** 低到这里就不是「还能再优化」，而是「几乎白改」；建议区用 warn 档把它拎出来。 */
+const WARN_YIELD_PCT = 10;
+
+/** 低收益建议的档位：30% 以下都值得看，10% 以下才配占一整条琥珀色。 */
+const lowYieldSeverityOf = (savingsPct: number): "info" | "warn" =>
+  savingsPct < WARN_YIELD_PCT ? "warn" : "info";
 /** 「未启用但可匹配」的最少命中次数。 */
 const POTENTIAL_MATCHES = 3;
 /** 事件行里表示「压成功」的状态（写面与读面共用这一枚字面量）。 */
@@ -440,6 +447,7 @@ function pipeTotalsOf(days: readonly PipeDayRow[], events: readonly PipeEventRow
     savingsPct: pct(savedTokens, originalTokens),
     coveragePct: pct(compressed, bashCalls),
     successPct: pct(compressed, events.length),
+    skipped: events.filter((event) => event.status === "skipped").length,
     latencyAvgMs: latency.avg,
     latencyMaxMs: latency.max,
   };
@@ -460,6 +468,7 @@ function prefixTotalsOf(days: readonly PrefixDayRow[], ledger: PrefixLedgerResul
   const savedTokens = sum(ledger.days, (day) => day.saved);
   const latencySum = sum(days, (day) => day.latency_ms_sum);
   const latencyCount = sum(days, (day) => day.latency_count);
+  const skipped = sum(days, (day) => day.gate_skips);
   return {
     bashCalls,
     attempts,
@@ -470,6 +479,7 @@ function prefixTotalsOf(days: readonly PrefixDayRow[], ledger: PrefixLedgerResul
     savingsPct: pct(savedTokens, originalTokens),
     coveragePct: pct(rewritten, bashCalls),
     successPct: pct(rewritten, attempts),
+    skipped,
     latencyAvgMs: latencyCount > 0 ? round2(latencySum / latencyCount) : 0,
     latencyMaxMs: 0,
   };
@@ -593,7 +603,7 @@ function pipeFilterSuggestions(
       suggestions.push({
         kind: "low-yield-filter",
         key: name,
-        severity: "info",
+        severity: lowYieldSeverityOf(savingsPct),
         params: {
           filter: name,
           days: windowDays,
@@ -656,7 +666,7 @@ function prefixCommandSuggestions(
       suggestions.push({
         kind: "low-yield-command",
         key: family,
-        severity: "info",
+        severity: lowYieldSeverityOf(savingsPct),
         params: {
           family,
           days: windowDays,
@@ -669,11 +679,33 @@ function prefixCommandSuggestions(
   return suggestions;
 }
 
-/** 把库里那一行投影成回执里的形状。 */
-function lastEventOf(row: LastEventRow | undefined): LastEvent | null {
+/** 把库里那一行投影成回执里的形状。
+ *
+ * prefix 的改写事件在落库时只有耗时（rtk 的节省量是它跑完后才写进自己账本的），所以这里
+ * 允许拿账本最新一行补节省量；只补「同一条改写、同一家族」那一支，避免把别的命令的节省量
+ * 贴到这条事件上。pipe 调用不传这一位，保持原来的投影。
+ */
+function lastEventOf(
+  row: LastEventRow | undefined,
+  lastCommand?: LedgerLastCommand | null,
+): LastEvent | null {
   if (row === undefined) {
     return null;
   }
+  const fallback =
+    lastCommand !== undefined &&
+    lastCommand !== null &&
+    row.form === "prefix" &&
+    row.status === "rewritten" &&
+    commandFamilyOf(lastCommand.originalCmd) === row.command_family
+      ? lastCommand
+      : undefined;
+  const savedTokens = row.saved_tokens ?? fallback?.saved;
+  const savingsPct =
+    row.savings_pct ??
+    (fallback !== undefined && fallback.input > 0
+      ? round2((fallback.saved / fallback.input) * 100)
+      : undefined);
   return {
     ts: row.ts,
     form: row.form,
@@ -683,6 +715,11 @@ function lastEventOf(row: LastEventRow | undefined): LastEvent | null {
     filter: row.filter,
     workdir: row.workdir,
     sizeBucket: row.size_bucket,
+    ...(savedTokens === undefined ? {} : { savedTokens }),
+    ...(savingsPct === undefined ? {} : { savingsPct }),
+    ...(row.latency_ms === null || row.latency_ms === undefined
+      ? {}
+      : { latencyMs: row.latency_ms }),
   };
 }
 
@@ -782,7 +819,7 @@ function prefixResponseOf(shared: SharedRead): InsightsResponse {
     commands,
     workdirs: prefixWorkdirRows(ledger.workdirs),
     skipReasons: reasonRowsOf(store?.readPrefixGateReasons(start) ?? []),
-    lastEvent: lastEventOf(store?.readLastEventOf(FORM_PREFIX)),
+    lastEvent: lastEventOf(store?.readLastEventOf(FORM_PREFIX), ledger.lastCommand),
     suggestions: prefixCommandSuggestions(families, request.rangeDays),
     legacy,
     dataStart: ledger.dataStart,

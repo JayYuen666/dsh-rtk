@@ -12,6 +12,7 @@ import type {
   FormToday,
   LastEvent,
   SeriesPoint,
+  StatsOverview,
   Suggestion,
   Totals,
 } from "../lib/insights-shape.ts";
@@ -36,6 +37,7 @@ import {
   kpiRowsOf,
   lastEventLineOf,
   latencyLabelKeyOf,
+  overviewHasData,
   latencyLineOf,
   rangeKeyOf,
   recentTitleKeyOf,
@@ -85,6 +87,7 @@ const TOTALS: Totals = {
   savingsPct: 80,
   coveragePct: 10,
   successPct: 30,
+  skipped: 7,
   latencyAvgMs: 12,
   latencyMaxMs: 340,
 };
@@ -204,57 +207,96 @@ describe("kpi 行", () => {
     const rows = kpiRowsOf(TOTALS, "pipe");
     assert.deepEqual(
       rows.map((row) => row.key),
-      ["bashCalls", "attempts", "succeeded", "coverage", "saved", "savings"],
+      ["rewrites", "trigger", "saved", "savings", "latency", "skipped"],
     );
-    // 4000 走短写 → `4.0k`；百分比整数不带小数点。这两条都是显示口径，不是数据口径。
+    // 触发率 = attempts / bashCalls = 40 / 120 = 33.3%；4000 走短写 → `4.0k`；
+    // 百分比整数不带小数点；跳过次数取 totals.skipped。期望值独立写死，不从实现反推。
+    // 单位拆到 `unit`，设计稿里单位比数值小一档；数值格只留数字。
     assert.deepEqual(
       rows.map((row) => row.value),
-      ["120", "40", "12", "10%", "4.0k", "80%"],
+      ["12", "33.3", "4.0", "80", "12", "7"],
+    );
+    assert.deepEqual(
+      rows.map((row) => row.unit),
+      [undefined, "%", "k", "%", "ms", undefined],
     );
   });
 
-  it("只有前三格带整数原值：动画目标值不能从短写反解析", () => {
+  it("单位拆分覆盖 M / 无单位 / 未量到耗时 / 0 调用", () => {
+    const million = kpiRowsOf({ ...TOTALS, savedTokens: 1_500_000 }, "pipe");
+    const millionSaved = million.at(2);
+    assert.ok(millionSaved !== undefined);
+    assert.equal(millionSaved.value, "1.5");
+    assert.equal(millionSaved.unit, "M");
+    const zero = kpiRowsOf({ ...TOTALS, savedTokens: 0 }, "pipe");
+    const zeroSaved = zero.at(2);
+    assert.ok(zeroSaved !== undefined);
+    assert.equal(zeroSaved.value, "0");
+    assert.equal(zeroSaved.unit, undefined);
+    // attempts=0 时 hasLatencyOf 为 false，耗时不编造 0 ms，显示占位并且没有单位。
+    const noLatency = kpiRowsOf(
+      { ...TOTALS, attempts: 0, latencyAvgMs: 0, latencyMaxMs: 0 },
+      "pipe",
+    );
+    const noLatencyCell = noLatency.at(4);
+    assert.ok(noLatencyCell !== undefined);
+    assert.equal(noLatencyCell.value, "—");
+    assert.equal(noLatencyCell.unit, undefined);
+    // 试过但没量到耗时（attempts>0、两个延迟都为 0）同样给占位：0 ms 会被读成「很快」。
+    const untimed = kpiRowsOf({ ...TOTALS, attempts: 5, latencyAvgMs: 0, latencyMaxMs: 0 }, "pipe");
+    assert.equal(untimed.at(4)?.value, "—");
+    // bashCalls=0 时触发率的分母不存在，给 0% 而不是 NaN。
+    const noCalls = kpiRowsOf({ ...TOTALS, bashCalls: 0 }, "pipe");
+    const noCallsTrigger = noCalls.at(1);
+    assert.ok(noCallsTrigger !== undefined);
+    assert.equal(noCallsTrigger.value, "0");
+    assert.equal(noCallsTrigger.unit, "%");
+  });
+
+  it("只有次数格带整数原值：动画目标值不能从短写反解析", () => {
     const rows = kpiRowsOf(TOTALS, "pipe");
-    // 前三格是次数（可数整数），组件拿 `count` 做数字滚动；
-    // 后三格是百分比与短写 token，反解析 `4.0k` 回来只是近似，不给 `count`。
+    // 改写次数与跳过次数是可数整数，组件拿 `count` 做数字滚动；
+    // 比率、短写 token 与耗时反解析回来只是近似，不给 `count`。
     assert.deepEqual(
       rows.map((row) => row.count),
-      [120, 40, 12, undefined, undefined, undefined],
+      [12, undefined, undefined, undefined, undefined, 7],
     );
-    // 两项必须能对上：`count` 是动画的落点，`value` 是落定之后要显示的文本。
     assert.equal(String(rows[0]?.count), rows[0]?.value);
-    assert.equal(String(rows[1]?.count), rows[1]?.value);
-    assert.equal(String(rows[2]?.count), rows[2]?.value);
+    assert.equal(String(rows[5]?.count), rows[5]?.value);
   });
 
-  it("中间三格的文案按形态换词：改写说尝试/改写成功，压缩说命中/压缩成功", () => {
+  it("六格文案按形态换词：改写说改写次数，压缩说压缩次数", () => {
     const prefix = kpiRowsOf(TOTALS, "prefix");
     const pipe = kpiRowsOf(TOTALS, "pipe");
     assert.deepEqual(
       prefix.map((row) => row.labelKey),
       [
-        "kpiBashCalls",
-        "kpiAttemptsPrefix",
-        "kpiSucceededPrefix",
-        "kpiCoveragePrefix",
+        "kpiRewriteCount",
+        "kpiTrigger",
         "kpiSaved",
         "kpiSavings",
+        "kpiAverageLatency",
+        "kpiSkipped",
       ],
     );
     assert.deepEqual(
       pipe.map((row) => row.labelKey),
       [
-        "kpiBashCalls",
-        "kpiAttemptsPipe",
-        "kpiSucceededPipe",
-        "kpiCoveragePipe",
+        "kpiCompressedCount",
+        "kpiTrigger",
         "kpiSaved",
         "kpiSavings",
+        "kpiAverageLatency",
+        "kpiSkipped",
       ],
     );
-    // 首末两格两种形态同一个指标，不许跟着改词。
-    assert.equal(prefix[0]?.labelKey, pipe[0]?.labelKey);
+    // 形态只改第一格；其余五格是同一个指标，不许跟着换词。
+    assert.equal(prefix[1]?.labelKey, pipe[1]?.labelKey);
     assert.equal(prefix[5]?.labelKey, pipe[5]?.labelKey);
+    // 触发率与耗时下方的说明同样按形态换。
+    assert.equal(prefix[1]?.subKey, "kpiTriggerHint");
+    assert.equal(prefix[4]?.subKey, "kpiLatencyHintPrefix");
+    assert.equal(pipe[4]?.subKey, "kpiLatencyHintPipe");
   });
 
   it("延迟：改写只报平均，压缩报平均 / 最大", () => {
@@ -405,6 +447,33 @@ describe("设置卡的两格今日摘要", () => {
       [false, true],
     );
   });
+
+  it("今天两形态都没记录且无旧账本时，清零统计没有可清的数据", () => {
+    const empty: StatsOverview = {
+      today: { prefix: today(0, 0, 0), pipe: today(0, 0, 0) },
+      availability: OK_AVAILABILITY,
+      legacy: null,
+    };
+    assert.equal(overviewHasData(empty), false);
+  });
+
+  it("只有尝试过的形态也算有数据，清零仍然有意义", () => {
+    const attempted: StatsOverview = {
+      today: { prefix: { ...today(0, 0, 0), attempts: 3 }, pipe: today(0, 0, 0) },
+      availability: OK_AVAILABILITY,
+      legacy: null,
+    };
+    assert.equal(overviewHasData(attempted), true);
+  });
+
+  it("旧账本仍算数据：清零会连迁移快照一起删掉", () => {
+    const legacy: StatsOverview = {
+      today: { prefix: today(0, 0, 0), pipe: today(0, 0, 0) },
+      availability: OK_AVAILABILITY,
+      legacy: { commands: 2, savedTokens: 0, byForm: { prefix: 2, pipe: 0 }, byFilter: {} },
+    };
+    assert.equal(overviewHasData(legacy), true);
+  });
 });
 
 describe("可用性与数据起始", () => {
@@ -480,10 +549,10 @@ describe("页脚的 rtk 自账对账", () => {
     assert.deepEqual(lines[1]?.values, { oversized: "4" });
   });
 
-  it("两个数都是 0 时一句话都不出（页脚不该被「0 次」撑长）", () => {
+  it("两个数都是 0 时给设计稿那一句「对账一致」", () => {
     assert.deepEqual(
       rtkSelfLinesOf(selfOf("prefix", { parseFailures: 0, recovered: 0, oversized: 0 })),
-      [],
+      [{ messageKey: "rtkSelfAgree", values: {} }],
     );
   });
 
@@ -532,14 +601,14 @@ describe("页脚的 rtk 自账对账", () => {
     );
     assert.deepEqual(
       lines.map((line) => line.messageKey),
-      ["rtkSelfRecall"],
+      ["rtkSelfAgree", "rtkSelfRecall"],
     );
-    assert.deepEqual(lines[0]?.values, { entries: "12", size: "2.0 KB" });
+    assert.deepEqual(lines[1]?.values, { entries: "12", size: "2.0 KB" });
   });
 
   it("recall 库里一条都没有时不提它（还没折过东西）", () => {
     // 与上面两条的判据不同：它不看窗口，所以「0 条」是「这个功能还没用过」而不是
-    // 「这一屏没有」——页脚多一句「0 条」只会让人以为漏了配置。
+    // 「这一屏没有」——页脚多一句「0 条」只会让人以为漏了配置。对账一致那句仍然成立。
     assert.deepEqual(
       rtkSelfLinesOf(
         selfOf("prefix", {
@@ -550,7 +619,7 @@ describe("页脚的 rtk 自账对账", () => {
           recallBytes: 4096,
         }),
       ),
-      [],
+      [{ messageKey: "rtkSelfAgree", values: {} }],
     );
   });
 
@@ -596,15 +665,16 @@ describe("最近一条事件", () => {
     assert.equal(lastEventLineOf(null), undefined);
   });
 
-  it("空家族兜成 unknown，其余字段原样带走", () => {
-    assert.deepEqual(lastEventLineOf({ ...EVENT, commandFamily: "" }), {
-      status: "lastCompressed",
-      tone: "ok",
-      family: "unknown",
-      reason: "success",
-      size: "small",
-      templateKey: "whyLastPlain",
-    });
+  it("空家族兜成 unknown，时间与结局字段原样带走", () => {
+    const line = lastEventLineOf({ ...EVENT, commandFamily: "" });
+    assert.ok(line);
+    assert.equal(line.status, "lastCompressed");
+    assert.equal(line.tone, "ok");
+    assert.equal(line.family, "unknown");
+    assert.equal(line.reason, "success");
+    assert.equal(line.when, "date");
+    assert.match(line.clock, /^\d{2}:\d{2}$/u);
+    assert.equal(line.templateKey, "whyLastPlain");
   });
 
   it("成功那两支用短模板（reason 只是把 status 再说一遍），跳过与失败保留原因", () => {
@@ -616,21 +686,42 @@ describe("最近一条事件", () => {
     assert.equal(lastEventLineOf({ ...EVENT, status: "failed" })?.templateKey, "whyLast");
   });
 
-  it("没量到字节时把「输入规模」整段省掉，不印成「输入 unknown」", () => {
-    // 改写形态量的是指令本身，`dsh_last_events.size_bucket` 因此恒为 `unknown`。真机上
-    // 「最近一次改写」那一行曾显示「已改写 · git status · 输入 unknown」——一个没见过这串
-    // 字的人只会以为统计坏了。没量到就说没量到，占位词不算数。
-    const unsized: LastEvent = { ...EVENT, sizeBucket: "unknown" };
+  it("量到耗时就把耗时带上；节省量只在真量到时出现（0 不算量到）", () => {
+    const timed = { ...EVENT, latencyMs: 420 };
+    assert.equal(lastEventLineOf(timed)?.templateKey, "whyLastLatency");
+    assert.equal(lastEventLineOf({ ...timed, latencyMs: 0 })?.templateKey, "whyLastPlain");
+    const saved = { ...EVENT, savedTokens: 3200, savingsPct: 61, latencyMs: 420 };
+    const full = lastEventLineOf(saved);
+    assert.ok(full);
+    assert.equal(full.templateKey, "whyLastSavedLatency");
+    assert.equal(full.saved, "3.2k");
+    assert.equal(full.pct, "61%");
+    assert.equal(full.latency, "420 ms");
     assert.equal(
-      lastEventLineOf({ ...unsized, status: "rewritten" })?.templateKey,
-      "whyLastPlainNoSize",
+      lastEventLineOf({ ...EVENT, savedTokens: 0, savingsPct: 0 })?.templateKey,
+      "whyLastPlain",
     );
     assert.equal(
-      lastEventLineOf({ ...unsized, status: "compressed" })?.templateKey,
-      "whyLastPlainNoSize",
+      lastEventLineOf({ ...EVENT, status: "skipped", latencyMs: 120 })?.templateKey,
+      "whyLastReasonLatency",
     );
-    assert.equal(lastEventLineOf({ ...unsized, status: "skipped" })?.templateKey, "whyLastNoSize");
-    assert.equal(lastEventLineOf({ ...unsized, status: "failed" })?.templateKey, "whyLastNoSize");
+    // 有节省、但没有量到耗时：走 whyLastSaved（不带 latency 的模板）。
+    const savedOnly = lastEventLineOf({ ...EVENT, savedTokens: 3200, savingsPct: 61 });
+    assert.ok(savedOnly);
+    assert.equal(savedOnly.templateKey, "whyLastSaved");
+    assert.equal(savedOnly.latency, undefined);
+  });
+
+  it("今天/昨天按本地日判，更早的用 MM-DD", () => {
+    const now = new Date(2026, 10, 23, 15, 0, 0).getTime();
+    const todayTs = new Date(2026, 10, 23, 9, 5, 0).getTime();
+    const yesterday = new Date(2026, 10, 22, 21, 40, 0).getTime();
+    const older = new Date(2026, 10, 18, 8, 0, 0).getTime();
+    assert.equal(lastEventLineOf({ ...EVENT, ts: todayTs }, now)?.when, "today");
+    assert.equal(lastEventLineOf({ ...EVENT, ts: todayTs }, now)?.clock, "09:05");
+    assert.equal(lastEventLineOf({ ...EVENT, ts: yesterday }, now)?.when, "yesterday");
+    assert.equal(lastEventLineOf({ ...EVENT, ts: older }, now)?.when, "date");
+    assert.equal(lastEventLineOf({ ...EVENT, ts: older }, now)?.dateText, "11-18");
   });
 
   it("结局带色调：成功绿、跳过黄、失败红（跳过不是失败，它代表策略在按规则工作）", () => {
@@ -661,9 +752,18 @@ describe("建议", () => {
     params: { filter: "git-status", days: 30, matches: 5 },
   };
 
-  it("severity 只影响样式（warn 才标红）", () => {
-    assert.equal(suggestionLineOf(WARN).warn, true);
-    assert.equal(suggestionLineOf(INFO).warn, false);
+  it("severity 只影响语气色：warn 琥珀、普通 info、未命中 muted", () => {
+    assert.equal(suggestionLineOf(WARN).tone, "warn");
+    assert.equal(suggestionLineOf(INFO).tone, "info");
+    assert.equal(
+      suggestionLineOf({
+        kind: "unused-filter",
+        key: "filter:unused",
+        severity: "info",
+        params: { filter: "unused", days: 30 },
+      }).tone,
+      "muted",
+    );
   });
 
   it("只把出现的参数带进模板：缺席的键不落成 undefined", () => {

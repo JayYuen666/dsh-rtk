@@ -21,8 +21,8 @@
 //
 // 按需加载在这里是两层：
 //   1. **按需下载**——整块代码不在入口产物里，用户没打开 Insights 页就一个字节都不下载；
-//   2. **按需装配**——只 `import` 要用的两个图（bar / line）、三个组件（grid / tooltip /
-//      legend）与 canvas 渲染器，`echarts/core` 之外的东西一概不进包。
+//   2. **按需装配**——只 `import` 要用的三个图（bar / line / pie）、四个组件（grid /
+//      tooltip / legend）与 canvas 渲染器，`echarts/core` 之外的东西一概不进包。
 //
 // 关于写法：从 `echarts/core` 取 `use`/`init` 是官方 ESM 按需入口；`echarts/charts` 这类
 // 再导出表必须**按名字**取（`import { BarChart } from "echarts/charts"`），写成
@@ -34,13 +34,33 @@
 // 别名不是风格问题：`use` 这个名字会被 `react-hooks` 那条规则当成 React Hook，
 // 在模块顶层调用就判「Hook 不能在组件外调用」。改名即绕过，语义一个字没变。
 import { init as echartsInit, use as echartsUse } from "echarts/core";
-import { BarChart, LineChart } from "echarts/charts";
-import { GridComponent, LegendComponent, TooltipComponent } from "echarts/components";
+import { BarChart, LineChart, PieChart } from "echarts/charts";
+import {
+  GridComponent,
+  LegendComponent,
+  LegendScrollComponent,
+  TooltipComponent,
+} from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 
-import type { ChartHandle, ChartModule, ChartSpec } from "./insights-chart-spec.ts";
+import type {
+  ChartHandle,
+  ChartInput,
+  ChartModule,
+  ChartSpec,
+  PieSpec,
+} from "./insights-chart-spec.ts";
 
-echartsUse([BarChart, LineChart, GridComponent, TooltipComponent, LegendComponent, CanvasRenderer]);
+echartsUse([
+  BarChart,
+  LineChart,
+  PieChart,
+  GridComponent,
+  LegendComponent,
+  LegendScrollComponent,
+  TooltipComponent,
+  CanvasRenderer,
+]);
 
 /** 坐标轴文字与分割线：颜色全从 `spec` 来，chunk 不认识本包的 CSS 变量。 */
 interface AxisStyle {
@@ -54,8 +74,8 @@ function barSeriesOf(spec: ChartSpec): Record<string, unknown> {
     name: spec.bar.name,
     type: "bar",
     data: [...spec.bar.values],
-    itemStyle: { color: spec.colors[0], borderRadius: [2, 2, 0, 0] },
-    barMaxWidth: 28,
+    itemStyle: { color: spec.colors[0], borderRadius: [4, 4, 0, 0] },
+    barWidth: spec.compact === true ? 20 : 14,
     yAxisIndex: 0,
     emphasis: { focus: "series" },
   };
@@ -73,7 +93,7 @@ function lineSeriesOf(
     lineStyle: { color: spec.colors[1], width: 2 },
     itemStyle: { color: spec.colors[1] },
     symbol: "circle",
-    symbolSize: 5,
+    symbolSize: 6,
     smooth: false,
     // 恒为 1：`lineSeriesOf` 只从 `optionOf` 的 `combo` 分支调进来（右侧百分比轴），
     // 写一个 `kind === "combo" ? 1 : 0` 的条件在那里永远为真，而且它会让读者以为
@@ -90,21 +110,30 @@ function lineSeriesOf(
 }
 
 /** 左轴：token 量。分割线画在这里，右轴不再画。紧凑档只留三条刻线。 */
-function tokenAxisOf(style: AxisStyle, compact: boolean): Record<string, unknown> {
+function tokenAxisOf(style: AxisStyle, compact: boolean, name: string): Record<string, unknown> {
   return {
     type: "value",
-    // 刻线条数就是「几行字」：13px 高的轴上放六条会叠（见 `compact` 的注释）。
-    splitNumber: compact ? 3 : 5,
-    axisLabel: { color: style.textColor, fontSize: 11 },
+    // 设计稿 D 的 renderMain 用 4 条刻线、左轴名「次数」；紧凑档不写轴名。
+    ...(compact ? {} : { name }),
+    splitNumber: 4,
+    nameTextStyle: { color: style.textColor, fontSize: 10 },
+    axisLabel: { color: style.textColor, fontSize: compact ? 9 : 10 },
+    axisLine: { lineStyle: { color: style.gridColor } },
+    axisTick: { show: false },
     splitLine: { lineStyle: { color: style.gridColor } },
   };
 }
 
 /** 右轴：百分比。`formatter` 后缀是必需的，否则 0.4 与 40 在两条轴上分不清。 */
-function pctAxisOf(style: AxisStyle): Record<string, unknown> {
+function pctAxisOf(style: AxisStyle, name: string): Record<string, unknown> {
   return {
     type: "value",
-    axisLabel: { color: style.textColor, fontSize: 11, formatter: "{value}%" },
+    name,
+    splitNumber: 4,
+    nameTextStyle: { color: style.textColor, fontSize: 10 },
+    axisLabel: { color: style.textColor, fontSize: 10, formatter: "{value}%" },
+    axisLine: { lineStyle: { color: style.gridColor } },
+    axisTick: { show: false },
     splitLine: { show: false },
   };
 }
@@ -119,18 +148,22 @@ function optionOf(spec: ChartSpec): Record<string, unknown> {
   const style: AxisStyle = { textColor: spec.textColor, gridColor: spec.gridColor };
   const compact = spec.compact === true;
   const series: Record<string, unknown>[] = [barSeriesOf(spec)];
-  const yAxis: Record<string, unknown>[] = [tokenAxisOf(style, compact)];
+  const yAxis: Record<string, unknown>[] = [tokenAxisOf(style, compact, spec.countAxisName)];
   if (spec.kind === "combo" && spec.line !== undefined) {
     series.push(lineSeriesOf(spec, spec.line));
-    yAxis.push(pctAxisOf(style));
+    yAxis.push(pctAxisOf(style, "%"));
   }
   // 紧凑档：设置卡里那张 132px 高的两柱图。刻度降到三档、外框收紧——同一套 option 在
   // 220px 的洞察页上正好（六条刻线各占一行），在 132px 里六条标签会叠成一团墨。
   const grid = compact
-    ? { top: 20, right: 8, bottom: 18, left: 4, containLabel: true }
-    : { top: 28, right: 12, bottom: 24, left: 8, containLabel: true };
+    ? { top: 24, right: 8, bottom: 26, left: 26 }
+    : { top: 26, right: 46, bottom: 28, left: 46 };
+  const reduceMotion =
+    typeof globalThis.matchMedia === "function" &&
+    globalThis.matchMedia("(prefers-reduced-motion: reduce)").matches;
   return {
-    animation: false,
+    animation: !reduceMotion,
+    animationDuration: reduceMotion ? 0 : 240,
     grid,
     tooltip: {
       trigger: "axis",
@@ -138,25 +171,95 @@ function optionOf(spec: ChartSpec): Record<string, unknown> {
       // tooltip 底色与文字色随主题（入口从 CSS 变量取好放进 spec）；浅色主题下不再是深底。
       backgroundColor: spec.tooltipBg,
       borderColor: spec.gridColor,
-      textStyle: { color: spec.tooltipText, fontSize: 11 },
+      textStyle: { color: spec.tooltipText, fontSize: 12 },
       axisPointer: { type: "shadow", shadowStyle: { color: "rgba(127,127,127,.12)" } },
     },
-    legend: {
-      show: series.length > 1,
-      top: 0,
-      textStyle: { color: spec.textColor, fontSize: 11 },
-      itemWidth: 10,
-      itemHeight: 8,
-    },
+    // 图例由卡片头那一行承担（设计稿 `.chart-card .c-head .legend`）。ECharts 自己也画一份
+    // 时同一个「压缩次数/节省率」会出现两次，而且画布内那份会把 grid 顶部吃掉 28px。
     xAxis: {
       type: "category",
       data: [...spec.labels],
-      axisLabel: { color: spec.textColor, fontSize: 11 },
+      axisLabel: {
+        color: spec.textColor,
+        fontSize: 10,
+        interval: 1,
+        hideOverlap: true,
+      },
       axisLine: { lineStyle: { color: spec.gridColor } },
       axisTick: { show: false },
     },
     yAxis,
     series,
+  };
+}
+
+/**
+ * 饼图 option：逐字对设计稿 `renderPie()`。
+ *
+ * 五个承重点：实心 `radius:'55%'`（不是环）、`center:['40%','50%']` 给右图例让位、
+ * 只有前 6 大片显示外置标签、`labelLayout` 防叠、图例 `type:'scroll'` 竖排并带次数。
+ * 扇区之间 1px 缝取卡片底色；强调阴影是设计稿写死的 10px。
+ */
+function optionOfPie(spec: PieSpec): Record<string, unknown> {
+  const reduceMotion =
+    typeof globalThis.matchMedia === "function" &&
+    globalThis.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  return {
+    animation: !reduceMotion,
+    animationDuration: reduceMotion ? 0 : 240,
+    color: [...spec.colors],
+    tooltip: {
+      trigger: "item",
+      confine: true,
+      backgroundColor: spec.tooltipBg,
+      borderColor: spec.gridColor,
+      borderWidth: 0.5,
+      textStyle: { color: spec.tooltipText, fontSize: 12 },
+      formatter: (params: {
+        readonly name?: string;
+        readonly value?: number;
+        readonly percent?: number;
+      }): string =>
+        spec.formatTooltip({
+          name: params.name ?? "",
+          value: params.value ?? 0,
+          percent: params.percent ?? 0,
+        }),
+    },
+    legend: {
+      type: "scroll",
+      orient: "vertical",
+      right: 8,
+      top: "middle",
+      textStyle: { color: spec.textColor, fontSize: 12 },
+      pageIconColor: spec.pageColor,
+      pageIconInactiveColor: spec.pageInactiveColor,
+      pageTextStyle: { color: spec.textColor, fontSize: 11 },
+      formatter: (name: string): string => {
+        const slice = spec.slices.find((item) => item.name === name);
+        return slice === undefined ? name : spec.formatLegend(slice);
+      },
+    },
+    series: [
+      {
+        type: "pie",
+        radius: "55%",
+        center: ["40%", "50%"],
+        data: spec.slices.map((slice, index) => ({
+          name: slice.name,
+          value: slice.value,
+          label: { show: index < 6 },
+          itemStyle: slice.muted === true ? { color: spec.mutedColor } : {},
+        })),
+        label: { color: spec.labelColor, fontSize: 12 },
+        labelLine: { lineStyle: { color: spec.lineColor } },
+        labelLayout: { hideOverlap: true, moveOverlap: "shiftY" },
+        itemStyle: { borderColor: spec.cardColor, borderWidth: 1 },
+        emphasis: {
+          itemStyle: { shadowBlur: 10, shadowOffsetX: 0, shadowColor: "rgba(0, 0, 0, 0.5)" },
+        },
+      },
+    ],
   };
 }
 
@@ -178,8 +281,34 @@ function mountChart(container: HTMLElement, spec: ChartSpec): ChartHandle {
   };
   globalThis.addEventListener("resize", onResize);
   return {
-    update: (next) => {
-      chart.setOption(optionOf(next), true);
+    update: (next: ChartInput) => {
+      if (next.kind !== "pie") {
+        chart.setOption(optionOf(next), true);
+      }
+    },
+    resize: () => {
+      chart.resize();
+    },
+    dispose: () => {
+      globalThis.removeEventListener("resize", onResize);
+      chart.dispose();
+    },
+  };
+}
+
+/** 饼图挂载：与柱图共用 `init` 与 window resize 兜底；更新走 merge，保留图例点击后的选中态。 */
+function mountPie(container: HTMLElement, spec: PieSpec): ChartHandle {
+  const chart = echartsInit(container, undefined, { renderer: "canvas" });
+  chart.setOption(optionOfPie(spec), true);
+  const onResize = (): void => {
+    chart.resize();
+  };
+  globalThis.addEventListener("resize", onResize);
+  return {
+    update: (next: ChartInput) => {
+      if (next.kind === "pie") {
+        chart.setOption(optionOfPie(next));
+      }
     },
     resize: () => {
       chart.resize();
@@ -192,6 +321,6 @@ function mountChart(container: HTMLElement, spec: ChartSpec): ChartHandle {
 }
 
 /** chunk 的导出面；`src/insights-chart.ts` 按 `ChartModule` 的形状核对它。 */
-const chartModule: ChartModule = { mountChart };
+const chartModule: ChartModule = { mountChart, mountPie };
 
 export { chartModule };

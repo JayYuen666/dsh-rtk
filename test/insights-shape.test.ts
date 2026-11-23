@@ -62,6 +62,7 @@ function response(): Response {
       savingsPct: 50,
       coveragePct: 100,
       successPct: 100,
+      skipped: 0,
       latencyAvgMs: 3,
       latencyMaxMs: 3,
     },

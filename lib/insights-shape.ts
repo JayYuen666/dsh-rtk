@@ -66,6 +66,8 @@ const TotalsSchema = z.object({
   coveragePct: z.number(),
   /** **成功率**：成功数 / `attempts`（失败含 verify 拒绝、超时、pipe 非零退出）。 */
   successPct: z.number(),
+  /** 窗口内被跳过（低于阈值 / gate 拦截）的次数；与 `attempts` 不是同一个分母。 */
+  skipped: z.int().nonnegative(),
   latencyAvgMs: z.number(),
   latencyMaxMs: z.number(),
 });
@@ -151,6 +153,11 @@ const LastEventSchema = z.object({
   filter: z.string().nullable(),
   workdir: z.string(),
   sizeBucket: SizeBucketSchema,
+  /** 量到的节省量与比率；prefix 不量 token，所以这两格缺席而不是 0。 */
+  savedTokens: z.number().nonnegative().optional(),
+  savingsPct: z.number().optional(),
+  /** 这一次的耗时；没量到就不带。 */
+  latencyMs: z.number().nonnegative().optional(),
 });
 export type LastEvent = z.infer<typeof LastEventSchema>;
 

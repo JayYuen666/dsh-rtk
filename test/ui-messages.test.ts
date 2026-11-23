@@ -72,16 +72,25 @@ describe("设置卡双语字典", () => {
       saveFailed: ["reason"],
       rtkTooOldHint: ["version", "minimum"],
       rtkReadyHint: ["version", "path"],
+      rtkReadyBadge: ["version"],
       filtersHint: ["filters"],
-      // Insights 页的两条：`whyLast` 是「最近一次为什么没压」那一行，四个位缺一个就是一句
-      // 带花括号的原文直接显示在页面上；`loadFailed` 的 `{reason}` 是读面自己给的诊断。
-      whyLast: ["status", "family", "reason", "size"],
-      // 成功那两支的短模板：只到「结局 · 家族 · 输入规模」，没有 `{reason}`。
-      whyLastPlain: ["status", "family", "size"],
-      // 没量到字节时用这两条：改写形态量的是指令，落库恒为 `unknown`。把它们印成
-      // 「输入 unknown」等于拿占位词冒充量到的值——所以整段省掉，位数也跟着少一个。
-      whyLastNoSize: ["status", "family", "reason"],
-      whyLastPlainNoSize: ["status", "family"],
+      // Insights 页的「最近一次」：模板由「要不要 reason」与「有没有量到节省量/耗时」
+      // 两个维度选出六条。六个位里缺任何一个，页面上就是一句带花括号的原文。
+      whyLast: ["time", "family", "status", "reason"],
+      whyLastLatency: ["time", "family", "status", "latency"],
+      whyLastReasonLatency: ["time", "family", "status", "reason", "latency"],
+      whyLastPlain: ["time", "family", "status"],
+      whyLastSaved: ["time", "family", "status", "saved", "pct"],
+      whyLastSavedLatency: ["time", "family", "status", "saved", "pct", "latency"],
+      reasonsDetails: ["total"],
+      reasonsTableFoot: ["total"],
+      // 原因码超过 40 条时的聚合片名称：剩余类数必须写明。
+      reasonsOtherCount: ["count"],
+      workdirDetails: ["total"],
+      filterDetails: ["total"],
+      pieTotal: ["total"],
+      // 饼图 hover：原因、次数、占比三个位。design 原句是中文全角分隔，英文用两个半角空格。
+      pieTooltip: ["name", "value", "percent"],
       loadFailed: ["reason"],
       // 空窗口那句话：`{days}` 是窗口天数，`{form}` 是页签名。两个位缺一个，页面就会把
       // 花括号原样印出来——而它出现的时机正是「这一屏什么都没有」，最容易被当成插件坏了。
@@ -101,6 +110,9 @@ describe("设置卡双语字典", () => {
       rtkSelfRecall: ["entries", "size"],
       // 明细表的表脚截断说明：总行数与上限两个位都要在，少了哪个「被截掉多少行」就读不出。
       tableTruncated: ["total", "limit"],
+      tableShown: ["shown", "total"],
+      tableExpand: [],
+      tableCollapse: ["limit"],
       // 页头最近刷新时间：时间位漏了页面会原样印出花括号。
       updatedAtLabel: ["time"],
       // KPI 涨跌标注：涨跌位漏了就原样印花括号。
@@ -109,6 +121,8 @@ describe("设置卡双语字典", () => {
       kpiDeltaMonth: ["delta"],
       // 页头副标题：整句直出，无占位符；登记只为钉住两语同键。
       panelSub: [],
+      // 页脚窗口说明：天数位漏了会原样印出花括号。
+      windowRange: ["days"],
       // 小节字段计数徽章：字段数位漏了会原样印花括号。
       fieldCount: ["count"],
     };

@@ -4,6 +4,10 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.6
+
+宿主基线切到 `dsh 0.2.3-alpha.2`（Node `^24.22.3 || >=26.13.1`），shared 经 catalog 抬到 `^0.2.13`。设置卡随 shared v3 视觉层更新；Insights 按设计稿 v3 重排（860px 内容列、六格 KPI 与容器查询、ECharts 饼图与宿主语义色、粘性表头、页级/表内空态、`RtkPanelSection` 与侧栏 `RtkTrailing`）。测试入口改为子进程 `scripts/run-tests.mjs`，以 `NODE_OPTIONS=--disable-warning=ExperimentalWarning` 吸收 `node:sqlite` 的 Worker 警告；对账文案与判据同步。另按 rtk 1.2.1 复核了工具级前缀（`cargo +nightly test` / `git --no-pager log`）的真 CLI 回路，并把取回口径写清：`rtk recall <hash>` 默认只回被省略的中段，整份输出要加 `--full`。
+
 ## 0.2.5
 
 宿主基线抬到 `0.2.2-rc.5`；客户端统计读取的测试替身换官方 RemoteMock。
@@ -24,14 +28,15 @@ written by a newer rtk schema reports its version instead of silently looking st
 
 ### Added
 
-- **The pipe filter table covers every rtk 1.2.1 `pipe -f` name.** `log`, `sqlfluff-lint`,
-  `prettier`, `ecs`, `phpstan` and `pint` join the table, and rtk's aliases are normalised when
-  they appear in `enabledFilters` (`cargo` → `cargo-test`, `rg` → `grep`, `fd` → `find`,
-  `paratest` / `php-test` → `pest`), so an entry written with an alias keeps matching. All 25
-  canonical names are classified for the output guard: `log` joins the listing class (recoverable
-  folding), the five new linters join the lint class. The `prettier` row leans on the guard's
-  fabricated-success rule: rtk prints "All files formatted correctly" for a run that reported
-  violations, and that claim against the original warning lines is what rejects the compression.
+- **The pipe filter table covers every rtk 1.2.1 `pipe -f` name.** The 23 canonical names (`log`,
+  `sqlfluff-lint`, `prettier`, `ecs`, `phpstan` and `pint` included) are all in the table, and rtk's
+  four documented aliases are normalised when they appear in `enabledFilters` (`rg` → `grep`,
+  `fd` → `find`, `paratest` / `php-test` → `pest`; the undocumented `cargo` alias is normalised too),
+  so an entry written with an alias keeps matching. All 23 canonical names are classified for the
+  output guard: `log` joins the listing class (recoverable folding), the five new linters join the
+  lint class. The `prettier` row leans on the guard's fabricated-success rule: rtk prints "All
+  files formatted correctly" for a run that reported violations, and that claim against the
+  original warning lines is what rejects the compression.
 - **The generated `pipeline.toml` is validated by rtk's own loader.** `rtk pipeline validate` runs
   once at assembly, after the version probe confirms a supported rtk, and a non-zero exit turns
   `E000` / `W025` diagnostics into one warn line. rtk otherwise falls back to `rtk:default`

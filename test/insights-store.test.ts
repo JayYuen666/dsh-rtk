@@ -469,6 +469,37 @@ describe("保留窗口", () => {
 });
 
 describe("旧账本迁移", () => {
+  it("旧 dsh_last_events 缺 saved/savings/latency 三列时打开即补列", async () => {
+    const dbPath = await tempDbPath();
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(dbPath);
+    old.exec(`CREATE TABLE dsh_last_events (
+      id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, form TEXT NOT NULL, status TEXT NOT NULL,
+      reason TEXT NOT NULL, command_family TEXT NOT NULL, workdir TEXT NOT NULL,
+      filter TEXT, size_bucket TEXT NOT NULL
+    )`);
+    old.close();
+    const store = await openStore(dbPath);
+    store.recordPipe(pipeSuccess(5));
+    await store.flush();
+    const [event] = store.readLastEvents(1);
+    assert.ok(event !== undefined);
+    // 三列都补上之后，这条 INSERT 才能落下；缺任意一列，写入期就会抛。
+    assert.equal(event.saved_tokens, 5);
+    assert.equal(event.savings_pct, 50);
+    assert.equal(event.latency_ms, 12);
+  });
+
+  it("原 token 为 0 时节省率落 0，不出 NaN", async () => {
+    const dbPath = await tempDbPath();
+    const store = await openStore(dbPath);
+    store.recordPipe(pipeSuccess(0));
+    await store.flush();
+    const [event] = store.readLastEvents(1);
+    assert.ok(event !== undefined);
+    assert.equal(event.savings_pct, 0);
+  });
+
   it("给出 legacy 时折成快照，字段照搬", async () => {
     const dbPath = await tempDbPath();
     const legacy: LegacyAccumulator = {
